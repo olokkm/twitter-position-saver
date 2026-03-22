@@ -246,7 +246,7 @@
         GM_setValue(STORAGE_KEY_MANUAL_PATH, getCurrentPath());
         GM_setValue(STORAGE_KEY_MANUAL_TAB, currentTab);
 
-        log('Manuelle Position gespeichert:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
+        log('Position saved:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
         
         const tweet = findTweetById(topTweet.tweetId));
 
