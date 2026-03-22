@@ -39,7 +39,7 @@
         showNotifications: true,
 
         // Debug-Modus (mehr Console-Ausgaben)
-        debug: false
+        debug: true
     };
 
     // ============ STORAGE KEYS ============
