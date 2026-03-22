@@ -545,7 +545,7 @@
             }
         });
 
-        restorePosition(false);
+        restorePosition(true);
     }
 
     // Warten bis die Seite bereit ist
