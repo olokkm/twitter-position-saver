@@ -520,8 +520,7 @@
         // Buttons erstellen
         createButtons();
 
-        // Automatisch Position speichern
-        setInterval(saveManualPosition, CONFIG.saveIntervalMs);
+
 
         // Position auch beim Verlassen speichern + Scroll abbrechen
         window.addEventListener('beforeunload', () => {
@@ -543,7 +542,12 @@
             }
         });
 
-        restorePosition(true);
+        setTimeout(() => {
+            restorePosition(true);
+            
+            setInterval(saveManualPosition, CONFIG.saveIntervalMs);
+        }, 2000);
+        
     }
 
     // Warten bis die Seite bereit ist
