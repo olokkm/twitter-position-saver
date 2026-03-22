@@ -248,8 +248,17 @@
 
         log('Manuelle Position gespeichert:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
         
-        const tabInfo = currentTab ? ` (Tab: ${currentTab})` : '';
-        showNotification(`🔖 Lesezeichen gespeichert!${tabInfo}`, 'success');
+        const tweet = findTweetById(topTweet.tweetId));
+
+        if (tweet) {
+            // Visuelles Highlight (unterschiedliche Farbe für manuell)
+            const highlightColor = '#202020';
+            tweet.style.transition = 'box-shadow 0.3s ease';
+            tweet.style.boxShadow = `0 0 0 3px ${highlightColor}`;
+            setTimeout(() => {
+                tweet.style.boxShadow = '';
+            }, 1000);
+        }
         return true;
     }
 
