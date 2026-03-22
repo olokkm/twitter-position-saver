@@ -222,12 +222,14 @@
 
         // Nimm den obersten sichtbaren Tweet
         const topTweet = visibleTweets[0];
+        const currentTab = getCurrentTabName();
 
         GM_setValue(STORAGE_KEY_TWEET_ID, topTweet.tweetId);
         GM_setValue(STORAGE_KEY_TIMESTAMP, Date.now());
         GM_setValue(STORAGE_KEY_PATH, getCurrentPath());
+        GM_setValue(STORAGE_KEY_MANUAL_TAB, currentTab);
 
-        log('Position gespeichert:', topTweet.tweetId);
+        log('Position gespeichert:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
     }
 
     // Manuelle Position speichern (Lesezeichen)
