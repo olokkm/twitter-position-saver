@@ -248,7 +248,7 @@
 
         log('Position saved:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
         
-        const tweet = findTweetById(topTweet.tweetId));
+        const tweet = findTweetById(topTweet.tweetId);
 
         if (tweet) {
             // Visuelles Highlight (unterschiedliche Farbe für manuell)
