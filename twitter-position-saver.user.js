@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.5
+// @version      2.6
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
@@ -367,7 +367,7 @@
                 showNotification(`✓ ${positionType} gefunden!`, 'success');
             } else {
                 // Scrolle zum Seitenende um neue Tweets zu laden
-                window.scrollBy(0, window.outerHeight * 5);
+                window.scrollBy(0, window.outerHeight);
                 await new Promise(r => setTimeout(r, CONFIG.scrollStepDelayMs));
                 attempts++;
 
