@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.3
+// @version      2.4
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
@@ -247,18 +247,6 @@
         GM_setValue(STORAGE_KEY_MANUAL_TAB, currentTab);
 
         log('Position saved:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
-        
-        const tweet = findTweetById(topTweet.tweetId);
-
-        if (tweet) {
-            // Visuelles Highlight (unterschiedliche Farbe für manuell)
-            const highlightColor = '#202020';
-            tweet.style.transition = 'box-shadow 0.3s ease';
-            tweet.style.boxShadow = `0 0 0 3px ${highlightColor}`;
-            setTimeout(() => {
-                tweet.style.boxShadow = '';
-            }, 1000);
-        }
         return true;
     }
 
