@@ -357,7 +357,7 @@
                 showNotification(`✓ ${positionType} gefunden!`, 'success');
             } else {
                 // Scrolle zum Seitenende um neue Tweets zu laden
-                window.scrollTo(0, document.body.scrollHeight);
+                window.scrollTo(0, window.outerHeight);
                 await new Promise(r => setTimeout(r, CONFIG.scrollStepDelayMs));
                 attempts++;
 
