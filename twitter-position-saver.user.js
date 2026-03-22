@@ -227,7 +227,7 @@
         GM_setValue(STORAGE_KEY_TIMESTAMP, Date.now());
         GM_setValue(STORAGE_KEY_PATH, getCurrentPath());
 
-        log('Position gespeichert:', topTweet.tweetId;
+        log('Position gespeichert:', topTweet.tweetId);
     }
 
     // Manuelle Position speichern (Lesezeichen)
