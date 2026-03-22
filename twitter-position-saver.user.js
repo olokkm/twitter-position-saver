@@ -545,20 +545,7 @@
             }
         });
 
-        // Prüfe ob nach Navigation ein Lesezeichen wiederhergestellt werden soll
-        const pendingRestore = GM_getValue('twitter_pending_restore');
-        if (pendingRestore) {
-            GM_setValue('twitter_pending_restore', null);
-            
-            // Kurz warten bis die Seite geladen ist
-            setTimeout(() => {
-                if (pendingRestore === 'manual') {
-                    restorePosition(true);
-                } else if (pendingRestore === 'auto') {
-                    restorePosition(false);
-                }
-            }, 2000);
-        }
+        restorePosition(false);
     }
 
     // Warten bis die Seite bereit ist
