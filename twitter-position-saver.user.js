@@ -234,7 +234,6 @@
     function saveManualPosition() {
         const visibleTweets = getVisibleTweets();
         if (visibleTweets.length === 0) {
-            showNotification('✗ Kein Tweet sichtbar', 'error');
             return false;
         }
 
@@ -300,7 +299,7 @@
             if (useManual) {
                 // Bei manuellem Lesezeichen: Zur gespeicherten Seite navigieren
                 log(`Navigiere von "${getCurrentPath()}" zu "${savedPath}"`);
-                showNotification(`🔄 Navigiere zu ${savedPath}...`, 'info');
+                showNotification(`🔄 Navigating to ${savedPath}...`, 'info');
                 
                 window.location.href = `https://${window.location.host}${savedPath}`;
                 
@@ -323,14 +322,14 @@
             const currentTab = getCurrentTabName();
             if (currentTab !== savedTab) {
                 log(`Wechsle von Tab "${currentTab}" zu "${savedTab}"`);
-                showNotification(`🔄 Wechsle zu Tab "${savedTab}"...`, 'info');
+                showNotification(`🔄 Switching to tab "${savedTab}"...`, 'info');
                 
                 if (clickTab(savedTab)) {
                     // Warte bis der Tab-Inhalt geladen ist
                     await new Promise(r => setTimeout(r, 2000));
                     if (abortController.aborted) return;
                 } else {
-                    showNotification(`✗ Tab "${savedTab}" nicht gefunden`, 'error');
+                    showNotification(`✗ Tab "${savedTab}" not found`, 'error');
                     return;
                 }
             }
@@ -343,7 +342,7 @@
         if (abortController.aborted) return;
 
         log(`Versuche ${positionType} wiederherzustellen: Tweet ${savedTweetId} (${ageText})`);
-        showNotification(`🔍 Suche ${positionType}... (${ageText})`, 'info');
+        showNotification(`🔍 Searching for ${positionType}... (${ageText})`, 'info');
 
         let attempts = 0;
         let found = false;
@@ -364,7 +363,7 @@
 
                 found = true;
                 log(`${positionType} gefunden und hingescrollt!`);
-                showNotification(`✓ ${positionType} gefunden!`, 'success');
+                showNotification(`✓ ${positionType} found!`, 'success');
             } else {
                 // Scrolle zum Seitenende um neue Tweets zu laden
                 window.scrollBy(0, window.outerHeight);
