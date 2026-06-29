@@ -1,18 +1,3 @@
-// ==UserScript==
-// @name         Twitter/X Timeline Position Saver
-// @namespace    http://tampermonkey.net/
-// @version      2.13
-// @description  Saves X timeline position. Gear iOS: use gear-extension/ Web Extension (Userscript blocked by X CSP).
-// @author       zaengerlein
-// @license      MIT
-// @match        https://twitter.com/*
-// @match        https://x.com/*
-// @grant        GM_getValue
-// @grant        GM_setValue
-// @run-at       document-start
-// @noframes
-// ==/UserScript==
-
 (function() {
     'use strict';
 
@@ -68,9 +53,6 @@
     const STORAGE_PREFIX = 'tps_';
 
     function gmGet(key) {
-        if (typeof GM_getValue !== 'undefined') {
-            return GM_getValue(key);
-        }
         try {
             const value = localStorage.getItem(STORAGE_PREFIX + key);
             return value === null ? undefined : JSON.parse(value);
@@ -80,10 +62,6 @@
     }
 
     function gmSet(key, value) {
-        if (typeof GM_setValue !== 'undefined') {
-            GM_setValue(key, value);
-            return;
-        }
         localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
     }
 
@@ -679,7 +657,7 @@
         appendButtonsToPage(container);
         log('Buttons injected');
         if (CONFIG.debug) {
-            showNotification('Timeline Saver v2.12 ready', 'success');
+            showNotification('Timeline Saver ready', 'success');
         }
         return true;
     }
@@ -743,7 +721,7 @@
         initialized = true;
 
         try {
-            log('Timeline Position Saver v2.12 started on', location.href);
+            log('Timeline Position Saver (Gear Web Extension) started on', location.href);
             ensureButtons();
             setupEventListeners();
             runRestoreFlow().catch(showFatalError);
