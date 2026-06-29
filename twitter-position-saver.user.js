@@ -1,16 +1,16 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.10
+// @version      2.12
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
 // @match        https://twitter.com/*
 // @match        https://x.com/*
-// @grant        none
-// @updateURL    https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
-// @downloadURL  https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
-// @run-at       document-end
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @run-at       document-start
+// @noframes
 // ==/UserScript==
 
 (function() {
@@ -68,6 +68,9 @@
     const STORAGE_PREFIX = 'tps_';
 
     function gmGet(key) {
+        if (typeof GM_getValue !== 'undefined') {
+            return GM_getValue(key);
+        }
         try {
             const value = localStorage.getItem(STORAGE_PREFIX + key);
             return value === null ? undefined : JSON.parse(value);
@@ -77,6 +80,10 @@
     }
 
     function gmSet(key, value) {
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue(key, value);
+            return;
+        }
         localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
     }
 
@@ -550,7 +557,7 @@
         container.id = BUTTONS_CONTAINER_ID;
         container.style.cssText = `
             position: fixed;
-            bottom: 180px;
+            bottom: ${window.innerWidth <= 500 ? '110px' : '180px'};
             right: 24px;
             display: flex;
             flex-direction: column;
@@ -672,7 +679,7 @@
         appendButtonsToPage(container);
         log('Buttons injected');
         if (CONFIG.debug) {
-            showNotification('Timeline Saver v2.10 ready', 'success');
+            showNotification('Timeline Saver v2.12 ready', 'success');
         }
         return true;
     }
@@ -736,7 +743,7 @@
         initialized = true;
 
         try {
-            log('Timeline Position Saver v2.10 started on', location.href);
+            log('Timeline Position Saver v2.12 started on', location.href);
             ensureButtons();
             setupEventListeners();
             runRestoreFlow().catch(showFatalError);
@@ -745,7 +752,15 @@
         }
     }
 
-    ensureButtons();
-    init();
+    function boot() {
+        ensureButtons();
+        init();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', boot);
+    } else {
+        boot();
+    }
 
 })();
