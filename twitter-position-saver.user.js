@@ -1,14 +1,13 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.9
+// @version      2.10
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
 // @match        https://twitter.com/*
 // @match        https://x.com/*
-// @grant        GM_getValue
-// @grant        GM_setValue
+// @grant        none
 // @updateURL    https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
 // @run-at       document-end
@@ -66,12 +65,11 @@
         }
     }
 
+    const STORAGE_PREFIX = 'tps_';
+
     function gmGet(key) {
-        if (typeof GM_getValue !== 'undefined') {
-            return GM_getValue(key);
-        }
         try {
-            const value = localStorage.getItem('tps_' + key);
+            const value = localStorage.getItem(STORAGE_PREFIX + key);
             return value === null ? undefined : JSON.parse(value);
         } catch {
             return undefined;
@@ -79,11 +77,7 @@
     }
 
     function gmSet(key, value) {
-        if (typeof GM_setValue !== 'undefined') {
-            GM_setValue(key, value);
-            return;
-        }
-        localStorage.setItem('tps_' + key, JSON.stringify(value));
+        localStorage.setItem(STORAGE_PREFIX + key, JSON.stringify(value));
     }
 
     function showFatalError(error) {
@@ -678,7 +672,7 @@
         appendButtonsToPage(container);
         log('Buttons injected');
         if (CONFIG.debug) {
-            showNotification('Timeline Saver v2.9 ready', 'success');
+            showNotification('Timeline Saver v2.10 ready', 'success');
         }
         return true;
     }
@@ -742,7 +736,7 @@
         initialized = true;
 
         try {
-            log('Timeline Position Saver v2.9 started on', location.href);
+            log('Timeline Position Saver v2.10 started on', location.href);
             ensureButtons();
             setupEventListeners();
             runRestoreFlow().catch(showFatalError);
