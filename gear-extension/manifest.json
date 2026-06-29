@@ -1,8 +1,20 @@
 {
   "manifest_version": 3,
   "name": "Twitter/X Timeline Position Saver",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Saves your X timeline position and returns to it on demand. For Gear iOS (bypasses X.com CSP).",
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "action": {
+    "default_title": "Timeline Position Saver",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": [

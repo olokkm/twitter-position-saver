@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>X Debug Test</title>
+  <style>
+    body {
+      font: 14px/1.4 system-ui, -apple-system, sans-serif;
+      margin: 12px;
+      max-width: 320px;
+    }
+    h1 { font-size: 16px; margin: 0 0 8px; }
+    p { margin: 0 0 10px; color: #444; }
+    button {
+      width: 100%;
+      padding: 10px;
+      border: 0;
+      border-radius: 8px;
+      background: #1d9bf0;
+      color: #fff;
+      font: inherit;
+      font-weight: 600;
+    }
+    #status { margin-top: 10px; min-height: 1.2em; }
+    code { font-size: 12px; }
+  </style>
+</head>
+<body>
+  <h1>X Debug Test</h1>
+  <p>Na iOS content script nie startuje, dopoki Gear nie ma uprawnien do x.com.</p>
+  <button id="enable" type="button">Wlacz na x.com</button>
+  <p id="status"></p>
+  <p>Po wlaczeniu odswiez x.com. Powinienes zobaczyc <strong>zielony pasek</strong> u gory strony.</p>
+  <script>
+    const status = document.getElementById('status');
+    const api = globalThis.browser || globalThis.chrome;
+
+    document.getElementById('enable').addEventListener('click', () => {
+      if (!api?.permissions?.request) {
+        status.textContent = 'Uprawnienia wlacz recznie: Ustawienia rozszerzenia -> Dostep do stron -> x.com';
+        return;
+      }
+
+      api.permissions.request({
+        origins: ['https://x.com/*', 'https://twitter.com/*']
+      }, (granted) => {
+        status.textContent = granted
+          ? 'OK. Odswiez x.com.'
+          : 'Odmowiono. W Gear: szczegoly rozszerzenia -> Zezwol na x.com.';
+      });
+    });
+  </script>
+</body>
+</html>

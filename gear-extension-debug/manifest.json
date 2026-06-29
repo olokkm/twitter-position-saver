@@ -1,8 +1,20 @@
 {
   "manifest_version": 3,
   "name": "X Debug Test (Gear)",
-  "version": "1.0.0",
-  "description": "Minimal Web Extension debug - only console.log on x.com",
+  "version": "1.0.1",
+  "description": "Minimal Web Extension debug - green banner + console.log on x.com",
+  "host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "optional_host_permissions": [
+    "https://x.com/*",
+    "https://twitter.com/*"
+  ],
+  "action": {
+    "default_title": "X Debug Test",
+    "default_popup": "popup.html"
+  },
   "content_scripts": [
     {
       "matches": [
