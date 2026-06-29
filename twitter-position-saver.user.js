@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.8
+// @version      2.9
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
@@ -214,34 +214,71 @@
         return tab.getAttribute('aria-label') || null;
     }
 
+    function scoreTablist(tablist) {
+        const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+        const labels = tabs.map(getTabLabel).filter(Boolean);
+
+        if (labels.length < 2) {
+            return -1;
+        }
+
+        let score = labels.length;
+
+        if (tabs.some(tab => tab.getAttribute('aria-selected') === 'true')) {
+            score += 5;
+        }
+
+        const primaryColumn = document.querySelector('[data-testid="primaryColumn"]');
+        if (primaryColumn) {
+            if (primaryColumn.contains(tablist)) {
+                score += 10;
+            } else {
+                // Mobile: tab bar sits just above the timeline column
+                const tabRect = tablist.getBoundingClientRect();
+                const colRect = primaryColumn.getBoundingClientRect();
+                if (tabRect.bottom <= colRect.top + 120 && tabRect.top >= colRect.top - 160) {
+                    score += 12;
+                }
+            }
+        }
+
+        const homeTimeline = document.querySelector('[aria-label="Home timeline"]');
+        if (homeTimeline && homeTimeline.contains(tablist)) {
+            score += 15;
+        }
+
+        return score;
+    }
+
     function getNavigationTabs() {
+        const candidates = new Set();
+
+        document.querySelectorAll('[role="tablist"], [data-testid="ScrollSnap-List"]').forEach(el => {
+            candidates.add(el);
+        });
+
         const primaryColumn = document.querySelector('[data-testid="primaryColumn"]');
         if (primaryColumn) {
             const tablist = primaryColumn.querySelector('[role="tablist"]');
             if (tablist) {
-                const tabs = tablist.querySelectorAll('[role="tab"]');
-                if (tabs.length >= 2) {
-                    return Array.from(tabs);
-                }
+                candidates.add(tablist);
             }
         }
 
-        const selectors = [
-            '[data-testid="ScrollSnap-List"]',
-            'nav[role="navigation"] div[role="tablist"]',
-            '[role="tablist"]'
-        ];
+        let bestTabs = [];
+        let bestScore = -1;
 
-        for (const selector of selectors) {
-            for (const navContainer of document.querySelectorAll(selector)) {
-                const tabs = navContainer.querySelectorAll('[role="tab"]');
-                if (tabs.length >= 2) {
-                    return Array.from(tabs);
-                }
+        for (const tablist of candidates) {
+            const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
+            const score = scoreTablist(tablist);
+
+            if (score > bestScore) {
+                bestScore = score;
+                bestTabs = tabs;
             }
         }
 
-        return [];
+        return bestTabs;
     }
 
     function getCurrentTabInfo() {
@@ -641,7 +678,7 @@
         appendButtonsToPage(container);
         log('Buttons injected');
         if (CONFIG.debug) {
-            showNotification('Timeline Saver v2.8 ready', 'success');
+            showNotification('Timeline Saver v2.9 ready', 'success');
         }
         return true;
     }
@@ -705,7 +742,7 @@
         initialized = true;
 
         try {
-            log('Timeline Position Saver v2.8 started on', location.href);
+            log('Timeline Position Saver v2.9 started on', location.href);
             ensureButtons();
             setupEventListeners();
             runRestoreFlow().catch(showFatalError);
