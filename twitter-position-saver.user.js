@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.6
+// @version      2.7
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
@@ -56,6 +56,7 @@
 
     // ============ SCROLL ABORT CONTROLLER ============
     let currentScrollAbort = null;
+    const BUTTONS_CONTAINER_ID = 'timeline-saver-buttons';
 
     function abortCurrentScroll() {
         if (currentScrollAbort) {
@@ -172,25 +173,44 @@
 
     // ============ NAVIGATION TABS ============
 
-    function getNavigationTabs() {
-        // Suche nach der Tab-Navigation über der Timeline
-        const navContainer = document.querySelector('nav[role="navigation"] div[role="tablist"]');
-        if (!navContainer) return [];
+    function getTabLabel(tab) {
+        const span = tab.querySelector('span');
+        if (span && span.textContent.trim()) {
+            return span.textContent.trim();
+        }
+        // X puts "For you" directly in the tab without a span
+        const text = (tab.innerText || tab.textContent || '').trim();
+        if (text) return text;
+        return tab.getAttribute('aria-label') || null;
+    }
 
-        const tabs = navContainer.querySelectorAll('a[role="tab"], div[role="tab"]');
-        return Array.from(tabs);
+    function getNavigationTabs() {
+        const selectors = [
+            'nav[role="navigation"] div[role="tablist"]',
+            '[data-testid="ScrollSnap-List"]',
+            '[role="tablist"]'
+        ];
+
+        for (const selector of selectors) {
+            for (const navContainer of document.querySelectorAll(selector)) {
+                const tabs = navContainer.querySelectorAll('a[role="tab"], div[role="tab"]');
+                if (tabs.length < 2) continue;
+
+                const labels = Array.from(tabs).map(getTabLabel);
+                if (labels.some(label => label === 'For you' || label === 'Following')) {
+                    return Array.from(tabs);
+                }
+            }
+        }
+
+        return [];
     }
 
     function getCurrentTabName() {
         const tabs = getNavigationTabs();
         for (const tab of tabs) {
-            // Aktiver Tab hat aria-selected="true"
             if (tab.getAttribute('aria-selected') === 'true') {
-                // Text des Tabs extrahieren
-                const textElement = tab.querySelector('span');
-                if (textElement) {
-                    return textElement.textContent.trim();
-                }
+                return getTabLabel(tab);
             }
         }
         return null;
@@ -201,14 +221,36 @@
 
         const tabs = getNavigationTabs();
         for (const tab of tabs) {
-            const textElement = tab.querySelector('span');
-            if (textElement && textElement.textContent.trim() === tabName) {
+            if (getTabLabel(tab) === tabName) {
                 tab.click();
                 log(`Tab "${tabName}" geklickt`);
                 return true;
             }
         }
         log(`Tab "${tabName}" nicht gefunden`);
+        return false;
+    }
+
+    async function waitForTimelineReady(maxWaitMs = 15000) {
+        const start = Date.now();
+
+        while (Date.now() - start < maxWaitMs) {
+            if (!isTimelinePage()) {
+                return true;
+            }
+
+            const hasTabs = getNavigationTabs().length > 0;
+            const hasTweets = document.querySelectorAll('article[data-testid="tweet"]').length > 0;
+
+            if (hasTabs || hasTweets) {
+                log('Timeline bereit (Tabs:', hasTabs, 'Tweets:', hasTweets, ')');
+                return true;
+            }
+
+            await new Promise(r => setTimeout(r, 500));
+        }
+
+        log('Timeline nicht bereit nach', maxWaitMs, 'ms');
         return false;
     }
 
@@ -337,7 +379,7 @@
 
         // Erst zum Seitenanfang scrollen, dann von dort aus suchen
         log('Scrolle zum Seitenanfang...');
-        window.scrollTo({ top: 0, behavior: 'instant' });
+        window.scrollTo(0, 0);
         await new Promise(r => setTimeout(r, 1000));
         if (abortController.aborted) return;
 
@@ -395,8 +437,11 @@
     // ============ UI: BUTTONS ============
 
     function createButtons() {
+        if (document.getElementById(BUTTONS_CONTAINER_ID)) return;
+
         // Container für beide Buttons
         const container = document.createElement('div');
+        container.id = BUTTONS_CONTAINER_ID;
         container.style.cssText = `
             position: fixed;
             bottom: 180px;
@@ -521,15 +566,30 @@
         document.body.appendChild(container);
     }
 
+    function watchButtons() {
+        if (!document.body) return;
+
+        const observer = new MutationObserver(() => {
+            if (!document.getElementById(BUTTONS_CONTAINER_ID)) {
+                createButtons();
+            }
+        });
+
+        observer.observe(document.body, { childList: true });
+    }
+
     // ============ INITIALISIERUNG ============
 
-    function init() {
+    let initialized = false;
+
+    async function init() {
+        if (initialized) return;
+        initialized = true;
+
         log('Timeline Position Saver initialisiert');
 
-        // Buttons erstellen
         createButtons();
-
-
+        watchButtons();
 
         // Position auch beim Verlassen speichern + Scroll abbrechen
         window.addEventListener('beforeunload', () => {
@@ -551,19 +611,35 @@
             }
         });
 
-        setTimeout(() => {
-            restorePosition(true);
-            
-            setInterval(saveManualPosition, CONFIG.saveIntervalMs);
-        }, 2000);
-        
+        await waitForTimelineReady();
+
+        if (GM_getValue('twitter_pending_restore')) {
+            GM_setValue('twitter_pending_restore', null);
+        }
+
+        restorePosition(true);
+        setInterval(saveManualPosition, CONFIG.saveIntervalMs);
     }
 
-    // Warten bis die Seite bereit ist
-    if (document.readyState === 'complete') {
+    function start() {
+        if (!document.body) {
+            const observer = new MutationObserver(() => {
+                if (document.body) {
+                    observer.disconnect();
+                    init();
+                }
+            });
+            observer.observe(document.documentElement, { childList: true, subtree: true });
+            return;
+        }
+
         init();
+    }
+
+    if (document.readyState === 'loading') {
+        document.addEventListener('DOMContentLoaded', start);
     } else {
-        window.addEventListener('load', init);
+        start();
     }
 
 })();
