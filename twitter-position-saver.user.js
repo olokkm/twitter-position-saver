@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      2.7
+// @version      2.8
 // @description  A Tampermonkey script that saves your timeline position and returns to it on demand
 // @author       zaengerlein
 // @license      MIT
@@ -11,7 +11,7 @@
 // @grant        GM_setValue
 // @updateURL    https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
 // @downloadURL  https://raw.githubusercontent.com/zaengerlein/twitter-position-saver/main/twitter-position-saver.user.js
-// @run-at       document-idle
+// @run-at       document-end
 // ==/UserScript==
 
 (function() {
@@ -53,6 +53,7 @@
     const STORAGE_KEY_MANUAL_TIMESTAMP = 'twitter_manual_timestamp';
     const STORAGE_KEY_MANUAL_PATH = 'twitter_manual_path';
     const STORAGE_KEY_MANUAL_TAB = 'twitter_manual_tab';
+    const STORAGE_KEY_MANUAL_TAB_INDEX = 'twitter_manual_tab_index';
 
     // ============ SCROLL ABORT CONTROLLER ============
     let currentScrollAbort = null;
@@ -62,6 +63,35 @@
         if (currentScrollAbort) {
             currentScrollAbort.aborted = true;
             log('Scroll-Vorgang abgebrochen');
+        }
+    }
+
+    function gmGet(key) {
+        if (typeof GM_getValue !== 'undefined') {
+            return GM_getValue(key);
+        }
+        try {
+            const value = localStorage.getItem('tps_' + key);
+            return value === null ? undefined : JSON.parse(value);
+        } catch {
+            return undefined;
+        }
+    }
+
+    function gmSet(key, value) {
+        if (typeof GM_setValue !== 'undefined') {
+            GM_setValue(key, value);
+            return;
+        }
+        localStorage.setItem('tps_' + key, JSON.stringify(value));
+    }
+
+    function showFatalError(error) {
+        console.error('[Timeline Saver]', error);
+        try {
+            showNotification('Timeline Saver error – see console (F12)', 'error');
+        } catch {
+            // ignore
         }
     }
 
@@ -185,19 +215,27 @@
     }
 
     function getNavigationTabs() {
+        const primaryColumn = document.querySelector('[data-testid="primaryColumn"]');
+        if (primaryColumn) {
+            const tablist = primaryColumn.querySelector('[role="tablist"]');
+            if (tablist) {
+                const tabs = tablist.querySelectorAll('[role="tab"]');
+                if (tabs.length >= 2) {
+                    return Array.from(tabs);
+                }
+            }
+        }
+
         const selectors = [
-            'nav[role="navigation"] div[role="tablist"]',
             '[data-testid="ScrollSnap-List"]',
+            'nav[role="navigation"] div[role="tablist"]',
             '[role="tablist"]'
         ];
 
         for (const selector of selectors) {
             for (const navContainer of document.querySelectorAll(selector)) {
-                const tabs = navContainer.querySelectorAll('a[role="tab"], div[role="tab"]');
-                if (tabs.length < 2) continue;
-
-                const labels = Array.from(tabs).map(getTabLabel);
-                if (labels.some(label => label === 'For you' || label === 'Following')) {
+                const tabs = navContainer.querySelectorAll('[role="tab"]');
+                if (tabs.length >= 2) {
                     return Array.from(tabs);
                 }
             }
@@ -206,14 +244,35 @@
         return [];
     }
 
-    function getCurrentTabName() {
+    function getCurrentTabInfo() {
         const tabs = getNavigationTabs();
-        for (const tab of tabs) {
-            if (tab.getAttribute('aria-selected') === 'true') {
-                return getTabLabel(tab);
+        for (let index = 0; index < tabs.length; index++) {
+            if (tabs[index].getAttribute('aria-selected') === 'true') {
+                return { index, label: getTabLabel(tabs[index]) };
             }
         }
         return null;
+    }
+
+    function getCurrentTabName() {
+        return getCurrentTabInfo()?.label || null;
+    }
+
+    function clickTabByInfo(tabInfo) {
+        if (!tabInfo) return false;
+
+        const tabs = getNavigationTabs();
+        if (tabInfo.index != null && tabs[tabInfo.index]) {
+            tabs[tabInfo.index].click();
+            log(`Tab index ${tabInfo.index} geklickt (${getTabLabel(tabs[tabInfo.index])})`);
+            return true;
+        }
+
+        if (tabInfo.label) {
+            return clickTab(tabInfo.label);
+        }
+
+        return false;
     }
 
     function clickTab(tabName) {
@@ -265,9 +324,9 @@
         // Nimm den obersten sichtbaren Tweet
         const topTweet = visibleTweets[0];
 
-        GM_setValue(STORAGE_KEY_TWEET_ID, topTweet.tweetId);
-        GM_setValue(STORAGE_KEY_TIMESTAMP, Date.now());
-        GM_setValue(STORAGE_KEY_PATH, getCurrentPath());
+        gmSet(STORAGE_KEY_TWEET_ID, topTweet.tweetId);
+        gmSet(STORAGE_KEY_TIMESTAMP, Date.now());
+        gmSet(STORAGE_KEY_PATH, getCurrentPath());
 
         log('Position gespeichert:', topTweet.tweetId);
     }
@@ -280,14 +339,15 @@
         }
 
         const topTweet = visibleTweets[0];
-        const currentTab = getCurrentTabName();
+        const currentTabInfo = getCurrentTabInfo();
 
-        GM_setValue(STORAGE_KEY_MANUAL_TWEET_ID, topTweet.tweetId);
-        GM_setValue(STORAGE_KEY_MANUAL_TIMESTAMP, Date.now());
-        GM_setValue(STORAGE_KEY_MANUAL_PATH, getCurrentPath());
-        GM_setValue(STORAGE_KEY_MANUAL_TAB, currentTab);
+        gmSet(STORAGE_KEY_MANUAL_TWEET_ID, topTweet.tweetId);
+        gmSet(STORAGE_KEY_MANUAL_TIMESTAMP, Date.now());
+        gmSet(STORAGE_KEY_MANUAL_PATH, getCurrentPath());
+        gmSet(STORAGE_KEY_MANUAL_TAB, currentTabInfo?.label || null);
+        gmSet(STORAGE_KEY_MANUAL_TAB_INDEX, currentTabInfo?.index ?? null);
 
-        log('Position saved:', topTweet.tweetId, 'Tab:', currentTab, 'Pfad:', getCurrentPath());
+        log('Position saved:', topTweet.tweetId, 'Tab:', currentTabInfo, 'Pfad:', getCurrentPath());
 
         const tweet = findTweetById(topTweet.tweetId);
 
@@ -314,10 +374,11 @@
         const abortController = { aborted: false };
         currentScrollAbort = abortController;
 
-        const savedTweetId = GM_getValue(useManual ? STORAGE_KEY_MANUAL_TWEET_ID : STORAGE_KEY_TWEET_ID);
-        const savedTimestamp = GM_getValue(useManual ? STORAGE_KEY_MANUAL_TIMESTAMP : STORAGE_KEY_TIMESTAMP);
-        const savedPath = GM_getValue(useManual ? STORAGE_KEY_MANUAL_PATH : STORAGE_KEY_PATH);
-        const savedTab = useManual ? GM_getValue(STORAGE_KEY_MANUAL_TAB) : null;
+        const savedTweetId = gmGet(useManual ? STORAGE_KEY_MANUAL_TWEET_ID : STORAGE_KEY_TWEET_ID);
+        const savedTimestamp = gmGet(useManual ? STORAGE_KEY_MANUAL_TIMESTAMP : STORAGE_KEY_TIMESTAMP);
+        const savedPath = gmGet(useManual ? STORAGE_KEY_MANUAL_PATH : STORAGE_KEY_PATH);
+        const savedTab = useManual ? gmGet(STORAGE_KEY_MANUAL_TAB) : null;
+        const savedTabIndex = useManual ? gmGet(STORAGE_KEY_MANUAL_TAB_INDEX) : null;
 
         const positionType = useManual ? 'Lesezeichen' : 'Position';
 
@@ -347,7 +408,7 @@
                 
                 // Nach Navigation wird die Seite neu geladen, 
                 // daher speichern wir einen Flag um danach fortzusetzen
-                GM_setValue('twitter_pending_restore', 'manual');
+                gmSet('twitter_pending_restore', 'manual');
                 return;
             } else {
                 log('Andere Seite als gespeichert');
@@ -360,18 +421,26 @@
                         `vor ${Math.round(ageMinutes / 60)} Std.`;
 
         // Bei manuellem Lesezeichen: Erst zum richtigen Tab wechseln
-        if (useManual && savedTab) {
-            const currentTab = getCurrentTabName();
-            if (currentTab !== savedTab) {
-                log(`Wechsle von Tab "${currentTab}" zu "${savedTab}"`);
-                showNotification(`🔄 Switching to tab "${savedTab}"...`, 'info');
-                
-                if (clickTab(savedTab)) {
-                    // Warte bis der Tab-Inhalt geladen ist
-                    await new Promise(r => setTimeout(r, 2000));
+        if (useManual && (savedTab != null || savedTabIndex != null)) {
+            const currentTabInfo = getCurrentTabInfo();
+            const savedTabInfo = { index: savedTabIndex, label: savedTab };
+            const sameTab = currentTabInfo
+                && savedTabIndex != null
+                && currentTabInfo.index === savedTabIndex;
+            const sameTabByLabel = currentTabInfo
+                && savedTab
+                && currentTabInfo.label === savedTab;
+
+            if (!sameTab && !sameTabByLabel) {
+                const tabLabel = savedTab || `#${savedTabIndex}`;
+                log(`Wechsle von Tab`, currentTabInfo, `zu`, savedTabInfo);
+                showNotification(`🔄 Switching to tab "${tabLabel}"...`, 'info');
+
+                if (clickTabByInfo(savedTabInfo)) {
+                    await waitForTimelineReady(5000);
                     if (abortController.aborted) return;
                 } else {
-                    showNotification(`✗ Tab "${savedTab}" not found`, 'error');
+                    showNotification(`✗ Tab "${tabLabel}" not found`, 'error');
                     return;
                 }
             }
@@ -436,8 +505,14 @@
 
     // ============ UI: BUTTONS ============
 
+    function appendButtonsToPage(container) {
+        const root = document.body || document.documentElement;
+        root.appendChild(container);
+    }
+
     function createButtons() {
-        if (document.getElementById(BUTTONS_CONTAINER_ID)) return;
+        if (document.getElementById(BUTTONS_CONTAINER_ID)) return true;
+        if (!document.body && !document.documentElement) return false;
 
         // Container für beide Buttons
         const container = document.createElement('div');
@@ -450,7 +525,7 @@
             flex-direction: column;
             align-items: flex-end;
             gap: 12px;
-            z-index: 9999;
+            z-index: 99999;
         `;
 
         // === Button 1: Automatische Position (wie bisher) ===
@@ -563,83 +638,83 @@
         container.appendChild(manualButtonContainer);
         container.appendChild(autoButton);
 
-        document.body.appendChild(container);
+        appendButtonsToPage(container);
+        log('Buttons injected');
+        if (CONFIG.debug) {
+            showNotification('Timeline Saver v2.8 ready', 'success');
+        }
+        return true;
     }
 
-    function watchButtons() {
-        if (!document.body) return;
+    function ensureButtons() {
+        if (createButtons()) return;
 
         const observer = new MutationObserver(() => {
-            if (!document.getElementById(BUTTONS_CONTAINER_ID)) {
-                createButtons();
+            if (createButtons()) {
+                observer.disconnect();
             }
         });
 
-        observer.observe(document.body, { childList: true });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        setTimeout(() => observer.disconnect(), 30000);
     }
 
     // ============ INITIALISIERUNG ============
 
     let initialized = false;
+    let saveIntervalStarted = false;
 
-    async function init() {
-        if (initialized) return;
-        initialized = true;
-
-        log('Timeline Position Saver initialisiert');
-
-        createButtons();
-        watchButtons();
-
-        // Position auch beim Verlassen speichern + Scroll abbrechen
+    function setupEventListeners() {
         window.addEventListener('beforeunload', () => {
             abortCurrentScroll();
             saveCurrentPosition();
         });
 
-        // Scroll abbrechen wenn Tab versteckt wird
         document.addEventListener('visibilitychange', () => {
             if (document.hidden) {
                 abortCurrentScroll();
             }
         });
 
-        // Scroll abbrechen bei Escape-Taste
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') {
                 abortCurrentScroll();
             }
         });
+    }
 
-        await waitForTimelineReady();
-
-        if (GM_getValue('twitter_pending_restore')) {
-            GM_setValue('twitter_pending_restore', null);
-        }
-
-        restorePosition(true);
+    function startSaveInterval() {
+        if (saveIntervalStarted) return;
+        saveIntervalStarted = true;
         setInterval(saveManualPosition, CONFIG.saveIntervalMs);
     }
 
-    function start() {
-        if (!document.body) {
-            const observer = new MutationObserver(() => {
-                if (document.body) {
-                    observer.disconnect();
-                    init();
-                }
-            });
-            observer.observe(document.documentElement, { childList: true, subtree: true });
-            return;
+    async function runRestoreFlow() {
+        await waitForTimelineReady();
+
+        if (gmGet('twitter_pending_restore')) {
+            gmSet('twitter_pending_restore', null);
         }
 
-        init();
+        await restorePosition(true);
+        startSaveInterval();
     }
 
-    if (document.readyState === 'loading') {
-        document.addEventListener('DOMContentLoaded', start);
-    } else {
-        start();
+    function init() {
+        if (initialized) return;
+        initialized = true;
+
+        try {
+            log('Timeline Position Saver v2.8 started on', location.href);
+            ensureButtons();
+            setupEventListeners();
+            runRestoreFlow().catch(showFatalError);
+        } catch (error) {
+            showFatalError(error);
+        }
     }
+
+    ensureButtons();
+    init();
 
 })();
