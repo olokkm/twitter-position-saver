@@ -28,7 +28,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            twitter-position-saver-gear-debug.zip
             twitter-position-saver-gear.zip
             twitter-position-saver.user.js
 
@@ -38,6 +37,5 @@ jobs:
         with:
           name: gear-extension-zips
           path: |
-            twitter-position-saver-gear-debug.zip
             twitter-position-saver-gear.zip
             twitter-position-saver.user.js

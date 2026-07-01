@@ -1,77 +1,58 @@
 # Twitter/X Position Saver
 
-A Tampermonkey userscript that saves your timeline position and returns to it on demand. Never lose your place in the Twitter/X timeline again!
+Remembers where you stopped scrolling on the X timeline and jumps back there on your next visit. Never lose your place again.
 
-## Features
+## How it works
 
-- **Automatic position saving** – Continuously saves your current scroll position
-- **Manual bookmarks** – Set a bookmark at any position and return to it later
-- **Cross-page navigation** – Bookmarks work across different pages (home, profiles, replies, etc.)
-- **Tab awareness** – Remembers which tab you were on (For You, Following, Replies, etc.)
-- **Fast scrolling** – Quickly scrolls through the timeline to find your saved position
-- **Abort support** – Press `Escape` to stop scrolling at any time
+While you browse the timeline, the script keeps saving the topmost visible tweet (plus the active tab, e.g. *For you* / *Following*). The next time you open X, it waits for the timeline to load, switches back to the right tab, and scrolls down until it finds that tweet and centers it on screen.
 
-## Installation
+A single floating button (📍, bottom-right) lets you jump back to where you left off at any time. Press **Escape** to stop a running scroll search.
 
-1. Install [Tampermonkey](https://www.tampermonkey.net/) for your browser
-2. Click on the script file [`twitter-position-saver.user.js`](twitter-position-saver.user.js)
-3. Click "Raw" to open the script
-4. Tampermonkey will prompt you to install – click "Install"
+## Install
 
-Or manually:
-1. Open Tampermonkey dashboard
-2. Create a new script
-3. Copy and paste the contents of `twitter-position-saver.user.js`
-4. Save
+### Desktop (Tampermonkey / Violentmonkey / Greasemonkey)
 
-## Usage
+1. Install a userscript manager (e.g. [Tampermonkey](https://www.tampermonkey.net/)).
+2. Open [`twitter-position-saver.user.js`](twitter-position-saver.user.js), click **Raw**, and confirm the install.
 
-After installation, you'll see two buttons in the bottom-right corner of Twitter/X:
+### Gear browser (iOS)
 
-| Button | Function |
-|--------|----------|
-| 💾 | Save a manual bookmark at your current position |
-| 🔖 | Jump to your saved bookmark |
-| 📍 | Jump to the automatically saved position |
+X's Content Security Policy blocks userscripts on iOS, so use the Web Extension instead:
 
-### Keyboard Shortcut
-
-- **Escape** – Abort the current scroll operation
+1. Download `twitter-position-saver-gear.zip` from the [latest release](../../releases/latest).
+2. In Gear: **Settings → Web Extensions → Import** and select the zip.
+3. If content scripts don't run, open the extension's settings and **allow access to x.com**, then reload the page.
 
 ## Configuration
 
-You can adjust settings at the top of the script:
+Adjust the values at the top of the script:
 
 ```javascript
 const CONFIG = {
-    maxAgeMinutes: 60,        // Auto-position expires after this time
-    saveIntervalMs: 2000,     // How often to save position (ms)
-    scrollStepDelayMs: 300,   // Delay between scroll steps (ms)
-    maxScrollAttempts: 150,   // Max attempts before giving up
-    showNotifications: true,  // Show status notifications
-    debug: false              // Enable console logging
+    maxAgeMinutes: 180,       // ignore a saved position older than this
+    saveIntervalMs: 2000,     // how often the current position is stored
+    scrollStepDelayMs: 300,   // pause between scroll steps while searching
+    maxScrollAttempts: 150,   // give up searching after this many scroll steps
+    autoRestore: true         // jump back automatically when the timeline loads
 };
 ```
 
-## How It Works
+## Development
 
-Twitter/X uses virtualized scrolling, which means tweets are dynamically loaded and unloaded as you scroll. This script:
+The Gear Web Extension is generated from the userscript, so you only edit one file (`twitter-position-saver.user.js`).
 
-1. Saves the Tweet ID of the topmost visible tweet
-2. When restoring, scrolls to the top of the page
-3. Repeatedly scrolls down until it finds the saved tweet
-4. Highlights the tweet and centers it on screen
+```bash
+bash scripts/build-gear-zips.sh
+```
+
+This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`) and packages `twitter-position-saver-gear.zip`. Releases build and attach the zip automatically via `.github/workflows/release.yml`.
 
 ## Compatibility
 
-- Works on both `twitter.com` and `x.com`
-- Tested with Tampermonkey on Firefox and Chrome
-- Should work with other userscript managers (Greasemonkey, Violentmonkey)
+- Works on both `x.com` and `twitter.com`
+- Desktop: any userscript manager
+- iOS: Gear browser Web Extension (tested under iOS Safari emulation)
 
 ## License
 
 MIT License – see [LICENSE](LICENSE) for details.
-
-## Contributing
-
-Contributions are welcome! Feel free to open issues or submit pull requests.
