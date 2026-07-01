@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.2
+// @version      3.3
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -57,6 +57,7 @@
 
     const PANEL_ID = 'timeline-saver-panel';
     const PANEL_INFO_ID = 'timeline-saver-info';
+    const BUTTON_ID = 'timeline-saver-day-button';
 
     function log(...args) {
         if (DEBUG) console.log('[Timeline Saver]', ...args);
@@ -351,6 +352,102 @@
         return waitForStep(null, ctrl);
     }
 
+    function tweetDate(article) {
+        const iso = getTweetTime(article);
+        const date = iso ? new Date(iso) : null;
+        return date && !isNaN(date) ? date : null;
+    }
+
+    function isSameDay(a, b) {
+        return a.getFullYear() === b.getFullYear() &&
+            a.getMonth() === b.getMonth() &&
+            a.getDate() === b.getDate();
+    }
+
+    // Scroll down the Olo timeline until the oldest tweet still from today, i.e. the
+    // boundary right before yesterday's tweets begin, then center it.
+    async function scrollToStartOfDay() {
+        abortRestore();
+        const ctrl = { aborted: false };
+        currentAbort = ctrl;
+        restoring = true;
+
+        const today = new Date();
+        showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
+
+        try {
+            const switched = await ensureTargetTab(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
+
+            window.scrollTo(0, 0);
+            await waitForContentToSettle(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+
+            let stuckSteps = 0;
+
+            for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
+                let beforeTodayCount = 0;
+                let oldestTodayEl = null;
+                let oldestTodayTime = null;
+
+                for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+                    const date = tweetDate(article);
+                    if (!date) continue;
+                    if (isSameDay(date, today)) {
+                        if (!oldestTodayTime || date < oldestTodayTime) {
+                            oldestTodayTime = date;
+                            oldestTodayEl = article;
+                        }
+                    } else if (date < today) {
+                        beforeTodayCount++;
+                    }
+                }
+
+                // Require a couple of pre-today tweets so a single old repost among today's
+                // tweets doesn't trigger the boundary prematurely.
+                const sawBeforeToday = beforeTodayCount >= 2;
+
+                // Once yesterday's tweets appear, the oldest today tweet in view is the start of the day.
+                if (sawBeforeToday) {
+                    if (oldestTodayEl) {
+                        oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(oldestTodayEl);
+                        return finishPanel('Reached the start of today');
+                    }
+                    return finishPanel('No tweets from today');
+                }
+
+                updatePanel(`Scrolling to the start of today… (step ${attempt})`);
+
+                const beforeY = window.scrollY;
+                window.scrollBy(0, Math.round(window.innerHeight * 0.85));
+
+                const outcome = await waitForStep(null, ctrl);
+                if (outcome === 'aborted') break;
+
+                // Reached the end of the feed without crossing into yesterday.
+                if (outcome === 'settled' && window.scrollY <= beforeY + 2) {
+                    if (++stuckSteps >= 3) {
+                        if (oldestTodayEl) {
+                            oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            highlight(oldestTodayEl);
+                            return finishPanel('Reached the oldest loaded tweet from today');
+                        }
+                        return finishPanel('No tweets from today');
+                    }
+                } else {
+                    stuckSteps = 0;
+                }
+            }
+
+            finishPanel(ctrl.aborted ? 'Stopped' : 'Start of today not found');
+        } finally {
+            restoring = false;
+            if (currentAbort === ctrl) currentAbort = null;
+        }
+    }
+
     async function waitForTimeline(maxWaitMs = 15000) {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
@@ -442,6 +539,49 @@
         }, 2500);
     }
 
+    // ============ UI: "START OF TODAY" BUTTON ============
+
+    function createButton() {
+        if (document.getElementById(BUTTON_ID)) return true;
+        if (!document.body) return false;
+
+        const btn = document.createElement('button');
+        btn.id = BUTTON_ID;
+        btn.type = 'button';
+        btn.textContent = '🌅';
+        btn.title = 'Scroll to the start of today';
+        btn.style.cssText = `
+            position: fixed;
+            bottom: ${window.innerWidth <= 500 ? '150px' : '96px'};
+            right: 16px;
+            width: 46px;
+            height: 46px;
+            border: none;
+            border-radius: 50%;
+            background: #1d9bf0;
+            color: #fff;
+            font-size: 22px;
+            cursor: pointer;
+            z-index: 99999;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+        `;
+        btn.addEventListener('click', () => { scrollToStartOfDay(); });
+        document.body.appendChild(btn);
+        return true;
+    }
+
+    function ensureButton() {
+        if (createButton()) return;
+        const observer = new MutationObserver(() => {
+            if (createButton()) observer.disconnect();
+        });
+        observer.observe(document.documentElement, { childList: true, subtree: true });
+        setTimeout(() => observer.disconnect(), 30000);
+    }
+
     // ============ INIT ============
 
     let started = false;
@@ -467,6 +607,7 @@
 
         log('started on', location.href);
         setupListeners();
+        ensureButton();
 
         const saved = readSavedPosition();
         const ready = await waitForTimeline();
