@@ -373,18 +373,19 @@
         restoring = true;
 
         const today = new Date();
-        showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
+        showPanel('Auto-scrolling to the start of today…');
 
         try {
             const switched = await ensureTargetTab(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
             if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
 
-            window.scrollTo(0, 0);
+            // Start from the currently visible tweet — don't jump back to the top.
             await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
             let stuckSteps = 0;
+            let deepestTodayTime = null; // earliest today time reached so far (for progress)
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
                 let beforeTodayCount = 0;
@@ -404,6 +405,10 @@
                     }
                 }
 
+                if (oldestTodayTime && (!deepestTodayTime || oldestTodayTime < deepestTodayTime)) {
+                    deepestTodayTime = oldestTodayTime;
+                }
+
                 // Require a couple of pre-today tweets so a single old repost among today's
                 // tweets doesn't trigger the boundary prematurely.
                 const sawBeforeToday = beforeTodayCount >= 2;
@@ -413,12 +418,14 @@
                     if (oldestTodayEl) {
                         oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         highlight(oldestTodayEl);
-                        return finishPanel('Reached the start of today');
+                        return finishPanel(`Reached the start of today (${formatTweetTime(oldestTodayTime)})`);
                     }
                     return finishPanel('No tweets from today');
                 }
 
-                updatePanel(`Scrolling to the start of today… (step ${attempt})`);
+                updatePanel(deepestTodayTime
+                    ? `Auto-scrolling to the start of today… now at ${formatTweetTime(deepestTodayTime)}`
+                    : 'Auto-scrolling to the start of today…');
 
                 const beforeY = window.scrollY;
                 window.scrollBy(0, Math.round(window.innerHeight * 0.85));
@@ -432,7 +439,7 @@
                         if (oldestTodayEl) {
                             oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
                             highlight(oldestTodayEl);
-                            return finishPanel('Reached the oldest loaded tweet from today');
+                            return finishPanel(`Reached the oldest loaded tweet from today (${formatTweetTime(oldestTodayTime)})`);
                         }
                         return finishPanel('No tweets from today');
                     }
