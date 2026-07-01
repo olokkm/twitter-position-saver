@@ -1,8 +1,8 @@
 {
   "manifest_version": 3,
   "name": "Twitter/X Timeline Position Saver",
-  "version": "3.0.0",
-  "description": "Remembers where you stopped scrolling on the X timeline and jumps back there on your next visit.",
+  "version": "3.1.0",
+  "description": "Remembers where you stopped scrolling on the X \"Olo\" timeline and jumps back there on your next visit.",
   "content_scripts": [
     {
       "matches": [

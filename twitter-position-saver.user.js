@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.0
-// @description  Remembers where you stopped scrolling on the X timeline and jumps back there on your next visit.
+// @version      3.1
+// @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
 // @match        https://twitter.com/*
@@ -17,6 +17,7 @@
     'use strict';
 
     const CONFIG = {
+        targetTab: 'Olo',         // auto-scroll only works on this timeline tab
         maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
         scrollStepDelayMs: 300,   // pause between scroll steps while searching
@@ -49,12 +50,12 @@
     }
 
     const KEY_TWEET_ID = 'tweet_id';
+    const KEY_TWEET_TIME = 'tweet_time';
     const KEY_TIMESTAMP = 'timestamp';
     const KEY_PATH = 'path';
-    const KEY_TAB_INDEX = 'tab_index';
-    const KEY_TAB_LABEL = 'tab_label';
 
-    const BUTTON_ID = 'timeline-saver-button';
+    const PANEL_ID = 'timeline-saver-panel';
+    const PANEL_INFO_ID = 'timeline-saver-info';
 
     function log(...args) {
         if (DEBUG) console.log('[Timeline Saver]', ...args);
@@ -87,14 +88,19 @@
         return match ? match[1] : null;
     }
 
-    // Id of the topmost tweet sitting in the upper half of the viewport.
-    function getTopTweetId() {
+    function getTweetTime(article) {
+        const time = article.querySelector('time[datetime]');
+        return time ? time.getAttribute('datetime') : null;
+    }
+
+    // Topmost tweet sitting in the upper half of the viewport.
+    function getTopTweet() {
         const articles = document.querySelectorAll('article[data-testid="tweet"]');
         for (const article of articles) {
             const rect = article.getBoundingClientRect();
             if (rect.top >= 0 && rect.top < window.innerHeight * 0.5) {
                 const id = extractTweetId(article);
-                if (id) return id;
+                if (id) return { id, time: getTweetTime(article) };
             }
         }
         return null;
@@ -109,7 +115,13 @@
         return null;
     }
 
-    // ============ NAVIGATION TABS (For you / Following / ...) ============
+    function formatTweetTime(iso) {
+        if (!iso) return 'unknown time';
+        const date = new Date(iso);
+        return isNaN(date) ? iso : date.toLocaleString();
+    }
+
+    // ============ NAVIGATION TABS (For you / Following / Olo ...) ============
 
     function getTabLabel(tab) {
         const span = tab.querySelector('span');
@@ -154,52 +166,63 @@
         return best;
     }
 
-    function getCurrentTab() {
-        const tabs = getNavigationTabs();
-        for (let i = 0; i < tabs.length; i++) {
-            if (tabs[i].getAttribute('aria-selected') === 'true') {
-                return { index: i, label: getTabLabel(tabs[i]) };
-            }
-        }
-        return null;
+    function getCurrentTabLabel() {
+        const tab = getNavigationTabs().find(t => t.getAttribute('aria-selected') === 'true');
+        return tab ? getTabLabel(tab) : null;
     }
 
-    function switchToTab(target) {
-        if (!target || (target.index == null && target.label == null)) return true;
+    function getTargetTabEl() {
+        return getNavigationTabs().find(t => getTabLabel(t) === CONFIG.targetTab) || null;
+    }
 
-        const tabs = getNavigationTabs();
-        const current = getCurrentTab();
-        if (current && (current.index === target.index || current.label === target.label)) {
-            return true;
+    function isOnTargetTab() {
+        return getCurrentTabLabel() === CONFIG.targetTab;
+    }
+
+    // Switch to the "Olo" tab and confirm it is actually selected before returning.
+    async function ensureTargetTab(ctrl, maxWaitMs = 8000) {
+        const start = Date.now();
+
+        let tab = getTargetTabEl();
+        while (!tab && Date.now() - start < maxWaitMs) {
+            if (ctrl.aborted) return false;
+            await sleep(300);
+            tab = getTargetTabEl();
         }
-        if (target.index != null && tabs[target.index]) {
-            tabs[target.index].click();
-            return true;
+        if (!tab) return false;
+
+        if (isOnTargetTab()) return true;
+
+        tab.click();
+        while (Date.now() - start < maxWaitMs) {
+            if (ctrl.aborted) return false;
+            if (isOnTargetTab()) return true;
+            await sleep(200);
         }
-        if (target.label) {
-            const tab = tabs.find(t => getTabLabel(t) === target.label);
-            if (tab) {
-                tab.click();
-                return true;
-            }
-        }
-        return false;
+        return isOnTargetTab();
     }
 
     // ============ SAVE / RESTORE ============
 
-    function savePosition() {
-        if (!isTimelinePage()) return;
-        const id = getTopTweetId();
-        if (!id) return;
+    let restoring = false;
+    let currentAbort = null;
 
-        const tab = getCurrentTab();
-        gmSet(KEY_TWEET_ID, id);
+    function abortRestore() {
+        if (currentAbort) currentAbort.aborted = true;
+    }
+
+    function savePosition() {
+        if (restoring) return;
+        if (!isTimelinePage() || !isOnTargetTab()) return;
+
+        const top = getTopTweet();
+        if (!top) return;
+
+        gmSet(KEY_TWEET_ID, top.id);
+        gmSet(KEY_TWEET_TIME, top.time);
         gmSet(KEY_TIMESTAMP, Date.now());
         gmSet(KEY_PATH, currentPath());
-        gmSet(KEY_TAB_INDEX, tab ? tab.index : null);
-        gmSet(KEY_TAB_LABEL, tab ? tab.label : null);
-        log('Saved', id, 'tab', tab);
+        log('Saved', top.id, top.time);
     }
 
     function readSavedPosition() {
@@ -208,17 +231,10 @@
         if (!id || !timestamp) return null;
         return {
             tweetId: id,
+            tweetTime: gmGet(KEY_TWEET_TIME),
             timestamp,
-            path: gmGet(KEY_PATH),
-            tabIndex: gmGet(KEY_TAB_INDEX),
-            tabLabel: gmGet(KEY_TAB_LABEL)
+            path: gmGet(KEY_PATH)
         };
-    }
-
-    let currentAbort = null;
-
-    function abortRestore() {
-        if (currentAbort) currentAbort.aborted = true;
     }
 
     function highlight(tweet) {
@@ -227,15 +243,13 @@
         setTimeout(() => { tweet.style.boxShadow = ''; }, 2000);
     }
 
-    async function restore(saved, { force = false } = {}) {
+    async function restore(saved) {
         if (!saved) return;
 
-        if (!force) {
-            const ageMinutes = (Date.now() - saved.timestamp) / 60000;
-            if (ageMinutes > CONFIG.maxAgeMinutes) {
-                log('Saved position too old:', ageMinutes.toFixed(1), 'min');
-                return;
-            }
+        const ageMinutes = (Date.now() - saved.timestamp) / 60000;
+        if (ageMinutes > CONFIG.maxAgeMinutes) {
+            log('Saved position too old:', ageMinutes.toFixed(1), 'min');
+            return;
         }
         if (saved.path && saved.path !== currentPath()) {
             log('Saved position is on a different page, skipping');
@@ -245,29 +259,41 @@
         abortRestore();
         const ctrl = { aborted: false };
         currentAbort = ctrl;
+        restoring = true;
 
-        if (switchToTab({ index: saved.tabIndex, label: saved.tabLabel })) {
-            await sleep(700);
-        }
-        if (ctrl.aborted) return;
+        const timeStr = formatTweetTime(saved.tweetTime);
+        showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
 
-        window.scrollTo(0, 0);
-        await sleep(800);
-        if (ctrl.aborted) return;
+        try {
+            const switched = await ensureTargetTab(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
 
-        for (let attempt = 0; attempt < CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
-            const tweet = findTweetById(saved.tweetId);
-            if (tweet) {
-                tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                highlight(tweet);
-                log('Restored to', saved.tweetId);
-                break;
+            await sleep(600);
+            if (ctrl.aborted) return finishPanel('Stopped');
+
+            window.scrollTo(0, 0);
+            await sleep(800);
+            if (ctrl.aborted) return finishPanel('Stopped');
+
+            for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
+                const tweet = findTweetById(saved.tweetId);
+                if (tweet) {
+                    tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    highlight(tweet);
+                    log('Restored to', saved.tweetId);
+                    return finishPanel(`Found tweet from ${timeStr}`);
+                }
+                updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
+                window.scrollBy(0, window.innerHeight);
+                await sleep(CONFIG.scrollStepDelayMs);
             }
-            window.scrollBy(0, window.innerHeight);
-            await sleep(CONFIG.scrollStepDelayMs);
-        }
 
-        if (currentAbort === ctrl) currentAbort = null;
+            finishPanel(ctrl.aborted ? 'Stopped' : `Tweet from ${timeStr} not found`);
+        } finally {
+            restoring = false;
+            if (currentAbort === ctrl) currentAbort = null;
+        }
     }
 
     async function waitForTimeline(maxWaitMs = 15000) {
@@ -282,53 +308,83 @@
         return false;
     }
 
-    // ============ UI: SINGLE "JUMP BACK" BUTTON ============
+    // ============ UI: SEARCH PANEL + STOP BUTTON ============
 
-    // Snapshot taken at page load so the button always returns to where the
-    // previous session ended, even after the interval starts overwriting it.
-    let restoreTarget = null;
-
-    function createButton() {
-        if (document.getElementById(BUTTON_ID)) return true;
-        if (!document.body) return false;
-
-        const btn = document.createElement('button');
-        btn.id = BUTTON_ID;
-        btn.type = 'button';
-        btn.textContent = '📍';
-        btn.title = 'Jump back to where you left off';
-        btn.style.cssText = `
+    function buildPanel() {
+        const panel = document.createElement('div');
+        panel.id = PANEL_ID;
+        panel.style.cssText = `
             position: fixed;
-            bottom: ${window.innerWidth <= 500 ? '90px' : '150px'};
-            right: 20px;
-            width: 46px;
-            height: 46px;
-            border: none;
-            border-radius: 50%;
-            background: #1d9bf0;
-            color: #fff;
-            font-size: 20px;
-            cursor: pointer;
-            z-index: 99999;
-            box-shadow: 0 2px 8px rgba(0,0,0,0.4);
+            bottom: ${window.innerWidth <= 500 ? '80px' : '24px'};
+            left: 50%;
+            transform: translateX(-50%);
             display: flex;
             align-items: center;
-            justify-content: center;
+            gap: 12px;
+            box-sizing: border-box;
+            width: max-content;
+            max-width: calc(100vw - 24px);
+            padding: 10px 12px 10px 16px;
+            border-radius: 14px;
+            background: #15202b;
+            color: #fff;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 13px;
+            line-height: 1.35;
+            box-shadow: 0 4px 16px rgba(0,0,0,0.5);
+            z-index: 100000;
         `;
-        btn.addEventListener('click', () => {
-            restore(restoreTarget || readSavedPosition(), { force: true });
-        });
-        document.body.appendChild(btn);
-        return true;
+
+        const info = document.createElement('span');
+        info.id = PANEL_INFO_ID;
+        info.style.cssText = 'flex: 1; min-width: 0; overflow-wrap: anywhere;';
+
+        const stop = document.createElement('button');
+        stop.type = 'button';
+        stop.textContent = 'Stop';
+        stop.style.cssText = `
+            flex: none;
+            border: none;
+            border-radius: 9999px;
+            background: #f4212e;
+            color: #fff;
+            font: inherit;
+            font-weight: 600;
+            padding: 6px 14px;
+            cursor: pointer;
+        `;
+        stop.addEventListener('click', abortRestore);
+
+        panel.appendChild(info);
+        panel.appendChild(stop);
+        return panel;
     }
 
-    function ensureButton() {
-        if (createButton()) return;
-        const observer = new MutationObserver(() => {
-            if (createButton()) observer.disconnect();
-        });
-        observer.observe(document.documentElement, { childList: true, subtree: true });
-        setTimeout(() => observer.disconnect(), 30000);
+    function showPanel(text) {
+        let panel = document.getElementById(PANEL_ID);
+        if (!panel) {
+            panel = buildPanel();
+            (document.body || document.documentElement).appendChild(panel);
+        }
+        updatePanel(text);
+    }
+
+    function updatePanel(text) {
+        const info = document.getElementById(PANEL_INFO_ID);
+        if (info) info.textContent = text;
+    }
+
+    // Show a final status for a moment, then remove the panel.
+    function finishPanel(text) {
+        updatePanel(text);
+        const panel = document.getElementById(PANEL_ID);
+        if (!panel) return;
+        const stop = panel.querySelector('button');
+        if (stop) stop.remove();
+        setTimeout(() => {
+            const p = document.getElementById(PANEL_ID);
+            if (p) p.remove();
+        }, 2500);
     }
 
     // ============ INIT ============
@@ -337,14 +393,13 @@
 
     function setupListeners() {
         window.addEventListener('beforeunload', () => {
-            abortRestore();
+            if (restoring) { abortRestore(); return; }
             savePosition();
         });
         document.addEventListener('visibilitychange', () => {
-            if (document.hidden) {
-                abortRestore();
-                savePosition();
-            }
+            if (!document.hidden) return;
+            if (restoring) { abortRestore(); return; }
+            savePosition();
         });
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') abortRestore();
@@ -356,14 +411,12 @@
         started = true;
 
         log('started on', location.href);
-        ensureButton();
         setupListeners();
 
-        restoreTarget = readSavedPosition();
-
+        const saved = readSavedPosition();
         const ready = await waitForTimeline();
-        if (ready && CONFIG.autoRestore) {
-            await restore(restoreTarget);
+        if (ready && CONFIG.autoRestore && saved) {
+            await restore(saved);
         }
 
         setInterval(savePosition, CONFIG.saveIntervalMs);

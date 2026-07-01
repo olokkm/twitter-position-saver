@@ -1,12 +1,14 @@
 # Twitter/X Position Saver
 
-Remembers where you stopped scrolling on the X timeline and jumps back there on your next visit. Never lose your place again.
+Remembers where you stopped scrolling on your custom **"Olo"** X timeline and jumps back there on your next visit. Never lose your place again.
 
 ## How it works
 
-While you browse the timeline, the script keeps saving the topmost visible tweet (plus the active tab, e.g. *For you* / *Following*). The next time you open X, it waits for the timeline to load, switches back to the right tab, and scrolls down until it finds that tweet and centers it on screen.
+While you browse the **Olo** tab, the script keeps saving the topmost visible tweet. The next time you open X, it waits for the timeline to load, **switches to the Olo tab and confirms it is active**, then scrolls down until it finds that tweet and centers it on screen.
 
-A single floating button (📍, bottom-right) lets you jump back to where you left off at any time. Press **Escape** to stop a running scroll search.
+During the search a small panel appears at the bottom showing the **timestamp of the tweet it is looking for**, together with a **Stop scrolling** button that interrupts the search at any time (pressing **Escape** does the same).
+
+> The tab name is configurable via `CONFIG.targetTab` (default `"Olo"`). Auto-restore only runs on that tab.
 
 ## Install
 
@@ -29,6 +31,7 @@ Adjust the values at the top of the script:
 
 ```javascript
 const CONFIG = {
+    targetTab: 'Olo',         // auto-scroll only works on this timeline tab
     maxAgeMinutes: 180,       // ignore a saved position older than this
     saveIntervalMs: 2000,     // how often the current position is stored
     scrollStepDelayMs: 300,   // pause between scroll steps while searching
