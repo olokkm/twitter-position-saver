@@ -20,22 +20,22 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Build zip packages
-        run: bash scripts/build-gear-zips.sh
+      - name: Build XPI package
+        run: bash scripts/build-gear-xpi.sh
 
       - name: Upload release assets
         if: github.event_name == 'release'
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            twitter-position-saver-gear.zip
+            twitter-position-saver-gear.xpi
             twitter-position-saver.user.js
 
       - name: Upload workflow artifacts
         if: github.event_name == 'workflow_dispatch'
         uses: actions/upload-artifact@v4
         with:
-          name: gear-extension-zips
+          name: gear-extension-xpi
           path: |
-            twitter-position-saver-gear.zip
+            twitter-position-saver-gear.xpi
             twitter-position-saver.user.js

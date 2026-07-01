@@ -21,8 +21,8 @@ During the search a small panel appears at the bottom showing the **timestamp of
 
 X's Content Security Policy blocks userscripts on iOS, so use the Web Extension instead:
 
-1. Download `twitter-position-saver-gear.zip` from the [latest release](../../releases/latest).
-2. In Gear: **Settings → Web Extensions → Import** and select the zip.
+1. Download `twitter-position-saver-gear.xpi` from the [latest release](../../releases/latest).
+2. In Gear: **Settings → Web Extensions → Import** and select the XPI.
 3. If content scripts don't run, open the extension's settings and **allow access to x.com**, then reload the page.
 
 ## Configuration
@@ -45,10 +45,10 @@ const CONFIG = {
 The Gear Web Extension is generated from the userscript, so you only edit one file (`twitter-position-saver.user.js`).
 
 ```bash
-bash scripts/build-gear-zips.sh
+bash scripts/build-gear-xpi.sh
 ```
 
-This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`) and packages `twitter-position-saver-gear.zip`. Releases build and attach the zip automatically via `.github/workflows/release.yml`.
+This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`) and packages `twitter-position-saver-gear.xpi`. Releases build and attach the XPI automatically via `.github/workflows/release.yml`.
 
 ## Compatibility
 
