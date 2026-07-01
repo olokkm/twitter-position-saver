@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.1
+// @version      3.2
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -20,7 +20,8 @@
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
         maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
-        scrollStepDelayMs: 300,   // pause between scroll steps while searching
+        stepSettleMs: 500,        // DOM must stay unchanged this long = content loaded
+        stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
         autoRestore: true         // jump back automatically when the timeline loads
     };
@@ -269,24 +270,45 @@
             if (ctrl.aborted) return finishPanel('Stopped');
             if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
 
-            await sleep(600);
+            window.scrollTo(0, 0);
+            // Wait for the fresh Olo timeline to actually render before searching.
+            await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
-            window.scrollTo(0, 0);
-            await sleep(800);
-            if (ctrl.aborted) return finishPanel('Stopped');
+            let stuckSteps = 0;
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
-                const tweet = findTweetById(saved.tweetId);
-                if (tweet) {
-                    tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                    highlight(tweet);
-                    log('Restored to', saved.tweetId);
-                    return finishPanel(`Found tweet from ${timeStr}`);
+                let tweet = findTweetById(saved.tweetId);
+
+                if (!tweet) {
+                    updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
+
+                    const beforeY = window.scrollY;
+                    // Overlap a little so a tweet can't slip between two renders.
+                    window.scrollBy(0, Math.round(window.innerHeight * 0.85));
+
+                    // Don't move on until the newly revealed tweets have loaded (or the
+                    // target shows up / we hit the safety cap) — never a blind fixed delay.
+                    const outcome = await waitForStep(saved.tweetId, ctrl);
+                    if (outcome === 'aborted') break;
+
+                    tweet = findTweetById(saved.tweetId);
+                    if (!tweet) {
+                        // Reached the end: can't scroll further and nothing new loaded.
+                        if (outcome === 'settled' && window.scrollY <= beforeY + 2) {
+                            if (++stuckSteps >= 3) break;
+                        } else {
+                            stuckSteps = 0;
+                        }
+                        continue;
+                    }
                 }
-                updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
-                window.scrollBy(0, window.innerHeight);
-                await sleep(CONFIG.scrollStepDelayMs);
+
+                // Act immediately so virtualization can't recycle the node away.
+                tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                highlight(tweet);
+                log('Restored to', saved.tweetId);
+                return finishPanel(`Found tweet from ${timeStr}`);
             }
 
             finishPanel(ctrl.aborted ? 'Stopped' : `Tweet from ${timeStr} not found`);
@@ -294,6 +316,39 @@
             restoring = false;
             if (currentAbort === ctrl) currentAbort = null;
         }
+    }
+
+    function documentHeight() {
+        return (document.scrollingElement || document.documentElement).scrollHeight;
+    }
+
+    // Wait until one scroll step's content is ready: the target appears, or the page
+    // height has been stable for `stepSettleMs` (loading + rendering finished), or the
+    // per-step cap is reached. This replaces any fixed, timing-based delay.
+    async function waitForStep(targetId, ctrl) {
+        const start = Date.now();
+        let lastHeight = documentHeight();
+        let stableSince = Date.now();
+
+        while (Date.now() - start < CONFIG.stepMaxWaitMs) {
+            if (ctrl.aborted) return 'aborted';
+            if (targetId && findTweetById(targetId)) return 'found';
+
+            const height = documentHeight();
+            if (height !== lastHeight) {
+                lastHeight = height;
+                stableSince = Date.now();
+            } else if (Date.now() - stableSince >= CONFIG.stepSettleMs) {
+                return 'settled';
+            }
+
+            await sleep(100);
+        }
+        return 'settled';
+    }
+
+    function waitForContentToSettle(ctrl) {
+        return waitForStep(null, ctrl);
     }
 
     async function waitForTimeline(maxWaitMs = 15000) {

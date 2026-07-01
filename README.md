@@ -4,7 +4,7 @@ Remembers where you stopped scrolling on your custom **"Olo"** X timeline and ju
 
 ## How it works
 
-While you browse the **Olo** tab, the script keeps saving the topmost visible tweet. The next time you open X, it waits for the timeline to load, **switches to the Olo tab and confirms it is active**, then scrolls down until it finds that tweet and centers it on screen.
+While you browse the **Olo** tab, the script keeps saving the topmost visible tweet. The next time you open X, it waits for the timeline to load, **switches to the Olo tab and confirms it is active**, then scrolls down until it finds that tweet and centers it on screen. Between scroll steps it **waits for each batch of tweets to finish loading** (rather than a fixed delay), so nothing gets skipped on a slow connection.
 
 During the search a small panel appears at the bottom showing the **timestamp of the tweet it is looking for**, together with a **Stop scrolling** button that interrupts the search at any time (pressing **Escape** does the same).
 
@@ -34,7 +34,8 @@ const CONFIG = {
     targetTab: 'Olo',         // auto-scroll only works on this timeline tab
     maxAgeMinutes: 180,       // ignore a saved position older than this
     saveIntervalMs: 2000,     // how often the current position is stored
-    scrollStepDelayMs: 300,   // pause between scroll steps while searching
+    stepSettleMs: 500,        // DOM must stay unchanged this long = content loaded
+    stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
     maxScrollAttempts: 150,   // give up searching after this many scroll steps
     autoRestore: true         // jump back automatically when the timeline loads
 };
