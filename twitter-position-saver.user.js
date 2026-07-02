@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.5
+// @version      3.6
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -433,16 +433,61 @@
             a.getDate() === b.getDate();
     }
 
-    // Scroll down the Olo timeline until the oldest tweet still from today, i.e. the
-    // boundary right before yesterday's tweets begin, then center it.
+    function startOfDay(date) {
+        const d = new Date(date);
+        d.setHours(0, 0, 0, 0);
+        return d;
+    }
+
+    function addDays(date, days) {
+        const d = new Date(date);
+        d.setDate(d.getDate() + days);
+        return d;
+    }
+
+    function isBeforeDay(date, day) {
+        return startOfDay(date) < startOfDay(day);
+    }
+
+    function formatDayLabel(day) {
+        const today = startOfDay(new Date());
+        const target = startOfDay(day);
+        const diffDays = Math.round((today - target) / 86400000);
+        if (diffDays === 0) return 'today';
+        if (diffDays === 1) return 'yesterday';
+        return target.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+    }
+
+    // Pick the calendar day to scroll to from the current viewport. If we're already
+    // sitting on that day's boundary, step back one day so repeated presses walk
+    // backward through the timeline day by day.
+    function getScrollTargetDay() {
+        const top = getTopTweet();
+        const fallback = startOfDay(new Date());
+        if (!top?.time) return fallback;
+
+        const topDay = startOfDay(new Date(top.time));
+        let beforeCount = 0;
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const date = tweetDate(article);
+            if (date && isBeforeDay(date, topDay)) beforeCount++;
+        }
+
+        if (beforeCount >= 2) return addDays(topDay, -1);
+        return topDay;
+    }
+
+    // Scroll down the Olo timeline until the oldest tweet still on the target day,
+    // i.e. the boundary right before the previous day's tweets begin, then center it.
     async function scrollToStartOfDay() {
         abortRestore();
         const ctrl = { aborted: false };
         currentAbort = ctrl;
         restoring = true;
 
-        const today = new Date();
-        showPanel('Auto-scrolling to the start of today…');
+        const targetDay = getScrollTargetDay();
+        const dayLabel = formatDayLabel(targetDay);
+        showPanel(`Auto-scrolling to the start of ${dayLabel}…`);
 
         try {
             const switched = await ensureTargetTab(ctrl);
@@ -453,63 +498,63 @@
             await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
-            let deepestTodayTime = null; // earliest today time reached so far (for progress)
+            let deepestTargetTime = null; // earliest target-day time reached so far (for progress)
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
-                let beforeTodayCount = 0;
-                let oldestTodayEl = null;
-                let oldestTodayTime = null;
+                let beforeTargetCount = 0;
+                let oldestTargetEl = null;
+                let oldestTargetTime = null;
 
                 for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
                     const date = tweetDate(article);
                     if (!date) continue;
-                    if (isSameDay(date, today)) {
-                        if (!oldestTodayTime || date < oldestTodayTime) {
-                            oldestTodayTime = date;
-                            oldestTodayEl = article;
+                    if (isSameDay(date, targetDay)) {
+                        if (!oldestTargetTime || date < oldestTargetTime) {
+                            oldestTargetTime = date;
+                            oldestTargetEl = article;
                         }
-                    } else if (date < today) {
-                        beforeTodayCount++;
+                    } else if (isBeforeDay(date, targetDay)) {
+                        beforeTargetCount++;
                     }
                 }
 
-                if (oldestTodayTime && (!deepestTodayTime || oldestTodayTime < deepestTodayTime)) {
-                    deepestTodayTime = oldestTodayTime;
+                if (oldestTargetTime && (!deepestTargetTime || oldestTargetTime < deepestTargetTime)) {
+                    deepestTargetTime = oldestTargetTime;
                 }
 
-                // Require a couple of pre-today tweets so a single old repost among today's
-                // tweets doesn't trigger the boundary prematurely.
-                const sawBeforeToday = beforeTodayCount >= 2;
+                // Require a couple of pre-target tweets so a single old repost among the
+                // target day's tweets doesn't trigger the boundary prematurely.
+                const sawBeforeTarget = beforeTargetCount >= 2;
 
-                // Once yesterday's tweets appear, the oldest today tweet in view is the start of the day.
-                if (sawBeforeToday) {
-                    if (oldestTodayEl) {
-                        oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(oldestTodayEl);
-                        return finishPanel(`Reached the start of today (${formatTweetTime(oldestTodayTime)})`);
+                // Once the previous day's tweets appear, the oldest target-day tweet in view is the boundary.
+                if (sawBeforeTarget) {
+                    if (oldestTargetEl) {
+                        oldestTargetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(oldestTargetEl);
+                        return finishPanel(`Reached the start of ${dayLabel} (${formatTweetTime(oldestTargetTime)})`);
                     }
-                    return finishPanel('No tweets from today');
+                    return finishPanel(`No tweets from ${dayLabel}`);
                 }
 
-                updatePanel(deepestTodayTime
-                    ? `Auto-scrolling to the start of today… now at ${formatTweetTime(deepestTodayTime)}`
-                    : 'Auto-scrolling to the start of today…');
+                updatePanel(deepestTargetTime
+                    ? `Auto-scrolling to the start of ${dayLabel}… now at ${formatTweetTime(deepestTargetTime)}`
+                    : `Auto-scrolling to the start of ${dayLabel}…`);
 
                 const outcome = await scrollDownAndWait(null, ctrl);
                 if (outcome === 'aborted') break;
 
-                // Reached the end of the feed without crossing into yesterday.
+                // Reached the end of the feed without crossing into the previous day.
                 if (outcome === 'end') {
-                    if (oldestTodayEl) {
-                        oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(oldestTodayEl);
-                        return finishPanel(`Reached the oldest loaded tweet from today (${formatTweetTime(oldestTodayTime)})`);
+                    if (oldestTargetEl) {
+                        oldestTargetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(oldestTargetEl);
+                        return finishPanel(`Reached the oldest loaded tweet from ${dayLabel} (${formatTweetTime(oldestTargetTime)})`);
                     }
-                    return finishPanel('No tweets from today');
+                    return finishPanel(`No tweets from ${dayLabel}`);
                 }
             }
 
-            finishPanel(ctrl.aborted ? 'Stopped' : 'Start of today not found');
+            finishPanel(ctrl.aborted ? 'Stopped' : `Start of ${dayLabel} not found`);
         } finally {
             restoring = false;
             if (currentAbort === ctrl) currentAbort = null;
@@ -617,7 +662,7 @@
         btn.id = BUTTON_ID;
         btn.type = 'button';
         btn.textContent = '🌅';
-        btn.title = 'Scroll to the start of today';
+        btn.title = 'Scroll to the start of this day (press again for the previous day)';
         btn.style.cssText = `
             position: fixed;
             bottom: ${window.innerWidth <= 500 ? '150px' : '96px'};
