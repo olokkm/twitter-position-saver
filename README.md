@@ -34,7 +34,6 @@ const CONFIG = {
     targetTab: 'Olo',         // auto-scroll only works on this timeline tab
     maxAgeMinutes: 180,       // ignore a saved position older than this
     saveIntervalMs: 2000,     // how often the current position is stored
-    stepSettleMs: 500,        // DOM must stay unchanged this long = content loaded
     stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
     maxScrollAttempts: 150,   // give up searching after this many scroll steps
     autoRestore: true         // jump back automatically when the timeline loads

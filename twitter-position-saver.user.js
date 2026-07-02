@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.3
+// @version      3.4
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -20,7 +20,6 @@
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
         maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
-        stepSettleMs: 500,        // DOM must stay unchanged this long = content loaded
         stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
         autoRestore: true         // jump back automatically when the timeline loads
@@ -276,31 +275,23 @@
             await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
-            let stuckSteps = 0;
-
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
                 let tweet = findTweetById(saved.tweetId);
 
                 if (!tweet) {
                     updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
 
-                    const beforeY = window.scrollY;
+                    const knownIds = currentTweetIds();
                     // Overlap a little so a tweet can't slip between two renders.
                     window.scrollBy(0, Math.round(window.innerHeight * 0.85));
 
-                    // Don't move on until the newly revealed tweets have loaded (or the
-                    // target shows up / we hit the safety cap) — never a blind fixed delay.
-                    const outcome = await waitForStep(saved.tweetId, ctrl);
+                    // Move on the moment new tweets render (or the target shows up).
+                    const outcome = await waitForStep(saved.tweetId, ctrl, knownIds);
                     if (outcome === 'aborted') break;
 
                     tweet = findTweetById(saved.tweetId);
                     if (!tweet) {
-                        // Reached the end: can't scroll further and nothing new loaded.
-                        if (outcome === 'settled' && window.scrollY <= beforeY + 2) {
-                            if (++stuckSteps >= 3) break;
-                        } else {
-                            stuckSteps = 0;
-                        }
+                        if (outcome === 'end') break; // reached the end, target not found
                         continue;
                     }
                 }
@@ -323,33 +314,57 @@
         return (document.scrollingElement || document.documentElement).scrollHeight;
     }
 
-    // Wait until one scroll step's content is ready: the target appears, or the page
-    // height has been stable for `stepSettleMs` (loading + rendering finished), or the
-    // per-step cap is reached. This replaces any fixed, timing-based delay.
-    async function waitForStep(targetId, ctrl) {
+    function currentTweetIds() {
+        const ids = new Set();
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const id = extractTweetId(article);
+            if (id) ids.add(id);
+        }
+        return ids;
+    }
+
+    function hasNewTweet(knownIds) {
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const id = extractTweetId(article);
+            if (id && !knownIds.has(id)) return true;
+        }
+        return false;
+    }
+
+    // Resolve as soon as fresh content is visible: the target appears, or a tweet id we
+    // hadn't seen before renders (= loaded, safe to scroll on). Returns 'end' only when
+    // we're parked at the very bottom with nothing new, or the safety cap is hit. No
+    // fixed settle delay — this is the fast path.
+    async function waitForStep(targetId, ctrl, knownIds) {
         const start = Date.now();
-        let lastHeight = documentHeight();
-        let stableSince = Date.now();
+        let bottomSince = null;
 
         while (Date.now() - start < CONFIG.stepMaxWaitMs) {
             if (ctrl.aborted) return 'aborted';
             if (targetId && findTweetById(targetId)) return 'found';
+            if (knownIds && hasNewTweet(knownIds)) return 'loaded';
 
-            const height = documentHeight();
-            if (height !== lastHeight) {
-                lastHeight = height;
-                stableSince = Date.now();
-            } else if (Date.now() - stableSince >= CONFIG.stepSettleMs) {
-                return 'settled';
+            const atBottom = window.scrollY + window.innerHeight >= documentHeight() - 2;
+            if (atBottom) {
+                if (bottomSince === null) bottomSince = Date.now();
+                else if (Date.now() - bottomSince >= 1000) return 'end';
+            } else {
+                bottomSince = null;
             }
 
-            await sleep(100);
+            await sleep(50);
         }
-        return 'settled';
+        return 'end';
     }
 
-    function waitForContentToSettle(ctrl) {
-        return waitForStep(null, ctrl);
+    // Wait until the timeline has rendered at least one tweet.
+    async function waitForContentToSettle(ctrl, maxWaitMs = 8000) {
+        const start = Date.now();
+        while (Date.now() - start < maxWaitMs) {
+            if (ctrl.aborted) return;
+            if (document.querySelector('article[data-testid="tweet"]')) return;
+            await sleep(80);
+        }
     }
 
     function tweetDate(article) {
@@ -384,7 +399,6 @@
             await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
-            let stuckSteps = 0;
             let deepestTodayTime = null; // earliest today time reached so far (for progress)
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
@@ -427,24 +441,20 @@
                     ? `Auto-scrolling to the start of today… now at ${formatTweetTime(deepestTodayTime)}`
                     : 'Auto-scrolling to the start of today…');
 
-                const beforeY = window.scrollY;
+                const knownIds = currentTweetIds();
                 window.scrollBy(0, Math.round(window.innerHeight * 0.85));
 
-                const outcome = await waitForStep(null, ctrl);
+                const outcome = await waitForStep(null, ctrl, knownIds);
                 if (outcome === 'aborted') break;
 
                 // Reached the end of the feed without crossing into yesterday.
-                if (outcome === 'settled' && window.scrollY <= beforeY + 2) {
-                    if (++stuckSteps >= 3) {
-                        if (oldestTodayEl) {
-                            oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            highlight(oldestTodayEl);
-                            return finishPanel(`Reached the oldest loaded tweet from today (${formatTweetTime(oldestTodayTime)})`);
-                        }
-                        return finishPanel('No tweets from today');
+                if (outcome === 'end') {
+                    if (oldestTodayEl) {
+                        oldestTodayEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(oldestTodayEl);
+                        return finishPanel(`Reached the oldest loaded tweet from today (${formatTweetTime(oldestTodayTime)})`);
                     }
-                } else {
-                    stuckSteps = 0;
+                    return finishPanel('No tweets from today');
                 }
             }
 
