@@ -20,6 +20,7 @@
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
         maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
+        stepSettleMs: 400,        // scrollHeight stable this long = batch rendered
         stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
         autoRestore: true         // jump back automatically when the timeline loads
@@ -276,6 +277,8 @@
             await waitForContentToSettle(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
 
+            let stuckSteps = 0;
+
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
                 let tweet = findTweetById(saved.tweetId);
 
@@ -287,7 +290,14 @@
                     if (outcome === 'end') break;
 
                     tweet = findTweetById(saved.tweetId);
-                    if (!tweet) continue;
+                    if (!tweet) {
+                        if (outcome === 'stuck') {
+                            if (++stuckSteps >= 3) break;
+                        } else {
+                            stuckSteps = 0;
+                        }
+                        continue;
+                    }
                 }
 
                 // Act immediately so virtualization can't recycle the node away.
@@ -312,16 +322,12 @@
         return scrollRoot().scrollTop;
     }
 
-    function documentHeight() {
-        return scrollRoot().scrollHeight;
-    }
-
     function isAtScrollBottom() {
         const root = scrollRoot();
         return root.scrollTop + window.innerHeight >= root.scrollHeight - 2;
     }
 
-    // Lowest tweet still visible — best anchor for triggering the next batch load.
+    // Lowest tweet still visible — anchor for triggering the next batch load.
     function getBottomVisibleTweet() {
         let bottomTweet = null;
         let maxBottom = -1;
@@ -342,39 +348,41 @@
         const beforeY = scrollTop();
         const beforeHeight = root.scrollHeight;
         const bottomTweet = getBottomVisibleTweet();
-        const bottomId = bottomTweet ? extractTweetId(bottomTweet) : null;
 
         if (bottomTweet) {
             bottomTweet.scrollIntoView({ block: 'end', behavior: 'auto' });
         }
 
-        const nudge = Math.round(window.innerHeight * 0.55);
+        const nudge = Math.round(window.innerHeight * 0.85);
         root.scrollTop += nudge;
         window.scrollBy(0, nudge);
 
-        return { beforeY, beforeHeight, bottomId };
+        return { beforeY, beforeHeight };
     }
 
-    function stepMadeProgress(stepBefore) {
-        const root = scrollRoot();
-        if (scrollTop() > stepBefore.beforeY + 40) return true;
-        if (root.scrollHeight > stepBefore.beforeHeight + 40) return true;
-
-        const bottomTweet = getBottomVisibleTweet();
-        const bottomId = bottomTweet ? extractTweetId(bottomTweet) : null;
-        return !!(bottomId && bottomId !== stepBefore.bottomId);
+    function stepMoved(stepBefore) {
+        return scrollTop() > stepBefore.beforeY + 40 ||
+            scrollRoot().scrollHeight > stepBefore.beforeHeight + 40;
     }
 
-    // Resolve once the target appears or the scroll step actually moved the feed.
-    // Returns 'end' only at the true bottom; 'stuck' on timeout so callers can retry.
-    async function waitForStep(targetId, ctrl, stepBefore) {
+    // Wait until scrollHeight stops changing (= batch rendered) or the target appears.
+    async function waitForStep(targetId, ctrl) {
         const start = Date.now();
+        let lastHeight = scrollRoot().scrollHeight;
+        let stableSince = Date.now();
         let bottomSince = null;
 
         while (Date.now() - start < CONFIG.stepMaxWaitMs) {
             if (ctrl.aborted) return 'aborted';
             if (targetId && findTweetById(targetId)) return 'found';
-            if (stepMadeProgress(stepBefore)) return 'progress';
+
+            const height = scrollRoot().scrollHeight;
+            if (height !== lastHeight) {
+                lastHeight = height;
+                stableSince = Date.now();
+            } else if (Date.now() - stableSince >= CONFIG.stepSettleMs) {
+                return 'settled';
+            }
 
             if (isAtScrollBottom()) {
                 if (bottomSince === null) bottomSince = Date.now();
@@ -385,30 +393,26 @@
 
             await sleep(50);
         }
-        return 'stuck';
+        return 'settled';
     }
 
     async function scrollDownAndWait(targetId, ctrl) {
-        let stepBefore = scrollDownStep();
-        let outcome = await waitForStep(targetId, ctrl, stepBefore);
-        if (outcome !== 'stuck') return outcome;
+        const stepBefore = scrollDownStep();
+        let outcome = await waitForStep(targetId, ctrl);
+        if (outcome === 'aborted' || outcome === 'found' || outcome === 'end') return outcome;
 
-        for (let retry = 1; retry <= 2 && !ctrl.aborted; retry++) {
-            stepBefore = scrollDownStep();
-            outcome = await waitForStep(targetId, ctrl, stepBefore);
-            if (outcome !== 'stuck') return outcome;
+        if (stepMoved(stepBefore)) return 'progress';
 
-            const root = scrollRoot();
-            const jump = Math.round(window.innerHeight * retry);
-            root.scrollTop += jump;
-            window.scrollBy(0, jump);
-            await sleep(300);
-            outcome = await waitForStep(targetId, ctrl, stepBefore);
-            if (outcome !== 'stuck') return outcome;
-        }
+        if (isAtScrollBottom()) return 'end';
 
-        // Don't stall on a slow batch — let the outer loop try another step.
-        return isAtScrollBottom() ? 'end' : 'progress';
+        // Stuck mid-feed — jump to the bottom of loaded content and wait once more.
+        const root = scrollRoot();
+        root.scrollTop = root.scrollHeight;
+        window.scrollTo(0, root.scrollHeight);
+        await sleep(300);
+        outcome = await waitForStep(targetId, ctrl);
+        if (outcome === 'found' || outcome === 'end') return outcome;
+        return stepMoved(stepBefore) ? 'progress' : 'stuck';
     }
 
     // Wait until the timeline has rendered at least one tweet.
