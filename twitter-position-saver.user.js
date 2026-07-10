@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.6
+// @version      3.8
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -20,7 +20,6 @@
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
         maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
-        stepSettleMs: 400,        // scrollHeight stable this long = batch rendered
         stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
         autoRestore: true         // jump back automatically when the timeline loads
@@ -73,8 +72,7 @@
         return location.pathname;
     }
 
-    function isTimelinePage() {
-        const p = currentPath();
+    function isTimelinePath(p) {
         return p === '/' ||
             p === '/home' ||
             p === '/i/bookmarks' ||
@@ -82,6 +80,10 @@
             /^\/i\/lists\/\d+$/.test(p) ||
             /^\/[^/]+$/.test(p) ||
             /^\/[^/]+\/(with_replies|media|likes|highlights)$/.test(p);
+    }
+
+    function isTimelinePage() {
+        return isTimelinePath(currentPath());
     }
 
     function extractTweetId(article) {
@@ -95,17 +97,25 @@
         return time ? time.getAttribute('datetime') : null;
     }
 
-    // Topmost tweet sitting in the upper half of the viewport.
+    // Topmost tweet occupying the upper half of the viewport (including ones
+    // partially tucked under the sticky mobile header where rect.top < 0).
     function getTopTweet() {
         const articles = document.querySelectorAll('article[data-testid="tweet"]');
+        let best = null;
+        let bestTop = Infinity;
+        const headerSlack = 80;
+        const upper = window.innerHeight * 0.5;
         for (const article of articles) {
             const rect = article.getBoundingClientRect();
-            if (rect.top >= 0 && rect.top < window.innerHeight * 0.5) {
+            if (rect.bottom <= headerSlack || rect.top >= upper) continue;
+            if (rect.top < bestTop) {
                 const id = extractTweetId(article);
-                if (id) return { id, time: getTweetTime(article) };
+                if (!id) continue;
+                bestTop = rect.top;
+                best = { id, time: getTweetTime(article) };
             }
         }
-        return null;
+        return best;
     }
 
     function findTweetById(id) {
@@ -327,6 +337,23 @@
         return root.scrollTop + window.innerHeight >= root.scrollHeight - 2;
     }
 
+    function currentTweetIds() {
+        const ids = new Set();
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const id = extractTweetId(article);
+            if (id) ids.add(id);
+        }
+        return ids;
+    }
+
+    function hasNewTweet(knownIds) {
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const id = extractTweetId(article);
+            if (id && !knownIds.has(id)) return true;
+        }
+        return false;
+    }
+
     // Lowest tweet still visible — anchor for triggering the next batch load.
     function getBottomVisibleTweet() {
         let bottomTweet = null;
@@ -345,8 +372,6 @@
     // Scroll the bottom tweet into view, then nudge past it so X fetches older tweets.
     function scrollDownStep() {
         const root = scrollRoot();
-        const beforeY = scrollTop();
-        const beforeHeight = root.scrollHeight;
         const bottomTweet = getBottomVisibleTweet();
 
         if (bottomTweet) {
@@ -356,63 +381,64 @@
         const nudge = Math.round(window.innerHeight * 0.85);
         root.scrollTop += nudge;
         window.scrollBy(0, nudge);
-
-        return { beforeY, beforeHeight };
     }
 
-    function stepMoved(stepBefore) {
-        return scrollTop() > stepBefore.beforeY + 40 ||
-            scrollRoot().scrollHeight > stepBefore.beforeHeight + 40;
-    }
-
-    // Wait until scrollHeight stops changing (= batch rendered) or the target appears.
-    async function waitForStep(targetId, ctrl) {
+    // Advance as soon as a new tweet id renders (content loaded). Fall back to the
+    // hard cap / true bottom-of-feed — no fixed settle delay.
+    async function waitForStep(targetId, ctrl, knownIds) {
         const start = Date.now();
-        let lastHeight = scrollRoot().scrollHeight;
-        let stableSince = Date.now();
         let bottomSince = null;
+        let bottomHeight = null;
 
         while (Date.now() - start < CONFIG.stepMaxWaitMs) {
             if (ctrl.aborted) return 'aborted';
             if (targetId && findTweetById(targetId)) return 'found';
-
-            const height = scrollRoot().scrollHeight;
-            if (height !== lastHeight) {
-                lastHeight = height;
-                stableSince = Date.now();
-            } else if (Date.now() - stableSince >= CONFIG.stepSettleMs) {
-                return 'settled';
-            }
+            if (knownIds && hasNewTweet(knownIds)) return 'loaded';
 
             if (isAtScrollBottom()) {
-                if (bottomSince === null) bottomSince = Date.now();
-                else if (Date.now() - bottomSince >= 1000) return 'end';
+                const height = scrollRoot().scrollHeight;
+                if (bottomSince === null || height !== bottomHeight) {
+                    bottomSince = Date.now();
+                    bottomHeight = height;
+                } else if (Date.now() - bottomSince >= 1500) {
+                    return 'end';
+                }
             } else {
                 bottomSince = null;
+                bottomHeight = null;
             }
 
             await sleep(50);
         }
-        return 'settled';
+        return 'timeout';
     }
 
     async function scrollDownAndWait(targetId, ctrl) {
-        const stepBefore = scrollDownStep();
-        let outcome = await waitForStep(targetId, ctrl);
+        const knownIds = currentTweetIds();
+        const beforeY = scrollTop();
+        const beforeHeight = scrollRoot().scrollHeight;
+
+        scrollDownStep();
+        let outcome = await waitForStep(targetId, ctrl, knownIds);
         if (outcome === 'aborted' || outcome === 'found' || outcome === 'end') return outcome;
+        if (outcome === 'loaded') return 'progress';
 
-        if (stepMoved(stepBefore)) return 'progress';
-
+        // Timeout with no new ids — if we still moved, keep going; otherwise recover.
+        if (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40) {
+            return 'progress';
+        }
         if (isAtScrollBottom()) return 'end';
 
-        // Stuck mid-feed — jump to the bottom of loaded content and wait once more.
         const root = scrollRoot();
         root.scrollTop = root.scrollHeight;
         window.scrollTo(0, root.scrollHeight);
         await sleep(300);
-        outcome = await waitForStep(targetId, ctrl);
+        outcome = await waitForStep(targetId, ctrl, knownIds);
         if (outcome === 'found' || outcome === 'end') return outcome;
-        return stepMoved(stepBefore) ? 'progress' : 'stuck';
+        if (outcome === 'loaded') return 'progress';
+        return (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40)
+            ? 'progress'
+            : 'stuck';
     }
 
     // Wait until the timeline has rendered at least one tweet.
@@ -503,39 +529,69 @@
             if (ctrl.aborted) return finishPanel('Stopped');
 
             let deepestTargetTime = null; // earliest target-day time reached so far (for progress)
+            let deepestTargetId = null;
+            let pastBoundaryVotes = 0;
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
-                let beforeTargetCount = 0;
                 let oldestTargetEl = null;
                 let oldestTargetTime = null;
+                const visible = [];
 
                 for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
                     const date = tweetDate(article);
                     if (!date) continue;
+                    const rect = article.getBoundingClientRect();
+                    if (rect.bottom > 0 && rect.top < window.innerHeight) {
+                        visible.push({ article, date, top: rect.top });
+                    }
                     if (isSameDay(date, targetDay)) {
                         if (!oldestTargetTime || date < oldestTargetTime) {
                             oldestTargetTime = date;
                             oldestTargetEl = article;
                         }
-                    } else if (isBeforeDay(date, targetDay)) {
-                        beforeTargetCount++;
                     }
                 }
 
-                if (oldestTargetTime && (!deepestTargetTime || oldestTargetTime < deepestTargetTime)) {
+                const foundEarlierTarget = !!(oldestTargetTime &&
+                    (!deepestTargetTime || oldestTargetTime < deepestTargetTime));
+                if (foundEarlierTarget) {
                     deepestTargetTime = oldestTargetTime;
+                    deepestTargetId = extractTweetId(oldestTargetEl);
+                    pastBoundaryVotes = 0;
                 }
 
-                // Require a couple of pre-target tweets so a single old repost among the
-                // target day's tweets doesn't trigger the boundary prematurely.
-                const sawBeforeTarget = beforeTargetCount >= 2;
+                // Day boundary = the bottom of the viewport is already on the previous day.
+                // Mid-feed old reposts don't count — only content we've scrolled past.
+                visible.sort((a, b) => b.top - a.top);
+                const bottomVisible = visible.slice(0, 3);
+                const bottomIsPrevDay = bottomVisible.length >= 2 &&
+                    bottomVisible.every(v => isBeforeDay(v.date, targetDay));
+                if (bottomIsPrevDay && !foundEarlierTarget) pastBoundaryVotes++;
 
-                // Once the previous day's tweets appear, the oldest target-day tweet in view is the boundary.
-                if (sawBeforeTarget) {
-                    if (oldestTargetEl) {
-                        oldestTargetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(oldestTargetEl);
-                        return finishPanel(`Reached the start of ${dayLabel} (${formatTweetTime(oldestTargetTime)})`);
+                if (pastBoundaryVotes >= 2 && deepestTargetId) {
+                    let landEl = oldestTargetEl || findTweetById(deepestTargetId);
+                    for (let nudge = 0; !landEl && nudge < 8; nudge++) {
+                        window.scrollBy(0, -Math.round(window.innerHeight * 0.7));
+                        await sleep(250);
+                        landEl = findTweetById(deepestTargetId);
+                        if (!landEl) {
+                            let best = null, bestTime = null;
+                            for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+                                const date = tweetDate(article);
+                                if (!date || !isSameDay(date, targetDay)) continue;
+                                if (!bestTime || date < bestTime) {
+                                    bestTime = date;
+                                    best = article;
+                                }
+                            }
+                            landEl = best;
+                        }
+                    }
+                    if (landEl) {
+                        landEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(landEl);
+                        const landTime = tweetDate(landEl) || deepestTargetTime;
+                        return finishPanel(`Reached the start of ${dayLabel} (${formatTweetTime(landTime)})`);
                     }
                     return finishPanel(`No tweets from ${dayLabel}`);
                 }
@@ -549,10 +605,13 @@
 
                 // Reached the end of the feed without crossing into the previous day.
                 if (outcome === 'end') {
-                    if (oldestTargetEl) {
-                        oldestTargetEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(oldestTargetEl);
-                        return finishPanel(`Reached the oldest loaded tweet from ${dayLabel} (${formatTweetTime(oldestTargetTime)})`);
+                    const landEl = oldestTargetEl ||
+                        (deepestTargetId ? findTweetById(deepestTargetId) : null);
+                    if (landEl) {
+                        landEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(landEl);
+                        const landTime = oldestTargetTime || deepestTargetTime;
+                        return finishPanel(`Reached the oldest loaded tweet from ${dayLabel} (${formatTweetTime(landTime)})`);
                     }
                     return finishPanel(`No tweets from ${dayLabel}`);
                 }
@@ -702,6 +761,8 @@
     // ============ INIT ============
 
     let started = false;
+    let lastSeenPath = null;
+    let restoreCooldownUntil = 0;
 
     function setupListeners() {
         window.addEventListener('beforeunload', () => {
@@ -716,6 +777,51 @@
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') abortRestore();
         });
+
+        // X is an SPA — document load only happens once, so watch History API navigations.
+        const notify = () => onPathChange();
+        window.addEventListener('popstate', notify);
+        const wrap = (fn) => function (...args) {
+            const ret = fn.apply(this, args);
+            notify();
+            return ret;
+        };
+        history.pushState = wrap(history.pushState.bind(history));
+        history.replaceState = wrap(history.replaceState.bind(history));
+    }
+
+    async function maybeAutoRestore() {
+        if (!CONFIG.autoRestore || restoring) return;
+        if (!isTimelinePage()) return;
+        if (Date.now() < restoreCooldownUntil) return;
+
+        const saved = readSavedPosition();
+        if (!saved) return;
+        if (saved.path && saved.path !== currentPath()) return;
+
+        restoreCooldownUntil = Date.now() + 2000;
+        const ready = await waitForTimeline();
+        if (!ready || !isTimelinePage()) return;
+        if (saved.path && saved.path !== currentPath()) return;
+        if (restoring) return;
+
+        await restore(saved);
+    }
+
+    function onPathChange() {
+        const path = currentPath();
+        if (path === lastSeenPath) return;
+
+        const prev = lastSeenPath;
+        if (restoring) abortRestore();
+        else if (prev && isTimelinePath(prev)) savePosition();
+
+        lastSeenPath = path;
+
+        // Returning to a timeline via client-side nav should restore again.
+        if (isTimelinePath(path) && prev && prev !== path) {
+            maybeAutoRestore();
+        }
     }
 
     async function start() {
@@ -723,16 +829,12 @@
         started = true;
 
         log('started on', location.href);
+        lastSeenPath = currentPath();
         setupListeners();
         ensureButton();
-
-        const saved = readSavedPosition();
-        const ready = await waitForTimeline();
-        if (ready && CONFIG.autoRestore && saved) {
-            await restore(saved);
-        }
-
         setInterval(savePosition, CONFIG.saveIntervalMs);
+
+        await maybeAutoRestore();
     }
 
     if (document.readyState === 'loading') {

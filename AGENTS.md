@@ -21,4 +21,4 @@
 ## Behavior notes
 
 - Auto-restore only runs on the custom timeline tab named in `CONFIG.targetTab` (default `"Olo"`); it switches to that tab and confirms it is active before scrolling.
-- While searching, wait for content to actually load between scroll steps (DOM height stable for `stepSettleMs`) instead of a fixed delay.
+- While searching, move to the next scroll step as soon as a new tweet id renders (content loaded), not after a fixed delay. `waitForStep` only falls back to `stepMaxWaitMs` / bottom-of-feed detection.
