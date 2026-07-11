@@ -7,6 +7,8 @@
 // @license      MIT
 // @match        https://twitter.com/*
 // @match        https://x.com/*
+// @updateURL    https://raw.githubusercontent.com/olokkm/twitter-position-saver/main/twitter-position-saver.user.js
+// @downloadURL  https://raw.githubusercontent.com/olokkm/twitter-position-saver/main/twitter-position-saver.user.js
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        unsafeWindow

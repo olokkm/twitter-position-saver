@@ -19,15 +19,17 @@ During the search a small panel appears at the bottom showing the **timestamp of
 
 ### Gear browser (iOS)
 
-X's Content Security Policy blocks userscripts on iOS, so use the Web Extension instead:
+X's Content Security Policy blocks userscripts on iOS, so use the Web Extension instead.
 
-1. Download the latest XPI (stable link — always the newest release):
-   [`twitter-position-saver-gear.xpi`](../../releases/latest/download/twitter-position-saver-gear.xpi)
+**Important:** use the raw GitHub URL below. The `releases/latest/download/...` link redirects, and Gear's updater often saves an empty file — that shows up as `ZIPFoundation.Archive.ArchiveError 13`.
+
+1. In Safari/Files, download:
+   [`twitter-position-saver-gear.xpi`](https://raw.githubusercontent.com/olokkm/twitter-position-saver/main/twitter-position-saver-gear.xpi)
 2. In Gear: **Settings → Web Extensions → Import** and select the XPI.
-3. To update later, download the same link again and re-import.
+3. To update: delete the old extension (or import again over it) using the **same raw link**.
 4. If content scripts don't run, open the extension's settings and **allow access to x.com**, then reload the page.
 
-Every push to `main` publishes a new GitHub Release with a bumped version and a fresh XPI.
+Every push to `main` publishes a new GitHub Release and refreshes the raw XPI on `main`.
 
 ## Configuration
 
@@ -54,7 +56,7 @@ bash scripts/build-gear-xpi.sh
 
 This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`), syncs `gear-extension/manifest.json` version from the userscript `@version`, and packages `twitter-position-saver-gear.xpi`.
 
-Pushes to `main` run `.github/workflows/release.yml`: bump patch version → build XPI → tag + GitHub Release. Direct download stays at [`releases/latest/download/twitter-position-saver-gear.xpi`](../../releases/latest/download/twitter-position-saver-gear.xpi).
+Pushes to `main` run `.github/workflows/release.yml`: bump patch version → build XPI → commit the XPI to `main` (for the raw install link) → tag + GitHub Release.
 
 ## Compatibility
 

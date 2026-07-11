@@ -1,0 +1,12 @@
+{
+  "addons": {
+    "twitter-position-saver@olokkm": {
+      "updates": [
+        {
+          "version": "3.14",
+          "update_link": "https://raw.githubusercontent.com/olokkm/twitter-position-saver/main/twitter-position-saver-gear.xpi"
+        }
+      ]
+    }
+  }
+}
