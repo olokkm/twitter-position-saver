@@ -15,9 +15,8 @@
 // ==/UserScript==
 
 /* TPS_SCROLL_GUARD_BEGIN */
-// Runs in the page JS realm (Gear: world MAIN; Tampermonkey: unsafeWindow).
-// Blocks X's programmatic jump-to-top when new tweets arrive, while still
-// allowing real user gestures and our own restore/search scrolls.
+// Page-realm scroll block (Tampermonkey: unsafeWindow). Gear content scripts are
+// isolated, so on Gear we rely on yank detection/restore in the main script.
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);

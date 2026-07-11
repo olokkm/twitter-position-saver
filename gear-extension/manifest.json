@@ -10,18 +10,6 @@
         "https://twitter.com/*"
       ],
       "js": [
-        "scroll-guard.js"
-      ],
-      "run_at": "document_start",
-      "all_frames": false,
-      "world": "MAIN"
-    },
-    {
-      "matches": [
-        "https://x.com/*",
-        "https://twitter.com/*"
-      ],
-      "js": [
         "content.js"
       ],
       "run_at": "document_start",
