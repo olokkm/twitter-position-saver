@@ -21,9 +21,13 @@ During the search a small panel appears at the bottom showing the **timestamp of
 
 X's Content Security Policy blocks userscripts on iOS, so use the Web Extension instead:
 
-1. Download `twitter-position-saver-gear.xpi` from the [latest release](../../releases/latest).
+1. Download the latest XPI (stable link — always the newest release):
+   [`twitter-position-saver-gear.xpi`](../../releases/latest/download/twitter-position-saver-gear.xpi)
 2. In Gear: **Settings → Web Extensions → Import** and select the XPI.
-3. If content scripts don't run, open the extension's settings and **allow access to x.com**, then reload the page.
+3. To update later, download the same link again and re-import.
+4. If content scripts don't run, open the extension's settings and **allow access to x.com**, then reload the page.
+
+Every push to `main` publishes a new GitHub Release with a bumped version and a fresh XPI.
 
 ## Configuration
 
@@ -48,7 +52,9 @@ The Gear Web Extension is generated from the userscript, so you only edit one fi
 bash scripts/build-gear-xpi.sh
 ```
 
-This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`) and packages `twitter-position-saver-gear.xpi`. Releases build and attach the XPI automatically via `.github/workflows/release.yml`.
+This regenerates `gear-extension/content.js` (userscript with the `GM_*` storage swapped for `localStorage`), syncs `gear-extension/manifest.json` version from the userscript `@version`, and packages `twitter-position-saver-gear.xpi`.
+
+Pushes to `main` run `.github/workflows/release.yml`: bump patch version → build XPI → tag + GitHub Release. Direct download stays at [`releases/latest/download/twitter-position-saver-gear.xpi`](../../releases/latest/download/twitter-position-saver-gear.xpi).
 
 ## Compatibility
 

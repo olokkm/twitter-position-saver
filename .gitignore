@@ -3,3 +3,9 @@ gear-extension/content.js
 
 # Built by scripts/build-gear-xpi.sh (also attached to GitHub Releases)
 twitter-position-saver-gear.xpi
+
+# Local/temp helpers under scripts/ — keep only the build/release scripts tracked
+scripts/*
+!scripts/build-gear-extension.mjs
+!scripts/build-gear-xpi.sh
+!scripts/bump-version.mjs

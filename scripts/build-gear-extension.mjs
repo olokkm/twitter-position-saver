@@ -5,6 +5,16 @@ import { fileURLToPath } from 'url';
 const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
 const src = fs.readFileSync(path.join(root, 'twitter-position-saver.user.js'), 'utf8');
 
+const versionMatch = src.match(/\/\/\s*@version\s+(\d+(?:\.\d+)+)/);
+if (versionMatch) {
+  const manifestPath = path.join(root, 'gear-extension', 'manifest.json');
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
+  if (manifest.version !== versionMatch[1]) {
+    manifest.version = versionMatch[1];
+    fs.writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  }
+}
+
 let body = src.replace(/^\/\/ ==UserScript==[\s\S]*?\/\/ ==\/UserScript==\n\n/, '');
 
 const storageImpl = `const STORAGE_PREFIX = 'tps_';
