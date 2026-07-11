@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.8
+// @version      3.10
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -18,7 +18,6 @@
 
     const CONFIG = {
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
-        maxAgeMinutes: 180,       // ignore a saved position older than this
         saveIntervalMs: 2000,     // how often the current position is stored
         stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
@@ -258,16 +257,6 @@
     async function restore(saved) {
         if (!saved) return;
 
-        const ageMinutes = (Date.now() - saved.timestamp) / 60000;
-        if (ageMinutes > CONFIG.maxAgeMinutes) {
-            log('Saved position too old:', ageMinutes.toFixed(1), 'min');
-            return;
-        }
-        if (saved.path && saved.path !== currentPath()) {
-            log('Saved position is on a different page, skipping');
-            return;
-        }
-
         abortRestore();
         const ctrl = { aborted: false };
         currentAbort = ctrl;
@@ -280,6 +269,11 @@
             const switched = await ensureTargetTab(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
             if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
+
+            if (saved.path && saved.path !== currentPath()) {
+                log('Saved position is on a different page, skipping scroll');
+                return finishPanel(`On "${CONFIG.targetTab}"`);
+            }
 
             scrollRoot().scrollTop = 0;
             window.scrollTo(0, 0);
@@ -790,22 +784,41 @@
         history.replaceState = wrap(history.replaceState.bind(history));
     }
 
+    async function switchToTargetTabOnly() {
+        abortRestore();
+        const ctrl = { aborted: false };
+        currentAbort = ctrl;
+        restoring = true;
+        showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
+        try {
+            const switched = await ensureTargetTab(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            finishPanel(switched
+                ? `On "${CONFIG.targetTab}"`
+                : `Tab "${CONFIG.targetTab}" not found`);
+        } finally {
+            restoring = false;
+            if (currentAbort === ctrl) currentAbort = null;
+        }
+    }
+
     async function maybeAutoRestore() {
         if (!CONFIG.autoRestore || restoring) return;
         if (!isTimelinePage()) return;
         if (Date.now() < restoreCooldownUntil) return;
 
-        const saved = readSavedPosition();
-        if (!saved) return;
-        if (saved.path && saved.path !== currentPath()) return;
-
         restoreCooldownUntil = Date.now() + 2000;
         const ready = await waitForTimeline();
         if (!ready || !isTimelinePage()) return;
-        if (saved.path && saved.path !== currentPath()) return;
         if (restoring) return;
 
-        await restore(saved);
+        const saved = readSavedPosition();
+        if (saved) {
+            await restore(saved);
+        } else {
+            // No pin yet — still open the configured timeline tab.
+            await switchToTargetTabOnly();
+        }
     }
 
     function onPathChange() {
