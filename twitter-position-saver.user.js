@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.11
+// @version      3.12
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -9,12 +9,157 @@
 // @match        https://x.com/*
 // @grant        GM_getValue
 // @grant        GM_setValue
+// @grant        unsafeWindow
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
 
+/* TPS_SCROLL_GUARD_BEGIN */
+// Runs in the page JS realm (Gear: world MAIN; Tampermonkey: unsafeWindow).
+// Blocks X's programmatic jump-to-top when new tweets arrive, while still
+// allowing real user gestures and our own restore/search scrolls.
+function tpsInstallPageScrollGuard(globalObj) {
+    'use strict';
+    const g = globalObj || (typeof window !== 'undefined' ? window : null);
+    if (!g || g.__tpsScrollGuardInstalled) return;
+    g.__tpsScrollGuardInstalled = true;
+
+    const USER_GRACE_MS = 900;
+    const MID_FEED_Y = 280;
+    const TOP_TARGET_Y = 140;
+    const BIG_JUMP_PX = 350;
+
+    let lastGestureAt = 0;
+    g.__tpsAllowScrollUntil = 0;
+
+    const markGesture = () => { lastGestureAt = Date.now(); };
+    g.addEventListener('wheel', markGesture, true);
+    g.addEventListener('touchstart', markGesture, true);
+    g.addEventListener('touchmove', markGesture, true);
+    g.addEventListener('pointerdown', markGesture, true);
+    g.addEventListener('keydown', (e) => {
+        if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
+            markGesture();
+        }
+    }, true);
+
+    g.addEventListener('message', (e) => {
+        if (e.source !== g) return;
+        const data = e.data;
+        if (!data || data.source !== 'tps' || data.type !== 'allow-scroll') return;
+        const until = Number(data.until) || 0;
+        if (until > g.__tpsAllowScrollUntil) g.__tpsAllowScrollUntil = until;
+    });
+
+    function allowUntilFromDom() {
+        try {
+            const raw = g.document?.documentElement?.getAttribute('data-tps-allow-scroll');
+            const until = raw ? Number(raw) : 0;
+            if (until > g.__tpsAllowScrollUntil) g.__tpsAllowScrollUntil = until;
+        } catch (_) { /* ignore */ }
+    }
+
+    function isAllowed() {
+        allowUntilFromDom();
+        const now = Date.now();
+        return now < g.__tpsAllowScrollUntil || now - lastGestureAt < USER_GRACE_MS;
+    }
+
+    function currentY() {
+        try {
+            const doc = g.document;
+            const se = doc && (doc.scrollingElement || doc.documentElement);
+            return (se && se.scrollTop) || g.scrollY || g.pageYOffset || 0;
+        } catch (_) {
+            return 0;
+        }
+    }
+
+    function shouldBlockJumpTo(nextY) {
+        if (typeof nextY !== 'number' || !isFinite(nextY) || isAllowed()) return false;
+        const cur = currentY();
+        if (cur < MID_FEED_Y) return false;
+        if (nextY <= TOP_TARGET_Y) return true;
+        if (cur - nextY >= BIG_JUMP_PX && nextY < (g.innerHeight || 800)) return true;
+        return false;
+    }
+
+    function parseScrollArgs(args) {
+        if (args.length === 1 && args[0] && typeof args[0] === 'object') {
+            return { left: args[0].left, top: args[0].top, opts: args[0] };
+        }
+        return { left: args[0], top: args[1], opts: null };
+    }
+
+    function wrapScrollFn(orig) {
+        return function (...args) {
+            const { top } = parseScrollArgs(args);
+            if (typeof top === 'number' && shouldBlockJumpTo(top)) return;
+            return orig.apply(this, args);
+        };
+    }
+
+    try {
+        g.scrollTo = wrapScrollFn(g.scrollTo.bind(g));
+        g.scroll = wrapScrollFn(g.scroll.bind(g));
+        g.scrollBy = wrapScrollFn(g.scrollBy.bind(g));
+    } catch (_) { /* ignore */ }
+
+    try {
+        const origSIV = g.Element.prototype.scrollIntoView;
+        g.Element.prototype.scrollIntoView = function (...args) {
+            if (!isAllowed()) {
+                try {
+                    const rect = this.getBoundingClientRect();
+                    const targetY = currentY() + rect.top;
+                    if (shouldBlockJumpTo(Math.max(0, targetY))) return;
+                } catch (_) { /* fall through */ }
+            }
+            return origSIV.apply(this, args);
+        };
+    } catch (_) { /* ignore */ }
+
+    function patchScrollTop(proto) {
+        if (!proto) return;
+        const desc = Object.getOwnPropertyDescriptor(proto, 'scrollTop');
+        if (!desc || !desc.set || !desc.get || desc.configurable === false) return;
+        try {
+            Object.defineProperty(proto, 'scrollTop', {
+                configurable: true,
+                enumerable: desc.enumerable,
+                get() { return desc.get.call(this); },
+                set(value) {
+                    const next = Number(value);
+                    try {
+                        const doc = g.document;
+                        const se = doc && (doc.scrollingElement || doc.documentElement);
+                        if ((this === se || this === doc.documentElement || this === doc.body) &&
+                            shouldBlockJumpTo(next)) {
+                            return;
+                        }
+                    } catch (_) { /* fall through */ }
+                    desc.set.call(this, value);
+                }
+            });
+        } catch (_) { /* ignore */ }
+    }
+
+    try {
+        patchScrollTop(g.Element.prototype);
+        patchScrollTop(g.HTMLElement && g.HTMLElement.prototype);
+    } catch (_) { /* ignore */ }
+}
+/* TPS_SCROLL_GUARD_END */
+
 (function() {
     'use strict';
+
+    try {
+        if (typeof unsafeWindow !== 'undefined') tpsInstallPageScrollGuard(unsafeWindow);
+    } catch (_) { /* ignore */ }
+    try {
+        tpsInstallPageScrollGuard(window);
+    } catch (_) { /* ignore */ }
 
     const CONFIG = {
         targetTab: 'Olo',         // auto-scroll only works on this timeline tab
@@ -25,6 +170,18 @@
     };
 
     const DEBUG = false;
+
+    function allowProgrammaticScroll(ms) {
+        const until = Date.now() + (ms == null ? 4000 : ms);
+        try {
+            const g = (typeof unsafeWindow !== 'undefined' && unsafeWindow) || window;
+            g.__tpsAllowScrollUntil = until;
+            g.postMessage({ source: 'tps', type: 'allow-scroll', until }, '*');
+        } catch (_) { /* ignore */ }
+        try {
+            document.documentElement.setAttribute('data-tps-allow-scroll', String(until));
+        } catch (_) { /* ignore */ }
+    }
 
     const STORAGE_PREFIX = 'tps_';
 
@@ -218,12 +375,79 @@
     let restoring = false;
     let currentAbort = null;
 
+    // X sometimes yanks the timeline to the top when new tweets arrive. Distinguish
+    // that from the user scrolling up (which should update the saved pin).
+    const USER_SCROLL_GRACE_MS = 800;
+    const YANK_JUMP_PX = 250;
+    let lastUserGestureAt = 0;
+    let lastStableScrollY = 0;
+    let lastStableTweetId = null;
+    let suppressSaves = false;
+    let yankRestoreCooldownUntil = 0;
+
     function abortRestore() {
         if (currentAbort) currentAbort.aborted = true;
     }
 
+    function noteUserGesture() {
+        lastUserGestureAt = Date.now();
+        if (suppressSaves) {
+            suppressSaves = false;
+            log('User scroll — resume saving');
+        }
+    }
+
+    function userRecentlyScrolled() {
+        return Date.now() - lastUserGestureAt < USER_SCROLL_GRACE_MS;
+    }
+
+    function rememberStablePosition() {
+        lastStableScrollY = scrollTop();
+        const top = getTopTweet();
+        if (top) lastStableTweetId = top.id;
+    }
+
+    function undoXYank() {
+        suppressSaves = true;
+        if (Date.now() < yankRestoreCooldownUntil) return;
+        yankRestoreCooldownUntil = Date.now() + 1000;
+        log('Blocked X auto-jump; restoring position');
+        allowProgrammaticScroll(1500);
+
+        const tweet = lastStableTweetId && findTweetById(lastStableTweetId);
+        if (tweet) {
+            tweet.scrollIntoView({ block: 'start', behavior: 'auto' });
+        } else {
+            scrollRoot().scrollTop = lastStableScrollY;
+            window.scrollTo(0, lastStableScrollY);
+        }
+    }
+
+    function onTimelineScroll() {
+        if (restoring) {
+            rememberStablePosition();
+            return;
+        }
+        if (!isTimelinePage() || !isOnTargetTab()) {
+            lastStableScrollY = scrollTop();
+            return;
+        }
+
+        const y = scrollTop();
+        const jumpedToTop = lastStableScrollY - y > YANK_JUMP_PX && y < window.innerHeight;
+
+        if (jumpedToTop && !userRecentlyScrolled()) {
+            undoXYank();
+            return;
+        }
+
+        if (userRecentlyScrolled() || !suppressSaves) {
+            rememberStablePosition();
+        }
+    }
+
     function savePosition() {
-        if (restoring) return;
+        if (restoring || suppressSaves) return;
         if (!isTimelinePage() || !isOnTargetTab()) return;
 
         const top = getTopTweet();
@@ -264,6 +488,7 @@
 
         const timeStr = formatTweetTime(saved.tweetTime);
         showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
+        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
 
         try {
             const switched = await ensureTargetTab(ctrl);
@@ -275,6 +500,7 @@
                 return finishPanel(`On "${CONFIG.targetTab}"`);
             }
 
+            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
             scrollRoot().scrollTop = 0;
             window.scrollTo(0, 0);
             // Wait for the fresh Olo timeline to actually render before searching.
@@ -365,6 +591,7 @@
 
     // Scroll the bottom tweet into view, then nudge past it so X fetches older tweets.
     function scrollDownStep() {
+        allowProgrammaticScroll(2000);
         const root = scrollRoot();
         const bottomTweet = getBottomVisibleTweet();
 
@@ -423,6 +650,7 @@
         }
         if (isAtScrollBottom()) return 'end';
 
+        allowProgrammaticScroll(2000);
         const root = scrollRoot();
         root.scrollTop = root.scrollHeight;
         window.scrollTo(0, root.scrollHeight);
@@ -512,6 +740,7 @@
         const targetDay = getScrollTargetDay();
         const dayLabel = formatDayLabel(targetDay);
         showPanel(`Auto-scrolling to the start of ${dayLabel}…`);
+        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
 
         try {
             const switched = await ensureTargetTab(ctrl);
@@ -759,6 +988,13 @@
     let restoreCooldownUntil = 0;
 
     function setupListeners() {
+        // Reduce browser scroll-anchoring jumps when X prepends tweets above the viewport.
+        try {
+            const style = document.createElement('style');
+            style.textContent = 'html, body, [data-testid="primaryColumn"] { overflow-anchor: none !important; }';
+            (document.head || document.documentElement).appendChild(style);
+        } catch (_) { /* ignore */ }
+
         window.addEventListener('beforeunload', () => {
             if (restoring) { abortRestore(); return; }
             savePosition();
@@ -770,7 +1006,19 @@
         });
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') abortRestore();
+            // Arrow/Page/Home/End/Space — treat as intentional scroll.
+            if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
+                noteUserGesture();
+            }
         });
+
+        // Touch/wheel/pointer mark real user scrolling; plain "scroll" also fires for X yanks.
+        window.addEventListener('wheel', noteUserGesture, { passive: true });
+        window.addEventListener('touchstart', noteUserGesture, { passive: true });
+        window.addEventListener('touchmove', noteUserGesture, { passive: true });
+        // Taps on "Show new posts" (etc.) count as intentional jump-to-top.
+        window.addEventListener('pointerdown', noteUserGesture, { passive: true });
+        window.addEventListener('scroll', onTimelineScroll, { passive: true });
 
         // X is an SPA — document load only happens once, so watch History API navigations.
         const notify = () => onPathChange();

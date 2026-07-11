@@ -8,7 +8,8 @@ node scripts/build-gear-extension.mjs
 rm -f twitter-position-saver-gear.xpi
 zip -j twitter-position-saver-gear.xpi \
   gear-extension/manifest.json \
-  gear-extension/content.js
+  gear-extension/content.js \
+  gear-extension/scroll-guard.js
 
 echo "Created:"
 echo "  twitter-position-saver-gear.xpi"
