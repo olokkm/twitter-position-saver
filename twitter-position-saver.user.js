@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.15
+// @version      3.16
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -167,6 +167,11 @@ function tpsInstallPageScrollGuard(globalObj) {
         saveIntervalMs: 2000,     // how often the current position is stored
         stepMaxWaitMs: 8000,      // hard cap waiting for one scroll step to load
         maxScrollAttempts: 150,   // give up searching after this many scroll steps
+        // Soft "end" = bottom of *loaded* content while X may still fetch more.
+        bottomConfirmMs: 2500,
+        endConfirmAttempts: 5,
+        endRetryDelayMs: 1500,
+        stuckConfirmAttempts: 5,
         autoRestore: true         // jump back automatically when the timeline loads
     };
 
@@ -509,24 +514,42 @@ function tpsInstallPageScrollGuard(globalObj) {
             if (ctrl.aborted) return finishPanel('Stopped');
 
             let stuckSteps = 0;
+            let endSteps = 0;
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
                 let tweet = findTweetById(saved.tweetId);
 
                 if (!tweet) {
                     updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
+                    allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
 
                     const outcome = await scrollDownAndWait(saved.tweetId, ctrl);
                     if (outcome === 'aborted') break;
-                    if (outcome === 'end') break;
 
                     tweet = findTweetById(saved.tweetId);
-                    if (!tweet) {
-                        if (outcome === 'stuck') {
-                            if (++stuckSteps >= 3) break;
-                        } else {
-                            stuckSteps = 0;
-                        }
+                    if (tweet) {
+                        // fall through
+                    } else if (outcome === 'end' || outcome === 'timeout') {
+                        endSteps++;
+                        stuckSteps = 0;
+                        if (endSteps >= CONFIG.endConfirmAttempts) break;
+                        updatePanel(
+                            `Still loading… retry ${endSteps}/${CONFIG.endConfirmAttempts} for tweet from ${timeStr}`
+                        );
+                        await sleep(CONFIG.endRetryDelayMs);
+                        scrollDownStep();
+                        continue;
+                    } else if (outcome === 'stuck') {
+                        endSteps = 0;
+                        if (++stuckSteps >= CONFIG.stuckConfirmAttempts) break;
+                        updatePanel(
+                            `Stuck — retry ${stuckSteps}/${CONFIG.stuckConfirmAttempts} for tweet from ${timeStr}`
+                        );
+                        await sleep(CONFIG.endRetryDelayMs);
+                        continue;
+                    } else {
+                        endSteps = 0;
+                        stuckSteps = 0;
                         continue;
                     }
                 }
@@ -622,7 +645,7 @@ function tpsInstallPageScrollGuard(globalObj) {
                 if (bottomSince === null || height !== bottomHeight) {
                     bottomSince = Date.now();
                     bottomHeight = height;
-                } else if (Date.now() - bottomSince >= 1500) {
+                } else if (Date.now() - bottomSince >= (CONFIG.bottomConfirmMs || 2500)) {
                     return 'end';
                 }
             } else {
@@ -642,10 +665,12 @@ function tpsInstallPageScrollGuard(globalObj) {
 
         scrollDownStep();
         let outcome = await waitForStep(targetId, ctrl, knownIds);
-        if (outcome === 'aborted' || outcome === 'found' || outcome === 'end') return outcome;
+        if (outcome === 'aborted' || outcome === 'found' || outcome === 'end' || outcome === 'timeout') {
+            return outcome;
+        }
         if (outcome === 'loaded') return 'progress';
 
-        // Timeout with no new ids — if we still moved, keep going; otherwise recover.
+        // No new ids yet — if we still moved, keep going; otherwise recover.
         if (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40) {
             return 'progress';
         }
@@ -657,7 +682,7 @@ function tpsInstallPageScrollGuard(globalObj) {
         window.scrollTo(0, root.scrollHeight);
         await sleep(300);
         outcome = await waitForStep(targetId, ctrl, knownIds);
-        if (outcome === 'found' || outcome === 'end') return outcome;
+        if (outcome === 'found' || outcome === 'end' || outcome === 'timeout') return outcome;
         if (outcome === 'loaded') return 'progress';
         return (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40)
             ? 'progress'
@@ -753,6 +778,7 @@ function tpsInstallPageScrollGuard(globalObj) {
             if (ctrl.aborted) return finishPanel('Stopped');
 
             let deepestTargetTime = null; // earliest target-day time reached so far (for progress)
+            let endSteps = 0;
             let deepestTargetId = null;
             let pastBoundaryVotes = 0;
 
@@ -827,8 +853,17 @@ function tpsInstallPageScrollGuard(globalObj) {
                 const outcome = await scrollDownAndWait(null, ctrl);
                 if (outcome === 'aborted') break;
 
-                // Reached the end of the feed without crossing into the previous day.
-                if (outcome === 'end') {
+                // Soft end/timeout: X may still be loading — retry before accepting boundary.
+                if (outcome === 'end' || outcome === 'timeout') {
+                    endSteps++;
+                    if (endSteps < CONFIG.endConfirmAttempts) {
+                        updatePanel(
+                            `Still loading… retry ${endSteps}/${CONFIG.endConfirmAttempts} toward start of ${dayLabel}`
+                        );
+                        await sleep(CONFIG.endRetryDelayMs);
+                        scrollDownStep();
+                        continue;
+                    }
                     const landEl = oldestTargetEl ||
                         (deepestTargetId ? findTweetById(deepestTargetId) : null);
                     if (landEl) {
@@ -839,6 +874,7 @@ function tpsInstallPageScrollGuard(globalObj) {
                     }
                     return finishPanel(`No tweets from ${dayLabel}`);
                 }
+                endSteps = 0;
             }
 
             finishPanel(ctrl.aborted ? 'Stopped' : `Start of ${dayLabel} not found`);
