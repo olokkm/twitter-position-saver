@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.17
+// @version      3.18
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -172,6 +172,8 @@ function tpsInstallPageScrollGuard(globalObj) {
         endConfirmAttempts: 5,
         endRetryDelayMs: 1500,
         stuckConfirmAttempts: 5,
+        historyMaxEntries: 15,    // recent session moments kept in the submenu
+        historyDedupeMs: 45000,   // skip duplicate pin of same tweet within this window
         autoRestore: true         // jump back automatically when the timeline loads
     };
 
@@ -215,10 +217,12 @@ function tpsInstallPageScrollGuard(globalObj) {
     const KEY_TWEET_TIME = 'tweet_time';
     const KEY_TIMESTAMP = 'timestamp';
     const KEY_PATH = 'path';
+    const KEY_HISTORY = 'session_history';
 
     const PANEL_ID = 'timeline-saver-panel';
     const PANEL_INFO_ID = 'timeline-saver-info';
-    const BUTTON_ID = 'timeline-saver-day-button';
+    const BUTTON_ID = 'timeline-saver-history-button';
+    const MENU_ID = 'timeline-saver-history-menu';
 
     function log(...args) {
         if (DEBUG) console.log('[Timeline Saver]', ...args);
@@ -417,6 +421,8 @@ function tpsInstallPageScrollGuard(globalObj) {
         suppressSaves = true;
         if (Date.now() < yankRestoreCooldownUntil) return;
         yankRestoreCooldownUntil = Date.now() + 1000;
+        // Snapshot the place we were before X yanked to top (new posts loaded).
+        pushHistoryFromStable('yank');
         log('Blocked X auto-jump; restoring position');
         allowProgrammaticScroll(1500);
 
@@ -452,18 +458,89 @@ function tpsInstallPageScrollGuard(globalObj) {
         }
     }
 
-    function savePosition() {
+    function capturePosition(extra) {
+        const top = getTopTweet();
+        if (!top) return null;
+        return Object.assign({
+            tweetId: top.id,
+            tweetTime: top.time,
+            timestamp: Date.now(),
+            path: currentPath()
+        }, extra || {});
+    }
+
+    function readHistory() {
+        const raw = gmGet(KEY_HISTORY);
+        if (!raw) return [];
+        try {
+            const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+            return Array.isArray(list) ? list : [];
+        } catch {
+            return [];
+        }
+    }
+
+    function writeHistory(list) {
+        gmSet(KEY_HISTORY, list);
+    }
+
+    function pushHistoryEntry(entry) {
+        if (!entry || !entry.tweetId) return;
+        const max = CONFIG.historyMaxEntries || 15;
+        const dedupeMs = CONFIG.historyDedupeMs || 45000;
+        let list = readHistory();
+        const head = list[0];
+        if (head && head.tweetId === entry.tweetId &&
+            Math.abs((entry.timestamp || 0) - (head.timestamp || 0)) < dedupeMs) {
+            // Refresh reason/time on the newest duplicate instead of stacking.
+            list[0] = Object.assign({}, head, entry);
+        } else {
+            list.unshift(entry);
+        }
+        if (list.length > max) list = list.slice(0, max);
+        writeHistory(list);
+        refreshHistoryMenuIfOpen();
+        log('History+', entry.reason, entry.tweetId);
+    }
+
+    function pushHistoryFromStable(reason) {
+        if (!lastStableTweetId) return;
+        let tweetTime = null;
+        const el = findTweetById(lastStableTweetId);
+        if (el) tweetTime = getTweetTime(el);
+        pushHistoryEntry({
+            tweetId: lastStableTweetId,
+            tweetTime,
+            timestamp: Date.now(),
+            path: currentPath(),
+            reason: reason || 'yank'
+        });
+    }
+
+    function pushHistorySession(reason) {
+        if (restoring) return;
+        if (!isTimelinePage() || !isOnTargetTab()) return;
+        const snap = capturePosition({ reason: reason || 'session' });
+        if (!snap) return;
+        pushHistoryEntry(snap);
+    }
+
+    function savePosition(opts) {
         if (restoring || suppressSaves) return;
         if (!isTimelinePage() || !isOnTargetTab()) return;
 
-        const top = getTopTweet();
-        if (!top) return;
+        const snap = capturePosition();
+        if (!snap) return;
 
-        gmSet(KEY_TWEET_ID, top.id);
-        gmSet(KEY_TWEET_TIME, top.time);
-        gmSet(KEY_TIMESTAMP, Date.now());
-        gmSet(KEY_PATH, currentPath());
-        log('Saved', top.id, top.time);
+        gmSet(KEY_TWEET_ID, snap.tweetId);
+        gmSet(KEY_TWEET_TIME, snap.tweetTime);
+        gmSet(KEY_TIMESTAMP, snap.timestamp);
+        gmSet(KEY_PATH, snap.path);
+        log('Saved', snap.tweetId, snap.tweetTime);
+
+        if (opts && opts.history) {
+            pushHistoryEntry(Object.assign({}, snap, { reason: opts.history }));
+        }
     }
 
     function readSavedPosition() {
@@ -476,6 +553,28 @@ function tpsInstallPageScrollGuard(globalObj) {
             timestamp,
             path: gmGet(KEY_PATH)
         };
+    }
+
+    function reasonLabel(reason) {
+        switch (reason) {
+            case 'blur': return 'Left app';
+            case 'leave': return 'Closed / killed';
+            case 'yank': return 'Feed jumped';
+            case 'nav': return 'Navigated away';
+            case 'manual': return 'Saved';
+            default: return reason || 'Session';
+        }
+    }
+
+    function formatHistoryWhen(ts) {
+        if (!ts) return '';
+        const d = new Date(ts);
+        if (isNaN(d)) return '';
+        const now = new Date();
+        const sameDay = d.toDateString() === now.toDateString();
+        return sameDay
+            ? d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
+            : d.toLocaleString([], { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' });
     }
 
     function highlight(tweet) {
@@ -699,191 +798,6 @@ function tpsInstallPageScrollGuard(globalObj) {
         }
     }
 
-    function tweetDate(article) {
-        const iso = getTweetTime(article);
-        const date = iso ? new Date(iso) : null;
-        return date && !isNaN(date) ? date : null;
-    }
-
-    function isSameDay(a, b) {
-        return a.getFullYear() === b.getFullYear() &&
-            a.getMonth() === b.getMonth() &&
-            a.getDate() === b.getDate();
-    }
-
-    function startOfDay(date) {
-        const d = new Date(date);
-        d.setHours(0, 0, 0, 0);
-        return d;
-    }
-
-    function addDays(date, days) {
-        const d = new Date(date);
-        d.setDate(d.getDate() + days);
-        return d;
-    }
-
-    function isBeforeDay(date, day) {
-        return startOfDay(date) < startOfDay(day);
-    }
-
-    function formatDayLabel(day) {
-        const today = startOfDay(new Date());
-        const target = startOfDay(day);
-        const diffDays = Math.round((today - target) / 86400000);
-        if (diffDays === 0) return 'today';
-        if (diffDays === 1) return 'yesterday';
-        return target.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
-    }
-
-    // Pick the calendar day to scroll to from the current viewport. If we're already
-    // sitting on that day's boundary, step back one day so repeated presses walk
-    // backward through the timeline day by day.
-    function getScrollTargetDay() {
-        const top = getTopTweet();
-        const fallback = startOfDay(new Date());
-        if (!top?.time) return fallback;
-
-        const topDay = startOfDay(new Date(top.time));
-        let beforeCount = 0;
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
-            const date = tweetDate(article);
-            if (date && isBeforeDay(date, topDay)) beforeCount++;
-        }
-
-        if (beforeCount >= 2) return addDays(topDay, -1);
-        return topDay;
-    }
-
-    // Scroll down the Olo timeline until the oldest tweet still on the target day,
-    // i.e. the boundary right before the previous day's tweets begin, then center it.
-    async function scrollToStartOfDay() {
-        abortRestore();
-        const ctrl = { aborted: false };
-        currentAbort = ctrl;
-        restoring = true;
-
-        const targetDay = getScrollTargetDay();
-        const dayLabel = formatDayLabel(targetDay);
-        showPanel(`Auto-scrolling to the start of ${dayLabel}…`);
-        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
-
-        try {
-            const switched = await ensureTargetTab(ctrl);
-            if (ctrl.aborted) return finishPanel('Stopped');
-            if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
-
-            // Start from the currently visible tweet — don't jump back to the top.
-            await waitForContentToSettle(ctrl);
-            if (ctrl.aborted) return finishPanel('Stopped');
-
-            let deepestTargetTime = null; // earliest target-day time reached so far (for progress)
-            let endSteps = 0;
-            let deepestTargetId = null;
-            let pastBoundaryVotes = 0;
-
-            for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
-                let oldestTargetEl = null;
-                let oldestTargetTime = null;
-                const visible = [];
-
-                for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
-                    const date = tweetDate(article);
-                    if (!date) continue;
-                    const rect = article.getBoundingClientRect();
-                    if (rect.bottom > 0 && rect.top < window.innerHeight) {
-                        visible.push({ article, date, top: rect.top });
-                    }
-                    if (isSameDay(date, targetDay)) {
-                        if (!oldestTargetTime || date < oldestTargetTime) {
-                            oldestTargetTime = date;
-                            oldestTargetEl = article;
-                        }
-                    }
-                }
-
-                const foundEarlierTarget = !!(oldestTargetTime &&
-                    (!deepestTargetTime || oldestTargetTime < deepestTargetTime));
-                if (foundEarlierTarget) {
-                    deepestTargetTime = oldestTargetTime;
-                    deepestTargetId = extractTweetId(oldestTargetEl);
-                    pastBoundaryVotes = 0;
-                }
-
-                // Day boundary = the bottom of the viewport is already on the previous day.
-                // Mid-feed old reposts don't count — only content we've scrolled past.
-                visible.sort((a, b) => b.top - a.top);
-                const bottomVisible = visible.slice(0, 3);
-                const bottomIsPrevDay = bottomVisible.length >= 2 &&
-                    bottomVisible.every(v => isBeforeDay(v.date, targetDay));
-                if (bottomIsPrevDay && !foundEarlierTarget) pastBoundaryVotes++;
-
-                if (pastBoundaryVotes >= 2 && deepestTargetId) {
-                    let landEl = oldestTargetEl || findTweetById(deepestTargetId);
-                    for (let nudge = 0; !landEl && nudge < 8; nudge++) {
-                        window.scrollBy(0, -Math.round(window.innerHeight * 0.7));
-                        await sleep(250);
-                        landEl = findTweetById(deepestTargetId);
-                        if (!landEl) {
-                            let best = null, bestTime = null;
-                            for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
-                                const date = tweetDate(article);
-                                if (!date || !isSameDay(date, targetDay)) continue;
-                                if (!bestTime || date < bestTime) {
-                                    bestTime = date;
-                                    best = article;
-                                }
-                            }
-                            landEl = best;
-                        }
-                    }
-                    if (landEl) {
-                        landEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(landEl);
-                        const landTime = tweetDate(landEl) || deepestTargetTime;
-                        return finishPanel(`Reached the start of ${dayLabel} (${formatTweetTime(landTime)})`);
-                    }
-                    return finishPanel(`No tweets from ${dayLabel}`);
-                }
-
-                updatePanel(deepestTargetTime
-                    ? `Auto-scrolling to the start of ${dayLabel}… now at ${formatTweetTime(deepestTargetTime)}`
-                    : `Auto-scrolling to the start of ${dayLabel}…`);
-
-                const outcome = await scrollDownAndWait(null, ctrl);
-                if (outcome === 'aborted') break;
-
-                // Soft end/timeout: X may still be loading — retry before accepting boundary.
-                if (outcome === 'end' || outcome === 'timeout') {
-                    endSteps++;
-                    if (endSteps < CONFIG.endConfirmAttempts) {
-                        updatePanel(
-                            `Still loading… retry ${endSteps}/${CONFIG.endConfirmAttempts} toward start of ${dayLabel}`
-                        );
-                        await sleep(CONFIG.endRetryDelayMs);
-                        scrollDownStep();
-                        continue;
-                    }
-                    const landEl = oldestTargetEl ||
-                        (deepestTargetId ? findTweetById(deepestTargetId) : null);
-                    if (landEl) {
-                        landEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(landEl);
-                        const landTime = oldestTargetTime || deepestTargetTime;
-                        return finishPanel(`Reached the oldest loaded tweet from ${dayLabel} (${formatTweetTime(landTime)})`);
-                    }
-                    return finishPanel(`No tweets from ${dayLabel}`);
-                }
-                endSteps = 0;
-            }
-
-            finishPanel(ctrl.aborted ? 'Stopped' : `Start of ${dayLabel} not found`);
-        } finally {
-            restoring = false;
-            if (currentAbort === ctrl) currentAbort = null;
-        }
-    }
-
     async function waitForTimeline(maxWaitMs = 15000) {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
@@ -975,7 +889,91 @@ function tpsInstallPageScrollGuard(globalObj) {
         }, 2500);
     }
 
-    // ============ UI: "START OF TODAY" BUTTON ============
+    // ============ UI: SESSION HISTORY SUBMENU ============
+
+    function closeHistoryMenu() {
+        const menu = document.getElementById(MENU_ID);
+        if (menu) menu.remove();
+    }
+
+    function refreshHistoryMenuIfOpen() {
+        const menu = document.getElementById(MENU_ID);
+        if (!menu) return;
+        closeHistoryMenu();
+        openHistoryMenu();
+    }
+
+    function openHistoryMenu() {
+        closeHistoryMenu();
+        if (!document.body) return;
+
+        const list = readHistory();
+        const menu = document.createElement('div');
+        menu.id = MENU_ID;
+        const bottom = window.innerWidth <= 500 ? '210px' : '156px';
+        menu.style.cssText = `
+            position: fixed;
+            bottom: ${bottom};
+            right: 16px;
+            width: min(300px, calc(100vw - 32px));
+            max-height: min(420px, 55vh);
+            overflow: auto;
+            background: #15202b;
+            color: #e7e9ea;
+            border: 1px solid #2f3336;
+            border-radius: 14px;
+            box-shadow: 0 8px 28px rgba(0,0,0,0.55);
+            z-index: 100000;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            font-size: 13px;
+        `;
+
+        const head = document.createElement('div');
+        head.style.cssText = 'padding: 12px 14px 8px; font-weight: 700; border-bottom: 1px solid #2f3336;';
+        head.textContent = 'Recent positions';
+        menu.appendChild(head);
+
+        if (!list.length) {
+            const empty = document.createElement('div');
+            empty.style.cssText = 'padding: 14px; color: #71767b;';
+            empty.textContent = 'No sessions yet — leave the app or wait for a feed jump.';
+            menu.appendChild(empty);
+        } else {
+            list.forEach((entry, idx) => {
+                const row = document.createElement('button');
+                row.type = 'button';
+                row.style.cssText = `
+                    display: block; width: 100%; text-align: left;
+                    background: transparent; border: 0; border-bottom: 1px solid #2f3336;
+                    color: inherit; font: inherit; padding: 10px 14px; cursor: pointer;
+                `;
+                const when = formatHistoryWhen(entry.timestamp);
+                const tweetWhen = formatTweetTime(entry.tweetTime);
+                row.innerHTML =
+                    `<div style="font-weight:600">${reasonLabel(entry.reason)} · ${when}</div>` +
+                    `<div style="color:#71767b;margin-top:2px">Tweet ${tweetWhen}</div>`;
+                row.addEventListener('click', () => {
+                    closeHistoryMenu();
+                    restore({
+                        tweetId: entry.tweetId,
+                        tweetTime: entry.tweetTime,
+                        timestamp: entry.timestamp || Date.now(),
+                        path: entry.path
+                    });
+                });
+                row.addEventListener('pointerenter', () => { row.style.background = 'rgba(239,243,244,0.08)'; });
+                row.addEventListener('pointerleave', () => { row.style.background = 'transparent'; });
+                menu.appendChild(row);
+            });
+        }
+
+        document.body.appendChild(menu);
+    }
+
+    function toggleHistoryMenu() {
+        if (document.getElementById(MENU_ID)) closeHistoryMenu();
+        else openHistoryMenu();
+    }
 
     function createButton() {
         if (document.getElementById(BUTTON_ID)) return true;
@@ -984,8 +982,9 @@ function tpsInstallPageScrollGuard(globalObj) {
         const btn = document.createElement('button');
         btn.id = BUTTON_ID;
         btn.type = 'button';
-        btn.textContent = '🌅';
-        btn.title = 'Scroll to the start of this day (press again for the previous day)';
+        btn.textContent = '⏱';
+        btn.title = 'Recent timeline positions';
+        btn.setAttribute('aria-label', 'Recent timeline positions');
         btn.style.cssText = `
             position: fixed;
             bottom: ${window.innerWidth <= 500 ? '150px' : '96px'};
@@ -996,7 +995,7 @@ function tpsInstallPageScrollGuard(globalObj) {
             border-radius: 50%;
             background: #1d9bf0;
             color: #fff;
-            font-size: 22px;
+            font-size: 20px;
             cursor: pointer;
             z-index: 99999;
             box-shadow: 0 2px 8px rgba(0,0,0,0.4);
@@ -1004,8 +1003,22 @@ function tpsInstallPageScrollGuard(globalObj) {
             align-items: center;
             justify-content: center;
         `;
-        btn.addEventListener('click', () => { scrollToStartOfDay(); });
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleHistoryMenu();
+        });
         document.body.appendChild(btn);
+
+        if (!window.__tpsHistoryMenuDocClick) {
+            window.__tpsHistoryMenuDocClick = true;
+            document.addEventListener('click', (e) => {
+                const menu = document.getElementById(MENU_ID);
+                const button = document.getElementById(BUTTON_ID);
+                if (!menu) return;
+                if (menu.contains(e.target) || (button && button.contains(e.target))) return;
+                closeHistoryMenu();
+            });
+        }
         return true;
     }
 
@@ -1034,12 +1047,16 @@ function tpsInstallPageScrollGuard(globalObj) {
 
         window.addEventListener('beforeunload', () => {
             if (restoring) { abortRestore(); return; }
-            savePosition();
+            savePosition({ history: 'leave' });
+        });
+        window.addEventListener('pagehide', () => {
+            if (restoring) { abortRestore(); return; }
+            savePosition({ history: 'leave' });
         });
         document.addEventListener('visibilitychange', () => {
             if (!document.hidden) return;
             if (restoring) { abortRestore(); return; }
-            savePosition();
+            savePosition({ history: 'blur' });
         });
         document.addEventListener('keydown', (e) => {
             if (e.key === 'Escape') abortRestore();
@@ -1112,7 +1129,7 @@ function tpsInstallPageScrollGuard(globalObj) {
 
         const prev = lastSeenPath;
         if (restoring) abortRestore();
-        else if (prev && isTimelinePath(prev)) savePosition();
+        else if (prev && isTimelinePath(prev)) savePosition({ history: 'nav' });
 
         lastSeenPath = path;
 
