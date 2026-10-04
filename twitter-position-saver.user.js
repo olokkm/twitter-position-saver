@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.17
+// @version      3.19
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -172,6 +172,11 @@ function tpsInstallPageScrollGuard(globalObj) {
         endConfirmAttempts: 5,
         endRetryDelayMs: 1500,
         stuckConfirmAttempts: 5,
+        // Small steps. A big jump skips virtualized tweets and, on iOS, grows the
+        // page until the tab is killed and X reloads — which starts the search over.
+        minStepGapMs: 450,
+        stepViewportRatio: 0.5,
+        maxMountedTweets: 26,
         autoRestore: true         // jump back automatically when the timeline loads
     };
 
@@ -215,6 +220,11 @@ function tpsInstallPageScrollGuard(globalObj) {
     const KEY_TWEET_TIME = 'tweet_time';
     const KEY_TIMESTAMP = 'timestamp';
     const KEY_PATH = 'path';
+    const KEY_RESTORE_ACTIVE = 'restore_active';
+    const KEY_RESTORE_CRASHES = 'restore_crashes';
+
+    let gentleRestore = false;
+    let lastScrollStepAt = 0;
 
     const PANEL_ID = 'timeline-saver-panel';
     const PANEL_INFO_ID = 'timeline-saver-info';
@@ -484,8 +494,37 @@ function tpsInstallPageScrollGuard(globalObj) {
         setTimeout(() => { tweet.style.boxShadow = ''; }, 2000);
     }
 
+    function navigationType() {
+        try {
+            const nav = performance.getEntriesByType('navigation')[0];
+            return (nav && nav.type) || 'navigate';
+        } catch (_) {
+            return 'navigate';
+        }
+    }
+
+    // A killed tab reloads the document and auto-restore would start again.
+    function restoreWasInterrupted() {
+        const startedAt = Number(gmGet(KEY_RESTORE_ACTIVE) || 0);
+        if (!startedAt || Date.now() - startedAt > 3 * 60 * 1000) return false;
+        return navigationType() === 'reload';
+    }
+
     async function restore(saved) {
         if (!saved) return;
+
+        const interrupted = restoreWasInterrupted();
+        const crashes = interrupted ? Number(gmGet(KEY_RESTORE_CRASHES) || 0) + 1 : 0;
+        gmSet(KEY_RESTORE_CRASHES, crashes);
+        gentleRestore = crashes > 0;
+        gmSet(KEY_RESTORE_ACTIVE, Date.now());
+
+        if (crashes >= 3) {
+            gmSet(KEY_RESTORE_ACTIVE, 0);
+            gmSet(KEY_RESTORE_CRASHES, 0);
+            showPanel("Search reloaded the page again — stopped so it does not loop");
+            return;
+        }
 
         abortRestore();
         const ctrl = { aborted: false };
@@ -493,7 +532,9 @@ function tpsInstallPageScrollGuard(globalObj) {
         restoring = true;
 
         const timeStr = formatTweetTime(saved.tweetTime);
-        showPanel(`Switching to "${CONFIG.targetTab}" tab…`);
+        showPanel(gentleRestore
+            ? `Switching to "${CONFIG.targetTab}" tab… (slower, after a reload)`
+            : `Switching to "${CONFIG.targetTab}" tab…`);
         allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
 
         try {
@@ -515,11 +556,29 @@ function tpsInstallPageScrollGuard(globalObj) {
 
             let stuckSteps = 0;
             let endSteps = 0;
+            let lastDir = 'down';
+            let passCrossings = 0;
 
             for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
                 let tweet = findTweetById(saved.tweetId);
 
+                if (!tweet && passedTarget(saved)) {
+                    if (lastDir !== 'up') {
+                        passCrossings++;
+                        if (passCrossings >= 4) break;
+                    }
+                    lastDir = 'up';
+                    updatePanel(`Went past the tweet — scrolling back (step ${attempt})`);
+                    await paceStep(ctrl);
+                    if (ctrl.aborted) break;
+                    scrollUpStep();
+                    await waitForStep(saved.tweetId, ctrl, currentTweetIds());
+                    await waitForVirtualizer(ctrl);
+                    continue;
+                }
+
                 if (!tweet) {
+                    lastDir = 'down';
                     updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
                     allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
 
@@ -564,6 +623,9 @@ function tpsInstallPageScrollGuard(globalObj) {
             finishPanel(ctrl.aborted ? 'Stopped' : `Tweet from ${timeStr} not found`);
         } finally {
             restoring = false;
+            gentleRestore = false;
+            gmSet(KEY_RESTORE_ACTIVE, 0);
+            gmSet(KEY_RESTORE_CRASHES, 0);
             if (currentAbort === ctrl) currentAbort = null;
         }
     }
@@ -613,19 +675,73 @@ function tpsInstallPageScrollGuard(globalObj) {
         return bottomTweet;
     }
 
-    // Scroll the bottom tweet into view, then nudge past it so X fetches older tweets.
-    function scrollDownStep() {
+    function stepNudge() {
+        const ratio = gentleRestore ? CONFIG.stepViewportRatio * 0.7 : CONFIG.stepViewportRatio;
+        return Math.max(120, Math.round(window.innerHeight * ratio));
+    }
+
+    async function paceStep(ctrl) {
+        const gap = gentleRestore ? CONFIG.minStepGapMs * 2 : CONFIG.minStepGapMs;
+        const wait = lastScrollStepAt + gap - Date.now();
+        if (wait > 0) await sleep(wait);
+        if (ctrl && ctrl.aborted) return;
+        lastScrollStepAt = Date.now();
+    }
+
+    // One short move on the real scroll root. scrollIntoView plus a second
+    // scrollBy jumped about two screens and skipped tweets X had already unmounted.
+    function scrollByNudge(dy) {
         allowProgrammaticScroll(2000);
         const root = scrollRoot();
-        const bottomTweet = getBottomVisibleTweet();
-
-        if (bottomTweet) {
-            bottomTweet.scrollIntoView({ block: 'end', behavior: 'auto' });
+        const next = Math.max(0, root.scrollTop + dy);
+        root.scrollTop = next;
+        if (root !== document.body && root !== document.documentElement && root !== document.scrollingElement) {
+            return;
         }
+        const winY = window.scrollY || window.pageYOffset || 0;
+        if (Math.abs(winY - next) > 2) window.scrollTo(0, next);
+    }
 
-        const nudge = Math.round(window.innerHeight * 0.85);
-        root.scrollTop += nudge;
-        window.scrollBy(0, nudge);
+    function scrollDownStep() {
+        scrollByNudge(stepNudge());
+    }
+
+    function scrollUpStep() {
+        scrollByNudge(-Math.round(stepNudge() * 0.8));
+    }
+
+    function mountedTweetCount() {
+        return document.querySelectorAll('article[data-testid="tweet"]').length;
+    }
+
+    async function waitForVirtualizer(ctrl) {
+        const cap = CONFIG.maxMountedTweets || 26;
+        const start = Date.now();
+        while (Date.now() - start < 2500) {
+            if (ctrl && ctrl.aborted) return;
+            if (mountedTweetCount() <= cap) return;
+            await sleep(80);
+        }
+    }
+
+    // Every mounted tweet is older than the saved one, so we scrolled past it.
+    // Using the newest (not the oldest) ignores a single old promoted tweet.
+    function passedTarget(saved) {
+        if (!saved || !saved.tweetTime) return false;
+        const target = new Date(saved.tweetTime);
+        if (isNaN(target)) return false;
+        let newest = null;
+        let count = 0;
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const iso = getTweetTime(article);
+            if (!iso) continue;
+            const date = new Date(iso);
+            if (isNaN(date)) continue;
+            count++;
+            if (!newest || date > newest) newest = date;
+        }
+        if (count < 3 || !newest) return false;
+        return newest.getTime() < target.getTime() - 60 * 1000;
     }
 
     // Advance as soon as a new tweet id renders (content loaded). Fall back to the
@@ -663,30 +779,23 @@ function tpsInstallPageScrollGuard(globalObj) {
         const beforeY = scrollTop();
         const beforeHeight = scrollRoot().scrollHeight;
 
+        await paceStep(ctrl);
+        if (ctrl.aborted) return 'aborted';
         scrollDownStep();
         let outcome = await waitForStep(targetId, ctrl, knownIds);
+        await waitForVirtualizer(ctrl);
         if (outcome === 'aborted' || outcome === 'found' || outcome === 'end' || outcome === 'timeout') {
             return outcome;
         }
         if (outcome === 'loaded') return 'progress';
 
-        // No new ids yet — if we still moved, keep going; otherwise recover.
+        // No new ids yet — if we still moved, keep going; otherwise retry this step.
+        // Never jump to scrollHeight: that resets X's virtual timeline.
         if (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40) {
             return 'progress';
         }
         if (isAtScrollBottom()) return 'end';
-
-        allowProgrammaticScroll(2000);
-        const root = scrollRoot();
-        root.scrollTop = root.scrollHeight;
-        window.scrollTo(0, root.scrollHeight);
-        await sleep(300);
-        outcome = await waitForStep(targetId, ctrl, knownIds);
-        if (outcome === 'found' || outcome === 'end' || outcome === 'timeout') return outcome;
-        if (outcome === 'loaded') return 'progress';
-        return (scrollTop() > beforeY + 40 || scrollRoot().scrollHeight > beforeHeight + 40)
-            ? 'progress'
-            : 'stuck';
+        return 'stuck';
     }
 
     // Wait until the timeline has rendered at least one tweet.
