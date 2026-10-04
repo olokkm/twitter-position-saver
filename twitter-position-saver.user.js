@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.19
+// @version      3.20
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -176,6 +176,9 @@ function tpsInstallPageScrollGuard(globalObj) {
         // page until the tab is killed and X reloads — which starts the search over.
         minStepGapMs: 450,
         stepViewportRatio: 0.5,
+        // Hard cap on tweets X may keep mounted during a search. The script
+        // cannot set a browser memory quota; it stops scrolling until the count
+        // drops, so the tab is not killed and reloaded.
         maxMountedTweets: 26,
         autoRestore: true         // jump back automatically when the timeline loads
     };
@@ -556,6 +559,7 @@ function tpsInstallPageScrollGuard(globalObj) {
 
             let stuckSteps = 0;
             let endSteps = 0;
+            let capHolds = 0;
             let lastDir = 'down';
             let passCrossings = 0;
 
@@ -598,6 +602,20 @@ function tpsInstallPageScrollGuard(globalObj) {
                         await sleep(CONFIG.endRetryDelayMs);
                         scrollDownStep();
                         continue;
+                    } else if (outcome === 'capped') {
+                        endSteps = 0;
+                        stuckSteps = 0;
+                        capHolds++;
+                        if (capHolds >= 8) {
+                            return finishPanel(
+                                `Stopped — ${mountedTweetCount()} posts still mounted (limit ${CONFIG.maxMountedTweets})`
+                            );
+                        }
+                        updatePanel(
+                            `Holding at ${mountedTweetCount()} posts (limit ${CONFIG.maxMountedTweets})`
+                        );
+                        await sleep(400);
+                        continue;
                     } else if (outcome === 'stuck') {
                         endSteps = 0;
                         if (++stuckSteps >= CONFIG.stuckConfirmAttempts) break;
@@ -609,6 +627,7 @@ function tpsInstallPageScrollGuard(globalObj) {
                     } else {
                         endSteps = 0;
                         stuckSteps = 0;
+                        capHolds = 0;
                         continue;
                     }
                 }
@@ -724,6 +743,27 @@ function tpsInstallPageScrollGuard(globalObj) {
         }
     }
 
+    // Do not scroll further while more than maxMountedTweets are mounted.
+    // Near the top, X often mounts a first batch before virtualizing, so the
+    // search is allowed to start. Deeper in, nudge up so off-screen tweets drop.
+    async function holdForMountedCap(ctrl) {
+        const cap = CONFIG.maxMountedTweets || 26;
+        for (let pass = 0; pass < 3; pass++) {
+            const start = Date.now();
+            while (Date.now() - start < 1500) {
+                if (ctrl && ctrl.aborted) return 'aborted';
+                if (mountedTweetCount() <= cap) return 'ok';
+                await sleep(80);
+            }
+            if (scrollTop() < window.innerHeight) return 'ok';
+            if (ctrl && ctrl.aborted) return 'aborted';
+            scrollByNudge(-Math.round(stepNudge() * 0.6));
+            await sleep(200);
+        }
+        if (ctrl && ctrl.aborted) return 'aborted';
+        return mountedTweetCount() <= cap ? 'ok' : 'capped';
+    }
+
     // Every mounted tweet is older than the saved one, so we scrolled past it.
     // Using the newest (not the oldest) ignores a single old promoted tweet.
     function passedTarget(saved) {
@@ -781,6 +821,9 @@ function tpsInstallPageScrollGuard(globalObj) {
 
         await paceStep(ctrl);
         if (ctrl.aborted) return 'aborted';
+        const held = await holdForMountedCap(ctrl);
+        if (held === 'aborted') return 'aborted';
+        if (held === 'capped') return 'capped';
         scrollDownStep();
         let outcome = await waitForStep(targetId, ctrl, knownIds);
         await waitForVirtualizer(ctrl);
