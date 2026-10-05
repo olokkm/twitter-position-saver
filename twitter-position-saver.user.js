@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.39
+// @version      3.40
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.39';
+const TPS_VERSION = '3.40';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -25,7 +25,8 @@ const TPS_VERSION = '3.39';
 // Optional on-screen overlay: localStorage tps_debug_scroll=1 or #tpsdebug.
 // v3.38: scrollBy deltas → absolute nextY (fixes iOS idle-normalize blocks).
 // v3.39: noanchor overlay uses getComputedStyle (not CSS.supports); wrap more
-//        scroll writers; after land seed AbsolutePower _heights for cells above.
+//        scroll writers (debug-only).
+// v3.40: drop unverified AbsolutePower _heights seeding (isolated-world miss).
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -2576,77 +2577,6 @@ function tpsInjectPageRealmScripts() {
         landSettleTimer = setTimeout(step, 180);
     }
 
-    // AbsolutePower (window.scroller) keeps a per-timelineId height Map that
-    // SURVIVES cell unmount. Unmeasured cells use assumedItemHeight (400 mobile /
-    // 250 desktop). After a mid-feed land, cells above are usually unmeasured, so
-    // scrolling up measures then idle-normalizes (Safari/iOS ~200ms after scroll
-    // end) → visible jump. Normal top→down scroll never does that because every
-    // cell above was already measured. Seed missing tweet-* heights with the
-    // average of currently mounted tweet cells so normalize deltas stay small.
-    // Does NOT prerender DOM; only writes numbers into scroller._heights.
-    function seedScrollerHeightCacheAfterLand(landedId) {
-        try {
-            const sc = typeof window !== 'undefined' ? window.scroller : null;
-            if (!sc || !sc._heights || typeof sc._heights.set !== 'function') return;
-            if (typeof sc._measureHeights === 'function') {
-                try { sc._measureHeights(); } catch (_) { /* ignore */ }
-            }
-            const articles = Array.from(
-                document.querySelectorAll('article[data-testid="tweet"]')
-            );
-            let sum = 0;
-            let n = 0;
-            const mountedIds = [];
-            for (let i = 0; i < articles.length; i++) {
-                const tid = extractTweetId(articles[i]);
-                if (!tid) continue;
-                const h = articles[i].getBoundingClientRect().height;
-                if (!(h > 40 && h < 4000)) continue;
-                sum += h;
-                n++;
-                mountedIds.push(tid);
-                const eid = 'tweet-' + tid;
-                if (!sc._heights.has(eid)) sc._heights.set(eid, Math.round(h));
-            }
-            if (n < 1) return;
-            const avg = Math.round(sum / n);
-            // Prefer AbsolutePower's own list ids when available.
-            let seeded = 0;
-            let list = null;
-            try {
-                list = sc.props && sc.props.list;
-            } catch (_) { list = null; }
-            if (list && typeof list.forEach === 'function') {
-                list.forEach(function (item) {
-                    if (!item || !item.id || typeof item.id !== 'string') return;
-                    if (item.id.indexOf('tweet-') !== 0) return;
-                    if (sc._heights.has(item.id)) return;
-                    sc._heights.set(item.id, avg);
-                    seeded++;
-                });
-            } else {
-                const meta = readJumpSortMeta && readJumpSortMeta();
-                const order = meta && Array.isArray(meta.order) ? meta.order : null;
-                if (order && order.length && landedId) {
-                    let landIdx = order.indexOf(String(landedId));
-                    if (landIdx < 0) landIdx = order.length;
-                    // Seed ~1 viewport-worth above + a little more (not entire feed).
-                    const start = Math.max(0, landIdx - 24);
-                    for (let i = start; i < landIdx; i++) {
-                        const eid = 'tweet-' + String(order[i]);
-                        if (sc._heights.has(eid)) continue;
-                        sc._heights.set(eid, avg);
-                        seeded++;
-                    }
-                }
-            }
-            scrollLog('seedHeights', 'avg=', avg, 'mounted=', n,
-                'seeded=', seeded, 'cacheSize=', sc._heights.size);
-        } catch (e) {
-            try { scrollLog('seedHeights err', e && e.message); } catch (_) { /* ignore */ }
-        }
-    }
-
     function markLanded(tweetOrId) {
         landedAwaitingUser = true;
         userControlAfterLand = false;
@@ -2657,13 +2587,6 @@ function tpsInjectPageRealmScripts() {
         rememberStablePosition();
         scrollLog('markLanded', 'y=', lastStableScrollY, 'tweet=', landedTweetId,
             'hdr=', stickyHeaderOffset());
-        seedScrollerHeightCacheAfterLand(landedTweetId);
-        // Second pass after a paint so late-mounted overscan cells are included.
-        try {
-            setTimeout(function () {
-                if (!userControlAfterLand) seedScrollerHeightCacheAfterLand(landedTweetId);
-            }, 320);
-        } catch (_) { /* ignore */ }
         scheduleLandSettle(landedTweetId);
     }
 

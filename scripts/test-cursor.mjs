@@ -1079,7 +1079,7 @@ assert(!wouldBlockScrollTo(Y, 0, true), 'allowed window permits scrollTo top');
 
 console.log('info: v3.38 scrollBy delta guard tests done');
 
-// --- v3.39 noanchor report + height-seed helpers ---
+// --- v3.40 noanchor report (debug overlay); seeding removed ---
 function formatOverflowAnchorReport(flag, aSe, aHtml, aBody) {
   const off = (aSe === 'none' && aHtml === 'none' && (!aBody || aBody === 'none'));
   return (flag ? 'flag' : 'noflag') + ':' + (off ? 'OFF' : 'ON') +
@@ -1097,24 +1097,10 @@ assert(
   formatOverflowAnchorReport(false, 'auto', 'auto', 'auto').startsWith('noflag:ON'),
   'noflag:ON when anchoring active'
 );
+// Seeding removed in v3.40 (never reached page-realm window.scroller from isolated content).
+assert(true, 'seedHeights removed');
 
-// Height seed: only fill missing keys; leave measured alone
-function seedMissingHeights(heights, ids, avg) {
-  let seeded = 0;
-  for (const id of ids) {
-    const eid = id.indexOf('tweet-') === 0 ? id : ('tweet-' + id);
-    if (heights.has(eid)) continue;
-    heights.set(eid, avg);
-    seeded++;
-  }
-  return seeded;
-}
-const hm = new Map([['tweet-1', 520]]);
-assert(seedMissingHeights(hm, ['1', '2', 'tweet-3'], 480) === 2, 'seed 2 missing');
-assert(hm.get('tweet-1') === 520, 'measured height preserved');
-assert(hm.get('tweet-2') === 480 && hm.get('tweet-3') === 480, 'missing filled with avg');
-
-console.log('info: v3.39 noanchor/seed tests done');
+console.log('info: v3.40 noanchor/debug-gate tests done');
 
 
 
