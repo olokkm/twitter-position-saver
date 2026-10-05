@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.35
+// @version      3.36
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.35';
+const TPS_VERSION = '3.36';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -1696,14 +1696,6 @@ function tpsInjectPageRealmScripts() {
         // Merged jump: chain head→Bottom pages until saved pos (+1 page), deliver one response.
         jumpMerge: true,
         jumpMergeMaxPages: 12,     // ~1200 posts; if target not reached → v3.28 fallback
-        // Pre-render posts above the pin so X measures heights before the user scrolls up.
-        // iPhone-width articles ≈450–550px; viewport ≈750px → ~1.5 posts/screen.
-        // Olo ≈8 posts/h → 2h ≈16 posts; cap 40 ≈27 viewport steps ×80ms ≈2.2s.
-        prerenderAbove: true,
-        prerenderLeadMs: 2 * 60 * 60 * 1000,
-        prerenderMaxPosts: 40,
-        prerenderMaxMs: 2500,
-        prerenderStepWaitMs: 80
     };
 
     const DEBUG = false;
@@ -2332,7 +2324,6 @@ function tpsInjectPageRealmScripts() {
     let landedAwaitingUser = false;
     let userControlAfterLand = false;
     let touchActive = false;
-    let prerenderActive = false;
     let landedTweetId = null;
     let landSettleTimer = 0;
     let landSettleCount = 0;
@@ -2482,10 +2473,9 @@ function tpsInjectPageRealmScripts() {
     }
 
     function undoXYank() {
-        if (userControlAfterLand || landedAwaitingUser || prerenderActive) {
+        if (userControlAfterLand || landedAwaitingUser) {
             scrollLog('yank-undo skipped',
-                prerenderActive ? '(prerender)' :
-                (userControlAfterLand ? '(userControl)' : '(land-settle)'));
+                userControlAfterLand ? '(userControl)' : '(land-settle)');
             return;
         }
         suppressSaves = true;
@@ -2700,170 +2690,6 @@ function tpsInjectPageRealmScripts() {
         return finishPanel(text + suffix);
     }
 
-    // How many newer posts (above target in newest-first order) to pre-render.
-    // Lead is snowflake-time ms; stop at maxPosts.
-    function computePrerenderPostCount(order, targetIdx, leadMs, maxPosts) {
-        if (!order || targetIdx == null || targetIdx <= 0) return 0;
-        const maxP = maxPosts == null ? 40 : maxPosts;
-        const lead = leadMs == null ? (2 * 60 * 60 * 1000) : leadMs;
-        if (maxP <= 0 || lead <= 0) return 0;
-        let targetId;
-        try { targetId = BigInt(order[targetIdx]); } catch (_) { return 0; }
-        let count = 0;
-        for (let i = targetIdx - 1; i >= 0; i--) {
-            try {
-                const newer = BigInt(order[i]);
-                const dt = Number((newer - targetId) >> 22n);
-                if (dt < 0) continue;
-                if (dt > lead) break;
-                count++;
-                if (count >= maxP) break;
-            } catch (_) { /* skip */ }
-        }
-        return count;
-    }
-
-    function dbgOverlayLine(line) {
-        scrollLog(line);
-        try {
-            const el = document.getElementById('tps-scroll-debug');
-            if (!el) return;
-            const parts = String(el.textContent || '').split('\n');
-            const head = parts.length ? parts[0] : 'TPS dbg';
-            const rest = parts.slice(1);
-            rest.push(String(line));
-            while (rest.length > 7) rest.shift();
-            el.textContent = [head].concat(rest).join('\n');
-        } catch (_) { /* ignore */ }
-    }
-
-    function waitForMountChange(prevIds, maxMs) {
-        const limit = maxMs == null ? 80 : maxMs;
-        return new Promise(function (resolve) {
-            let done = false;
-            let mo = null;
-            let raf = 0;
-            const start = Date.now();
-            const finish = function (ok) {
-                if (done) return;
-                done = true;
-                if (mo) try { mo.disconnect(); } catch (_) { /* ignore */ }
-                if (raf) try { cancelAnimationFrame(raf); } catch (_) { /* ignore */ }
-                resolve(!!ok);
-            };
-            const tick = function () {
-                if (done) return;
-                try {
-                    const now = currentTweetIds();
-                    for (const id of now) {
-                        if (!prevIds.has(id)) { finish(true); return; }
-                    }
-                } catch (_) { /* ignore */ }
-                if (Date.now() - start >= limit) { finish(false); return; }
-                raf = requestAnimationFrame(tick);
-            };
-            try {
-                const root = document.getElementById('react-root') || document.body || document.documentElement;
-                mo = new MutationObserver(function () { tick(); });
-                if (root) mo.observe(root, { childList: true, subtree: true });
-            } catch (_) { /* ignore */ }
-            raf = requestAnimationFrame(tick);
-            setTimeout(function () { finish(false); }, limit + 20);
-        });
-    }
-
-    // Scroll up from the target so X mounts/measures newer posts, then return.
-    // Sets prerenderActive so yank-undo does not fight. Aborts on user gesture.
-    async function prerenderAboveTarget(saved, ctrl, order, targetIdx) {
-        if (CONFIG.prerenderAbove === false) {
-            return { posts: 0, steps: 0, ms: 0, shift: 0, skipped: true };
-        }
-        const posts = computePrerenderPostCount(
-            order,
-            targetIdx,
-            CONFIG.prerenderLeadMs,
-            CONFIG.prerenderMaxPosts
-        );
-        if (posts <= 0 || targetIdx <= 0) {
-            return { posts: 0, steps: 0, ms: 0, shift: 0, skipped: true };
-        }
-
-        const maxMs = CONFIG.prerenderMaxMs == null ? 2500 : CONFIG.prerenderMaxMs;
-        const stepWait = CONFIG.prerenderStepWaitMs == null ? 80 : CONFIG.prerenderStepWaitMs;
-        // ~500px/post, ~750px viewport → ~1.5 posts/step; bound steps by time too.
-        const postsPerStep = 1.5;
-        const maxSteps = Math.max(1, Math.min(
-            Math.ceil(posts / postsPerStep),
-            Math.floor(maxMs / Math.max(16, stepWait))
-        ));
-        const goalIdx = Math.max(0, targetIdx - posts);
-        const view = Math.max(320, (window.innerHeight || 700) * 0.95);
-
-        updatePanel('Pre-rendering posts above… (' + posts + ')');
-        prerenderActive = true;
-        const t0 = Date.now();
-        let steps = 0;
-        let shift = 0;
-
-        try {
-            while (Date.now() - t0 < maxMs && steps < maxSteps) {
-                if (ctrl.aborted || userControlAfterLand) break;
-
-                let minI = Infinity;
-                const articles = document.querySelectorAll('article[data-testid="tweet"]');
-                for (let a = 0; a < articles.length; a++) {
-                    const id = extractTweetId(articles[a]);
-                    if (!id) continue;
-                    let oi = order.indexOf(id);
-                    if (oi < 0) {
-                        const mapped = lookupSortId(id);
-                        if (mapped) oi = order.indexOf(String(mapped));
-                    }
-                    if (oi >= 0 && oi < minI) minI = oi;
-                }
-                if (minI !== Infinity && minI <= goalIdx) break;
-
-                const prevIds = currentTweetIds();
-                const yBefore = scrollTop();
-                tpsScrollWrite('prerender-up', function () {
-                    const root = scrollRoot();
-                    root.scrollTop = Math.max(0, (root.scrollTop || 0) - view);
-                    window.scrollBy(0, -view);
-                });
-                await waitForMountChange(prevIds, stepWait);
-                const yAfter = scrollTop();
-                // Expected ≈ yBefore - view (clamped at 0); X height fixes show as extra delta.
-                const expected = Math.max(0, yBefore - view);
-                shift += Math.abs(yAfter - expected);
-                steps++;
-                if (yAfter <= 2) break;
-            }
-        } finally {
-            prerenderActive = false;
-        }
-
-        const ms = Date.now() - t0;
-        const line = 'prerender: posts=' + posts + ' steps=' + steps +
-            ' ms=' + ms + ' shift=' + Math.round(shift);
-        dbgOverlayLine(line);
-        jumpLog(line);
-
-        // Return to target before final land.
-        if (!ctrl.aborted && !userControlAfterLand) {
-            const el = findTweetById(saved.tweetId);
-            if (el) {
-                tpsScrollWrite('prerender-return', function () {
-                    try {
-                        el.scrollIntoView({ behavior: 'instant', block: 'start' });
-                    } catch (_) {
-                        try { el.scrollIntoView({ block: 'start' }); } catch (__) { /* ignore */ }
-                    }
-                });
-                await sleep(40);
-            }
-        }
-        return { posts: posts, steps: steps, ms: ms, shift: shift, skipped: false };
-    }
 
     function landTweet(tweet, timeStr, code) {
         tpsScrollWrite('land', function () {
@@ -2988,7 +2814,6 @@ function tpsInjectPageRealmScripts() {
         for (let iter = 0; iter < maxIters && !ctrl.aborted; iter++) {
             const landed = findTweetById(saved.tweetId);
             if (landed) {
-                await prerenderAboveTarget(saved, ctrl, order, idx);
                 if (ctrl.aborted) return finishPanel('Stopped');
                 if (userControlAfterLand) return finishPanel('Stopped');
                 const again = findTweetById(saved.tweetId) || landed;
@@ -3057,7 +2882,6 @@ function tpsInjectPageRealmScripts() {
         if (ctrl.aborted) return finishPanel('Stopped');
         const last = findTweetById(saved.tweetId);
         if (last) {
-            await prerenderAboveTarget(saved, ctrl, order, idx);
             if (ctrl.aborted) return finishPanel('Stopped');
             if (userControlAfterLand) return finishPanel('Stopped');
             const again = findTweetById(saved.tweetId) || last;
