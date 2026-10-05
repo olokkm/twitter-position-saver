@@ -1023,7 +1023,51 @@ const r = [];
 ringPush(r, 3, 'a'); ringPush(r, 3, 'b'); ringPush(r, 3, 'c'); ringPush(r, 3, 'd');
 assert(r.join(',') === 'b,c,d', 'ring keeps last 3');
 
+
 console.log('info: v3.34 debug overlay tests done');
+
+// --- v3.35 prerender bound ---
+function computePrerenderPostCount(order, targetIdx, leadMs, maxPosts) {
+  if (!order || targetIdx == null || targetIdx <= 0) return 0;
+  const maxP = maxPosts == null ? 40 : maxPosts;
+  const lead = leadMs == null ? (2 * 60 * 60 * 1000) : leadMs;
+  if (maxP <= 0 || lead <= 0) return 0;
+  let targetId;
+  try { targetId = BigInt(order[targetIdx]); } catch (_) { return 0; }
+  let count = 0;
+  for (let i = targetIdx - 1; i >= 0; i--) {
+    try {
+      const newer = BigInt(order[i]);
+      const dt = Number((newer - targetId) >> 22n);
+      if (dt < 0) continue;
+      if (dt > lead) break;
+      count++;
+      if (count >= maxP) break;
+    } catch (_) {}
+  }
+  return count;
+}
+
+const TW_EPOCH35 = 1288834974657n;
+function sf35(ms) { return (BigInt(ms) - TW_EPOCH35) << 22n; }
+const t0 = 1700000000000;
+// newest → oldest ids
+const order = [
+  String(sf35(t0 + 3 * 3600000)), // +3h
+  String(sf35(t0 + 90 * 60000)),  // +90m
+  String(sf35(t0 + 30 * 60000)),  // +30m
+  String(sf35(t0)),               // target
+  String(sf35(t0 - 3600000))
+];
+const idx = 3;
+assert(computePrerenderPostCount(order, idx, 2 * 3600000, 40) === 2, '2h lead includes 90m+30m not 3h');
+assert(computePrerenderPostCount(order, idx, 4 * 3600000, 40) === 3, '4h lead includes all newer');
+assert(computePrerenderPostCount(order, idx, 4 * 3600000, 2) === 2, 'maxPosts caps');
+assert(computePrerenderPostCount(order, 0, 2 * 3600000, 40) === 0, 'target at head → 0');
+assert(computePrerenderPostCount(order, idx, 0, 40) === 0, 'zero lead → 0');
+
+console.log('info: v3.35 prerender bound tests done');
+
 
 
 
