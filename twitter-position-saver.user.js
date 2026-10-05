@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.38
+// @version      3.39
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.38';
+const TPS_VERSION = '3.39';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -24,6 +24,8 @@ const TPS_VERSION = '3.38';
 // unless a recent user gesture or data-tps-allow-scroll window is active.
 // Optional on-screen overlay: localStorage tps_debug_scroll=1 or #tpsdebug.
 // v3.38: scrollBy deltas → absolute nextY (fixes iOS idle-normalize blocks).
+// v3.39: noanchor overlay uses getComputedStyle (not CSS.supports); wrap more
+//        scroll writers; after land seed AbsolutePower _heights for cells above.
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -88,15 +90,79 @@ function tpsInstallPageScrollGuard(globalObj) {
         }
     }
 
+
+    function readNoAnchorFlag() {
+        try {
+            if (g.localStorage && g.localStorage.getItem('tps_debug_noanchor') === '1') return true;
+        } catch (_) { /* ignore */ }
+        try {
+            const h = String(g.location && g.location.hash || '');
+            if (/(?:^|[&#])tpsnoanchor(?:&|$)/.test(h)) return true;
+        } catch (_) { /* ignore */ }
+        return false;
+    }
+
+    function overflowAnchorOf(el) {
+        if (!el) return '?';
+        try {
+            const cs = g.getComputedStyle(el);
+            return cs.getPropertyValue('overflow-anchor').trim() || cs.overflowAnchor || '?';
+        } catch (_) {
+            return '?';
+        }
+    }
+
+    // Report whether NOANCHOR is active on the real scrollers (not CSS.supports).
+    function readOverflowAnchorReport() {
+        try {
+            const doc = g.document;
+            if (!doc) return '?';
+            const se = doc.scrollingElement || doc.documentElement;
+            const html = doc.documentElement;
+            const body = doc.body;
+            const flag = readNoAnchorFlag();
+            const aSe = overflowAnchorOf(se);
+            const aHtml = overflowAnchorOf(html);
+            const aBody = overflowAnchorOf(body);
+            // Effective: all none => disabled (iOS-like); else show values.
+            const off = (aSe === 'none' && aHtml === 'none' && (!body || aBody === 'none'));
+            return (flag ? 'flag' : 'noflag') + ':' + (off ? 'OFF' : 'ON') +
+                '(se=' + aSe + ' html=' + aHtml + ' body=' + aBody + ')';
+        } catch (_) {
+            return '?';
+        }
+    }
+
+    function ensureNoAnchorCss() {
+        if (!readNoAnchorFlag()) return false;
+        try {
+            const doc = g.document;
+            if (!doc) return false;
+            if (doc.getElementById('tps-debug-noanchor')) return true;
+            const s = doc.createElement('style');
+            s.id = 'tps-debug-noanchor';
+            // Cover window scroller + common X timeline roots.
+            s.textContent = [
+                'html, body, html body, #react-root, #react-root > div,',
+                '[data-testid="primaryColumn"], [data-testid="primaryColumn"] *,',
+                '[data-testid="cellInnerDiv"], [data-testid="cellInnerDiv"] *',
+                '{ overflow-anchor: none !important; }'
+            ].join(' ');
+            (doc.documentElement || doc.head || doc.body).appendChild(s);
+            dbgPush('noanchor css injected');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
     function dbgEnsureOverlay() {
         if (!DEBUG || dbgEl) return dbgEl;
         try {
             const doc = g.document;
             if (!doc || !doc.documentElement) return null;
             try {
-                dbgAnchorSupports = (typeof CSS !== 'undefined' && CSS.supports)
-                    ? String(CSS.supports('overflow-anchor', 'auto'))
-                    : '?';
+                dbgAnchorSupports = readOverflowAnchorReport();
             } catch (_) {
                 dbgAnchorSupports = '?';
             }
@@ -123,7 +189,9 @@ function tpsInstallPageScrollGuard(globalObj) {
             ].join(';');
             (doc.documentElement || doc.body).appendChild(el);
             dbgEl = el;
-            dbgPush('overlay on anchor=' + dbgAnchorSupports);
+            ensureNoAnchorCss();
+            try { dbgAnchorSupports = readOverflowAnchorReport(); } catch (_) { /* ignore */ }
+            dbgPush('overlay on oa=' + dbgAnchorSupports);
             return el;
         } catch (_) {
             return null;
@@ -136,8 +204,10 @@ function tpsInstallPageScrollGuard(globalObj) {
         if (!el || !dbgRing) return;
         const now = dbgNow();
         const y = Math.round(currentY());
+        let oa = dbgAnchorSupports;
+        try { oa = readOverflowAnchorReport(); dbgAnchorSupports = oa; } catch (_) { /* ignore */ }
         const lines = [
-            'TPS dbg y=' + y + ' oa=' + dbgAnchorSupports +
+            'TPS dbg y=' + y + ' oa=' + oa +
             (dbgLastBlk ? ' | LAST ' + dbgLastBlk : '')
         ];
         for (let i = 0; i < dbgRing.length; i++) {
@@ -228,8 +298,11 @@ function tpsInstallPageScrollGuard(globalObj) {
             const prev = dbgLastFrameDy < 0 ? -dbgLastFrameDy : dbgLastFrameDy;
             if (prev < 1 || abs > prev * 3) {
                 const ours = isOurWrite();
+                // No matching WR line usually means the browser moved scrollY
+                // itself (overflow-anchor), not AbsolutePower scrollBy.
+                const tag = ours ? (' us:' + ours) : (dbgLastBlk ? ' afterBLK' : ' native?');
                 dbgPush('JUMP d=' + Math.round(dy) + ' ' + Math.round(dbgLastScrollY) +
-                    '→' + Math.round(y) + (ours ? ' us:' + ours : ' ?'));
+                    '→' + Math.round(y) + tag);
             }
         }
         if (!dbgTouching && Date.now() < momentumUntil && !dbgMomentumMarked && abs < 1.5) {
@@ -381,22 +454,18 @@ function tpsInstallPageScrollGuard(globalObj) {
                     const next = Number(value);
                     const from = currentY();
                     let block = false;
+                    let isDocScroller = false;
                     try {
                         const doc = g.document;
                         const se = doc && (doc.scrollingElement || doc.documentElement);
-                        if ((this === se || this === doc.documentElement || this === doc.body) &&
-                            shouldBlockJumpTo(next)) {
+                        isDocScroller = (this === se || this === doc.documentElement ||
+                            this === doc.body);
+                        if (isDocScroller && shouldBlockJumpTo(next)) {
                             block = true;
                         }
                     } catch (_) { /* fall through */ }
-                    if (DEBUG) {
-                        try {
-                            const doc = g.document;
-                            const se = doc && (doc.scrollingElement || doc.documentElement);
-                            if (this === se || this === doc.documentElement || this === doc.body) {
-                                dbgLogWrite('scrollTop', from, next, block, isOurWrite());
-                            }
-                        } catch (_) { /* ignore */ }
+                    if (DEBUG && isDocScroller) {
+                        dbgLogWrite('scrollTop', from, next, block, isOurWrite());
                     }
                     if (block) return;
                     desc.set.call(this, value);
@@ -410,13 +479,18 @@ function tpsInstallPageScrollGuard(globalObj) {
         patchScrollTop(g.HTMLElement && g.HTMLElement.prototype);
     } catch (_) { /* ignore */ }
 
+    // Always honor noanchor flag in page realm (even if scroll debug overlay is off),
+    // so Chrome tests can disable native overflow-anchor like iOS.
+    try { ensureNoAnchorCss(); } catch (_) { /* ignore */ }
+
     if (DEBUG) {
         dbgLastScrollY = currentY();
         try {
             if (g.document && g.document.documentElement) {
                 dbgEnsureOverlay();
-            } else {
+            } else if (g.document) {
                 g.document.addEventListener('DOMContentLoaded', function () {
+                    ensureNoAnchorCss();
                     dbgEnsureOverlay();
                 }, { once: true });
             }
@@ -1834,12 +1908,30 @@ function tpsInjectPageRealmScripts() {
     function applyDebugNoAnchorCss() {
         if (!TPS_DEBUG_NOANCHOR) return;
         try {
-            if (document.getElementById('tps-debug-noanchor')) return;
-            const s = document.createElement('style');
-            s.id = 'tps-debug-noanchor';
-            s.textContent = 'html, body, * { overflow-anchor: none !important; }';
-            (document.documentElement || document.head).appendChild(s);
-            scrollLog('noanchor css injected (Chrome≈iOS)');
+            if (!document.getElementById('tps-debug-noanchor')) {
+                const s = document.createElement('style');
+                s.id = 'tps-debug-noanchor';
+                s.textContent = [
+                    'html, body, html body, #react-root, #react-root > div,',
+                    '[data-testid="primaryColumn"], [data-testid="primaryColumn"] *,',
+                    '[data-testid="cellInnerDiv"], [data-testid="cellInnerDiv"] *',
+                    '{ overflow-anchor: none !important; }'
+                ].join(' ');
+                (document.documentElement || document.head).appendChild(s);
+                scrollLog('noanchor css injected (Chrome≈iOS)');
+            }
+            try {
+                const se = document.scrollingElement || document.documentElement;
+                const oa = function (el) {
+                    try {
+                        return getComputedStyle(el).getPropertyValue('overflow-anchor').trim();
+                    } catch (_) { return '?'; }
+                };
+                scrollLog('noanchor verify',
+                    'se=' + oa(se),
+                    'html=' + oa(document.documentElement),
+                    'body=' + (document.body ? oa(document.body) : 'n/a'));
+            } catch (_) { /* ignore */ }
         } catch (_) { /* ignore */ }
     }
 
@@ -2484,6 +2576,77 @@ function tpsInjectPageRealmScripts() {
         landSettleTimer = setTimeout(step, 180);
     }
 
+    // AbsolutePower (window.scroller) keeps a per-timelineId height Map that
+    // SURVIVES cell unmount. Unmeasured cells use assumedItemHeight (400 mobile /
+    // 250 desktop). After a mid-feed land, cells above are usually unmeasured, so
+    // scrolling up measures then idle-normalizes (Safari/iOS ~200ms after scroll
+    // end) → visible jump. Normal top→down scroll never does that because every
+    // cell above was already measured. Seed missing tweet-* heights with the
+    // average of currently mounted tweet cells so normalize deltas stay small.
+    // Does NOT prerender DOM; only writes numbers into scroller._heights.
+    function seedScrollerHeightCacheAfterLand(landedId) {
+        try {
+            const sc = typeof window !== 'undefined' ? window.scroller : null;
+            if (!sc || !sc._heights || typeof sc._heights.set !== 'function') return;
+            if (typeof sc._measureHeights === 'function') {
+                try { sc._measureHeights(); } catch (_) { /* ignore */ }
+            }
+            const articles = Array.from(
+                document.querySelectorAll('article[data-testid="tweet"]')
+            );
+            let sum = 0;
+            let n = 0;
+            const mountedIds = [];
+            for (let i = 0; i < articles.length; i++) {
+                const tid = extractTweetId(articles[i]);
+                if (!tid) continue;
+                const h = articles[i].getBoundingClientRect().height;
+                if (!(h > 40 && h < 4000)) continue;
+                sum += h;
+                n++;
+                mountedIds.push(tid);
+                const eid = 'tweet-' + tid;
+                if (!sc._heights.has(eid)) sc._heights.set(eid, Math.round(h));
+            }
+            if (n < 1) return;
+            const avg = Math.round(sum / n);
+            // Prefer AbsolutePower's own list ids when available.
+            let seeded = 0;
+            let list = null;
+            try {
+                list = sc.props && sc.props.list;
+            } catch (_) { list = null; }
+            if (list && typeof list.forEach === 'function') {
+                list.forEach(function (item) {
+                    if (!item || !item.id || typeof item.id !== 'string') return;
+                    if (item.id.indexOf('tweet-') !== 0) return;
+                    if (sc._heights.has(item.id)) return;
+                    sc._heights.set(item.id, avg);
+                    seeded++;
+                });
+            } else {
+                const meta = readJumpSortMeta && readJumpSortMeta();
+                const order = meta && Array.isArray(meta.order) ? meta.order : null;
+                if (order && order.length && landedId) {
+                    let landIdx = order.indexOf(String(landedId));
+                    if (landIdx < 0) landIdx = order.length;
+                    // Seed ~1 viewport-worth above + a little more (not entire feed).
+                    const start = Math.max(0, landIdx - 24);
+                    for (let i = start; i < landIdx; i++) {
+                        const eid = 'tweet-' + String(order[i]);
+                        if (sc._heights.has(eid)) continue;
+                        sc._heights.set(eid, avg);
+                        seeded++;
+                    }
+                }
+            }
+            scrollLog('seedHeights', 'avg=', avg, 'mounted=', n,
+                'seeded=', seeded, 'cacheSize=', sc._heights.size);
+        } catch (e) {
+            try { scrollLog('seedHeights err', e && e.message); } catch (_) { /* ignore */ }
+        }
+    }
+
     function markLanded(tweetOrId) {
         landedAwaitingUser = true;
         userControlAfterLand = false;
@@ -2494,6 +2657,13 @@ function tpsInjectPageRealmScripts() {
         rememberStablePosition();
         scrollLog('markLanded', 'y=', lastStableScrollY, 'tweet=', landedTweetId,
             'hdr=', stickyHeaderOffset());
+        seedScrollerHeightCacheAfterLand(landedTweetId);
+        // Second pass after a paint so late-mounted overscan cells are included.
+        try {
+            setTimeout(function () {
+                if (!userControlAfterLand) seedScrollerHeightCacheAfterLand(landedTweetId);
+            }, 320);
+        } catch (_) { /* ignore */ }
         scheduleLandSettle(landedTweetId);
     }
 
@@ -3805,7 +3975,12 @@ function tpsInjectPageRealmScripts() {
         // Reduce browser scroll-anchoring jumps when X prepends tweets above the viewport.
         try {
             const style = document.createElement('style');
-            style.textContent = 'html, body, [data-testid="primaryColumn"] { overflow-anchor: none !important; }';
+            style.id = 'tps-overflow-anchor-off';
+            style.textContent = [
+                'html, body, html body, #react-root,',
+                '[data-testid="primaryColumn"], [data-testid="primaryColumn"] *',
+                '{ overflow-anchor: none !important; }'
+            ].join(' ');
             (document.head || document.documentElement).appendChild(style);
         } catch (_) { /* ignore */ }
 
