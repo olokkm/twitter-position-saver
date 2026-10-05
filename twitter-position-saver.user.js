@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.29
+// @version      3.30
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -15,6 +15,8 @@
 // @run-at       document-start
 // @noframes
 // ==/UserScript==
+
+const TPS_VERSION = '3.30';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block (Tampermonkey: unsafeWindow). Gear content scripts are
@@ -165,11 +167,32 @@ function tpsInstallPageScrollGuard(globalObj) {
 // 4) Every ListLatestTweetsTimeline response is scanned for displayedTweetId →
 //    positionId mappings and published to <script id="tps-sortmap"> (plus
 //    order/jumpMerged/pages after a merge).
-function tpsInstallPageJumpHook(globalObj) {
+function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
-    if (!g || g.__tpsJumpHookInstalled) return;
+    if (!g) return;
+    const realm = realmHint || 'local';
+    const ver = versionHint || '0';
+
+    // Prefer page realm (tm / injected) over a content-script-local install.
+    // Same-realm double-patch is blocked by __tpsJumpHookInstalled.
+    try {
+        const existing = g.document && g.document.documentElement &&
+            g.document.documentElement.getAttribute('data-tps-hook');
+        if (existing) {
+            const er = String(existing).split('|')[1] || '';
+            if (realm === 'local' && (er === 'tm' || er === 'injected')) return;
+            if (er === realm && g.__tpsJumpHookInstalled) return;
+        }
+    } catch (_) { /* ignore */ }
+    if (g.__tpsJumpHookInstalled) return;
     g.__tpsJumpHookInstalled = true;
+
+    try {
+        if (g.document && g.document.documentElement) {
+            g.document.documentElement.setAttribute('data-tps-hook', String(ver) + '|' + realm);
+        }
+    } catch (_) { /* ignore */ }
 
     const TWITTER_EPOCH_MS = 1288834974657n;
     const DEFAULT_FILL_DELTA = BigInt(3 * 60 * 60 * 1000) << 22n; // ~3 hours
@@ -832,6 +855,13 @@ function tpsInstallPageJumpHook(globalObj) {
         }
     }
 
+    function setJumpResult(code) {
+        try {
+            g.document.documentElement.setAttribute('data-tps-jump-result', String(code || ''));
+            jumpLog('result', code);
+        } catch (_) { /* ignore */ }
+    }
+
     function beginJumpHandling() {
         // Consume the one-shot arm immediately so the content script sees
         // data-tps-jump-used while chained pages are still in flight.
@@ -840,6 +870,7 @@ function tpsInstallPageJumpHook(globalObj) {
             el.removeAttribute('data-tps-jump');
             el.setAttribute('data-tps-jump-used', String(Date.now()));
             el.setAttribute('data-tps-jump-busy', '1');
+            el.setAttribute('data-tps-jump-result', 'merge:busy');
         } catch (_) { /* ignore */ }
     }
 
@@ -862,6 +893,7 @@ function tpsInstallPageJumpHook(globalObj) {
                     if (merged && merged.json) {
                         startJumpSession(false, true);
                         applySortMapFromPages(collected.pages, merged.order, true, collected.pages.length);
+                        setJumpResult('merge:ok p=' + collected.pages.length + ' n=' + merged.tweetCount);
                         jumpLog('merge ok pages=', collected.pages.length,
                             'tweets=', merged.tweetCount, 'order=', merged.order.length);
                         return {
@@ -872,13 +904,19 @@ function tpsInstallPageJumpHook(globalObj) {
                         };
                     }
                     jumpLog('merge synthesize failed — falling back');
+                    setJumpResult('merge:fallback(synth)');
                 } else {
+                    const why = collected.error || 'not-reached';
                     jumpLog('merge cap/miss — fallback to single Bottom jump',
-                        'pages=', collected.pages.length, 'err=', collected.error || 'not-reached');
+                        'pages=', collected.pages.length, 'err=', why);
+                    setJumpResult('merge:fallback(' + why + ')');
                 }
             } catch (e) {
                 jumpLog('merge error — fallback', e && (e.message || e));
+                setJumpResult('merge:fallback(error)');
             }
+        } else {
+            setJumpResult('merge:fallback(no-target)');
         }
 
         // v3.28 fallback: single Bottom-cursor page near target (B/A from arm).
@@ -890,6 +928,7 @@ function tpsInstallPageJumpHook(globalObj) {
             if (!result.ok) {
                 jumpLog('fallback fetch failed', result.status);
                 endJumpBusy();
+                setJumpResult('merge:fallback(status-' + result.status + ')');
                 return { ok: false, status: result.status };
             }
             startJumpSession(jump.fillUp, false);
@@ -900,10 +939,18 @@ function tpsInstallPageJumpHook(globalObj) {
             } catch (_) {
                 inspectResponseText(result.text);
             }
+            // Keep prior merge:fallback(...) if set; else mark single jump.
+            try {
+                const prev = g.document.documentElement.getAttribute('data-tps-jump-result') || '';
+                if (!prev || prev === 'merge:busy') {
+                    setJumpResult('merge:fallback(single)');
+                }
+            } catch (_) { /* ignore */ }
             return { ok: true, merged: false, text: result.text, url: result.url || jumpUrl };
         } catch (e) {
             jumpLog('fallback error', e && (e.message || e));
             endJumpBusy();
+            setJumpResult('merge:fallback(error)');
             return { ok: false, error: e };
         }
     }
@@ -1082,10 +1129,20 @@ function tpsInjectPageRealmScripts() {
     'use strict';
     if (typeof document === 'undefined') return;
 
+    const ver = typeof TPS_VERSION !== 'undefined' ? TPS_VERSION : '0';
     const code = [
         '(' + tpsInstallPageScrollGuard.toString() + ')(window);',
-        '(' + tpsInstallPageJumpHook.toString() + ')(window);'
+        '(' + tpsInstallPageJumpHook.toString() + ')(window,"injected",' + JSON.stringify(ver) + ');'
     ].join('\n');
+
+    function pageHookPresent() {
+        try {
+            const v = document.documentElement.getAttribute('data-tps-hook') || '';
+            return /\|(injected|tm)$/.test(v);
+        } catch (_) {
+            return false;
+        }
+    }
 
     function findNonce() {
         try {
@@ -1095,12 +1152,26 @@ function tpsInjectPageRealmScripts() {
                 if (n) return n;
             }
         } catch (_) { /* ignore */ }
+        try {
+            const all = document.querySelectorAll('[nonce]');
+            for (let i = 0; i < all.length; i++) {
+                let n = null;
+                try { n = all[i].nonce; } catch (_) { /* ignore */ }
+                if (!n) {
+                    try { n = all[i].getAttribute('nonce'); } catch (_) { /* ignore */ }
+                }
+                if (n) return n;
+            }
+        } catch (_) { /* ignore */ }
         return null;
     }
 
-    function inject(nonce) {
+    function injectInline(nonce) {
         try {
-            if (document.documentElement.getAttribute('data-tps-page-injected') === '1') return true;
+            if (pageHookPresent()) return true;
+            if (document.documentElement.getAttribute('data-tps-page-injected') === '1' && pageHookPresent()) {
+                return true;
+            }
             const s = document.createElement('script');
             if (nonce) {
                 try { s.nonce = nonce; } catch (_) { /* ignore */ }
@@ -1112,27 +1183,73 @@ function tpsInjectPageRealmScripts() {
             parent.appendChild(s);
             s.remove();
             document.documentElement.setAttribute('data-tps-page-injected', '1');
+            return pageHookPresent();
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function injectBlob(nonce) {
+        try {
+            if (pageHookPresent()) return true;
+            const blob = new Blob([code], { type: 'text/javascript' });
+            const url = URL.createObjectURL(blob);
+            const s = document.createElement('script');
+            if (nonce) {
+                try { s.nonce = nonce; } catch (_) { /* ignore */ }
+                try { s.setAttribute('nonce', nonce); } catch (_) { /* ignore */ }
+            }
+            s.src = url;
+            const parent = document.documentElement || document.head || document.body;
+            if (!parent) return false;
+            parent.appendChild(s);
+            // Revoke after a tick; keep element briefly so it can execute.
+            setTimeout(() => {
+                try { s.remove(); } catch (_) { /* ignore */ }
+                try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
+            }, 2000);
+            document.documentElement.setAttribute('data-tps-page-injected', '1');
             return true;
         } catch (_) {
             return false;
         }
     }
 
-    function tryInject() {
+    function tryInject(allowNoNonce) {
+        if (pageHookPresent()) return true;
         const nonce = findNonce();
-        if (!nonce) return false;
-        return inject(nonce);
+        if (nonce) {
+            if (injectInline(nonce)) return true;
+            if (injectBlob(nonce)) return pageHookPresent();
+        }
+        if (allowNoNonce) {
+            if (injectInline(null)) return true;
+            if (injectBlob(null)) return pageHookPresent();
+        }
+        return pageHookPresent();
     }
 
-    if (tryInject()) return;
+    if (tryInject(false)) return;
 
     const root = document.documentElement || document;
+    const started = Date.now();
     const mo = new MutationObserver(() => {
-        if (tryInject()) mo.disconnect();
+        if (tryInject(Date.now() - started > 800)) mo.disconnect();
     });
     try {
-        mo.observe(root, { childList: true, subtree: true });
+        mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['nonce'] });
     } catch (_) { /* ignore */ }
+
+    // Escalating fallbacks: wait for nonce ~1s, then try without nonce / blob.
+    setTimeout(() => {
+        if (pageHookPresent()) { try { mo.disconnect(); } catch (_) {} return; }
+        tryInject(true);
+    }, 1000);
+    setTimeout(() => {
+        if (pageHookPresent()) { try { mo.disconnect(); } catch (_) {} return; }
+        tryInject(true);
+        try { mo.disconnect(); } catch (_) { /* ignore */ }
+    }, 2500);
     setTimeout(() => { try { mo.disconnect(); } catch (_) { /* ignore */ } }, 15000);
 }
 
@@ -1143,16 +1260,17 @@ function tpsInjectPageRealmScripts() {
     try {
         if (typeof unsafeWindow !== 'undefined') {
             tpsInstallPageScrollGuard(unsafeWindow);
-            tpsInstallPageJumpHook(unsafeWindow);
+            tpsInstallPageJumpHook(unsafeWindow, 'tm', TPS_VERSION);
         } else {
             // Gear WebExtension: isolated world — inject into the page with CSP nonce.
             tpsInjectPageRealmScripts();
         }
     } catch (_) { /* ignore */ }
     try {
-        // Best-effort local install (no-op if already installed / wrong realm).
+        // Best-effort local install. Skips if a page-realm hook (tm/injected) is
+        // already marked on <html data-tps-hook>.
         tpsInstallPageScrollGuard(window);
-        tpsInstallPageJumpHook(window);
+        tpsInstallPageJumpHook(window, 'local', TPS_VERSION);
     } catch (_) { /* ignore */ }
 
     const CONFIG = {
@@ -1336,6 +1454,7 @@ function tpsInjectPageRealmScripts() {
         try { document.documentElement.removeAttribute('data-tps-jump-used'); } catch (_) { /* ignore */ }
         try { document.documentElement.removeAttribute('data-tps-jump-merged'); } catch (_) { /* ignore */ }
         try { document.documentElement.removeAttribute('data-tps-jump-busy'); } catch (_) { /* ignore */ }
+        try { document.documentElement.removeAttribute('data-tps-jump-result'); } catch (_) { /* ignore */ }
     }
 
     function jumpIsBusy() {
@@ -1856,65 +1975,200 @@ function tpsInjectPageRealmScripts() {
         return navigationType() === 'reload';
     }
 
+    // Resolve target index in merged order (newest-first position ids).
+    // sortMap is displayedId → positionId (not the reverse).
+    function resolveOrderIndex(order, tweetId, sortId, sortMap) {
+        if (!order || !order.length) return { idx: -1, how: 'empty', approx: false };
+        const tid = String(tweetId || '');
+        const sid = String(sortId || tweetId || '');
+        let idx = order.indexOf(tid);
+        if (idx >= 0) return { idx: idx, how: 'tweetId', approx: false };
+        if (sid && sid !== tid) {
+            idx = order.indexOf(sid);
+            if (idx >= 0) return { idx: idx, how: 'sortId', approx: false };
+        }
+        const sm = sortMap && typeof sortMap === 'object' ? sortMap : null;
+        function mapPos(key) {
+            if (!sm || key == null) return null;
+            const v = sm[String(key)];
+            if (v == null || typeof v === 'object' || Array.isArray(v) || v === true || v === false) return null;
+            return String(v);
+        }
+        const posFromTweet = mapPos(tid);
+        if (posFromTweet) {
+            idx = order.indexOf(posFromTweet);
+            if (idx >= 0) return { idx: idx, how: 'mapTweet', approx: false };
+        }
+        if (sid && sid !== tid) {
+            const posFromSort = mapPos(sid);
+            if (posFromSort) {
+                idx = order.indexOf(posFromSort);
+                if (idx >= 0) return { idx: idx, how: 'mapSort', approx: false };
+            }
+        }
+        // Insertion point: first order entry with position <= targetPos (newest-first).
+        let targetPos = null;
+        try {
+            if (posFromTweet) targetPos = BigInt(posFromTweet);
+        } catch (_) { /* ignore */ }
+        if (targetPos == null) {
+            try { targetPos = BigInt(sid || tid); } catch (_) {
+                return { idx: -1, how: 'none', approx: false };
+            }
+        }
+        for (let i = 0; i < order.length; i++) {
+            try {
+                if (BigInt(order[i]) <= targetPos) {
+                    return { idx: i, how: 'insert', approx: true };
+                }
+            } catch (_) { /* ignore */ }
+        }
+        return { idx: order.length - 1, how: 'insert-end', approx: true };
+    }
+
+    function readJumpResultCode() {
+        try {
+            return document.documentElement.getAttribute('data-tps-jump-result') || '';
+        } catch (_) {
+            return '';
+        }
+    }
+
+    function readHookInfo() {
+        try {
+            const raw = document.documentElement.getAttribute('data-tps-hook') || '';
+            if (!raw) return null;
+            const parts = String(raw).split('|');
+            return { version: parts[0] || '', realm: parts[1] || '' };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function finishWithCode(text, code) {
+        const suffix = code ? ' [' + code + ']' : '';
+        return finishPanel(text + suffix);
+    }
+
+    function landTweet(tweet, timeStr, code) {
+        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+        try {
+            tweet.scrollIntoView({ behavior: 'instant', block: 'start' });
+        } catch (_) {
+            try { tweet.scrollIntoView({ block: 'start' }); } catch (__) { /* ignore */ }
+        }
+        try {
+            const root = scrollRoot();
+            root.scrollTop = Math.max(0, root.scrollTop - 12);
+        } catch (_) { /* ignore */ }
+        highlight(tweet);
+        return finishWithCode('Jumped to tweet from ' + timeStr, code || 'pos:ok');
+    }
+
+    // After estimate loop misses: step ~0.8 viewport toward target using order indices.
+    async function searchMergedByOrder(saved, ctrl, timeStr, order, idx, codePrefix) {
+        const maxSteps = 40;
+        updatePanel('Near-search after merge… [' + (codePrefix || 'pos:near') + ']');
+        for (let step = 1; step <= maxSteps && !ctrl.aborted; step++) {
+            const tweet = findTweetById(saved.tweetId);
+            if (tweet) return landTweet(tweet, timeStr, 'pos:near');
+
+            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            let minI = Infinity;
+            let maxI = -Infinity;
+            for (let a = 0; a < articles.length; a++) {
+                const id = extractTweetId(articles[a]);
+                if (!id) continue;
+                let oi = order.indexOf(id);
+                if (oi < 0) {
+                    const mapped = lookupSortId(id);
+                    if (mapped) oi = order.indexOf(String(mapped));
+                }
+                if (oi < 0) continue;
+                if (oi < minI) minI = oi;
+                if (oi > maxI) maxI = oi;
+            }
+
+            let dirDown = true;
+            if (minI !== Infinity) {
+                if (idx < minI) dirDown = false; // need newer → scroll up
+                else if (idx > maxI) dirDown = true;
+                else {
+                    // Target index is within mounted range but article not found
+                    // (original id of a repost, etc.) — nudge down then up.
+                    dirDown = step % 2 === 1;
+                }
+            }
+
+            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+            await paceStep(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+
+            const root = scrollRoot();
+            const view = (window.innerHeight || 600) * 0.8;
+            try {
+                if (dirDown) {
+                    root.scrollTop = (root.scrollTop || 0) + view;
+                    window.scrollBy(0, view);
+                } else {
+                    root.scrollTop = Math.max(0, (root.scrollTop || 0) - view);
+                    window.scrollBy(0, -view);
+                }
+            } catch (_) { /* ignore */ }
+
+            updatePanel(
+                (dirDown ? 'Searching down' : 'Searching up') +
+                ' after merge (step ' + step + '/' + maxSteps + ')…'
+            );
+            await sleep(180);
+            await waitForVirtualizer(ctrl);
+        }
+        if (ctrl.aborted) return finishPanel('Stopped');
+        return finishWithCode(
+            'Merged jump OK but post not found from ' + timeStr,
+            'pos:missed'
+        );
+    }
+
     // After a merged jump, X renders from the top of a deep timeline. Use the
     // published order list to estimate scroll position, correct from mounted
     // articles, and land on the saved tweet near the top of the viewport.
+    // Never returns 'continue' into a from-top search.
     async function positionMergedJump(saved, ctrl, timeStr) {
-        const meta = await waitForJumpOrder(ctrl, 6000);
+        const meta = await waitForJumpOrder(ctrl, 8000);
         if (ctrl.aborted) return finishPanel('Stopped');
         if (!meta || !meta.order || !meta.order.length) {
-            jumpLog('positionMergedJump: no order list — fall through');
-            return 'continue';
+            jumpLog('positionMergedJump: no order list');
+            updatePanel('Merged but no order… [pos:notInOrder]');
+            return finishWithCode(
+                'Merged jump but timeline order missing',
+                'pos:notInOrder'
+            );
         }
 
         const order = meta.order;
         const N = order.length;
         const tweetId = String(saved.tweetId);
         const sortId = String(saved.sortId || saved.tweetId);
-        let idx = order.indexOf(tweetId);
-        if (idx < 0 && sortId !== tweetId) idx = order.indexOf(sortId);
-        if (idx < 0) {
-            // Map via sortmap: find order entry whose mapping equals tweetId/sortId.
-            const sm = readSortMap();
-            for (let i = 0; i < order.length; i++) {
-                const mapped = sm[order[i]];
-                if (mapped != null && (String(mapped) === tweetId || String(mapped) === sortId)) {
-                    idx = i;
-                    break;
-                }
-                if (String(order[i]) === tweetId || String(order[i]) === sortId) {
-                    idx = i;
-                    break;
-                }
-            }
-        }
+        const sm = readSortMap();
+        const resolved = resolveOrderIndex(order, tweetId, sortId, sm);
+        let idx = resolved.idx;
+
         if (idx < 0) {
             jumpLog('positionMergedJump: target not in order', tweetId, sortId, 'N=', N);
-            return 'continue';
+            updatePanel('Target not in order… [pos:notInOrder]');
+            return searchMergedByOrder(saved, ctrl, timeStr, order, Math.floor(N / 2), 'pos:notInOrder');
         }
 
-        jumpLog('positionMergedJump start idx=', idx, '/', N, 'pages=', meta.pages);
-        updatePanel(`Positioning saved tweet (${idx + 1}/${N})…`);
+        const approxTag = resolved.approx ? 'approx:' + resolved.how : resolved.how;
+        jumpLog('positionMergedJump start idx=', idx, '/', N, 'how=', resolved.how,
+            'pages=', meta.pages);
+        updatePanel('Positioning (' + (idx + 1) + '/' + N + ', ' + approxTag + ')… [merge:ok]');
 
         const maxIters = 10;
         for (let iter = 0; iter < maxIters && !ctrl.aborted; iter++) {
             const landed = findTweetById(saved.tweetId);
-            if (landed) {
-                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-                try {
-                    landed.scrollIntoView({ behavior: 'instant', block: 'start' });
-                } catch (_) {
-                    landed.scrollIntoView({ block: 'start' });
-                }
-                // Nudge so the tweet sits a bit below the sticky header.
-                try {
-                    const root = scrollRoot();
-                    root.scrollTop = Math.max(0, root.scrollTop - 12);
-                } catch (_) { /* ignore */ }
-                highlight(landed);
-                jumpLog('positionMergedJump landed iter=', iter);
-                return finishPanel(`Jumped to tweet from ${timeStr}`);
-            }
+            if (landed) return landTweet(landed, timeStr, 'pos:ok');
 
             const root = scrollRoot();
             const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
@@ -1931,7 +2185,7 @@ function tpsInjectPageRealmScripts() {
                 const rect = articles[a].getBoundingClientRect();
                 mounted.push({
                     el: articles[a],
-                    id,
+                    id: id,
                     i: oi,
                     top: rect.top,
                     height: rect.height || 1
@@ -1945,12 +2199,10 @@ function tpsInjectPageRealmScripts() {
                 let sumH = 0;
                 for (let m = 0; m < mounted.length; m++) sumH += mounted[m].height;
                 const avgH = sumH / mounted.length;
-                // Prefer a mid mounted article as reference for proportional correction.
-                mounted.sort((x, y) => x.i - y.i);
+                mounted.sort(function (x, y) { return x.i - y.i; });
                 const ref = mounted[Math.floor(mounted.length / 2)];
                 const refDocTop = (root.scrollTop || 0) + ref.top;
                 scrollTarget = refDocTop + (idx - ref.i) * avgH;
-                // Blend with fractional estimate when scrollHeight looks reserved.
                 if (scrollable > avgH * N * 0.25) {
                     const fracY = (idx / Math.max(1, N - 1)) * scrollable;
                     scrollTarget = 0.65 * scrollTarget + 0.35 * fracY;
@@ -1961,38 +2213,27 @@ function tpsInjectPageRealmScripts() {
                 scrollTarget = (idx / Math.max(1, N - 1)) * scrollable;
                 jumpLog('position iter', iter, 'no mounted; fracY=', Math.round(scrollTarget));
             } else {
-                // Page still collapsing/reserving — wait.
                 jumpLog('position iter', iter, 'waiting for timeline height');
                 await sleep(200);
                 continue;
             }
 
             allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-            try {
-                root.scrollTop = Math.max(0, scrollTarget);
-            } catch (_) { /* ignore */ }
-            try {
-                window.scrollTo(0, Math.max(0, scrollTarget));
-            } catch (_) { /* ignore */ }
+            try { root.scrollTop = Math.max(0, scrollTarget); } catch (_) { /* ignore */ }
+            try { window.scrollTo(0, Math.max(0, scrollTarget)); } catch (_) { /* ignore */ }
 
             const waitMs = 150 + Math.min(iter * 12, 100);
             await sleep(waitMs);
             if (ctrl.aborted) return finishPanel('Stopped');
-            updatePanel(`Positioning saved tweet… (${iter + 1}/${maxIters})`);
+            updatePanel('Positioning… (' + (iter + 1) + '/' + maxIters + ') [merge:ok]');
         }
 
         if (ctrl.aborted) return finishPanel('Stopped');
         const last = findTweetById(saved.tweetId);
-        if (last) {
-            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-            try { last.scrollIntoView({ behavior: 'instant', block: 'start' }); }
-            catch (_) { last.scrollIntoView({ block: 'start' }); }
-            highlight(last);
-            jumpLog('positionMergedJump landed after loop');
-            return finishPanel(`Jumped to tweet from ${timeStr}`);
-        }
-        jumpLog('positionMergedJump missed after', maxIters, 'iters — near search');
-        return 'continue';
+        if (last) return landTweet(last, timeStr, 'pos:ok');
+
+        jumpLog('positionMergedJump estimate missed — order near-search');
+        return searchMergedByOrder(saved, ctrl, timeStr, order, idx, 'pos:near');
     }
 
     // After a cursor jump, search a limited number of steps toward the target.
@@ -2087,18 +2328,39 @@ function tpsInjectPageRealmScripts() {
             }
 
             let jumpedNear = false;
+            let mergeSucceeded = false;
+            let jumpLate = false;
 
             if (wantJump) {
-                updatePanel(`Jumping near tweet from ${timeStr}…`);
+                // Wait briefly for page-realm hook (Gear inject can lag).
+                let hookInfo = readHookInfo();
+                if (!hookInfo) {
+                    updatePanel('Waiting for page hook…');
+                    for (let i = 0; i < 40 && !readHookInfo(); i++) {
+                        if (ctrl.aborted) return finishPanel('Stopped');
+                        await sleep(50);
+                    }
+                    hookInfo = readHookInfo();
+                }
+                if (!hookInfo) {
+                    jumpLog('Page hook missing — search from top');
+                    updatePanel('No page hook… [hook:missing]');
+                    // Fall through to from-top search with visible reason at end.
+                } else {
+                    jumpLog('Hook present', hookInfo.version, hookInfo.realm);
+                }
+
+                updatePanel('Jumping near tweet from ' + timeStr + '…');
                 const jumpWaitMs = CONFIG.jumpMerge === false ? 2500 : 15000;
                 let used = jumpWasUsed() || await waitForJumpUsed(ctrl, jumpWaitMs);
                 if (ctrl.aborted) return finishPanel('Stopped');
 
                 // Timeline may have loaded before the hook was armed — try one
                 // tab switch away and back to force a fresh ListLatestTweetsTimeline.
-                if (!used) {
+                if (!used && hookInfo) {
+                    jumpLate = true;
                     jumpLog('Jump not consumed; trying tab-switch refetch');
-                    updatePanel(`Refreshing "${CONFIG.targetTab}" for jump…`);
+                    updatePanel('Refreshing for jump… [jump:late]');
                     armCursorJump(saved, 15000);
                     const refetched = await refetchTargetTabWithJump(saved, ctrl);
                     if (ctrl.aborted) return finishPanel('Stopped');
@@ -2110,19 +2372,22 @@ function tpsInjectPageRealmScripts() {
                 if (used) {
                     // Merged path chains many pages — wait until hook clears busy.
                     if (jumpIsBusy()) {
-                        updatePanel(`Loading timeline to tweet from ${timeStr}…`);
+                        updatePanel('Loading timeline…' + (jumpLate ? ' [jump:late]' : ''));
                         jumpLog('Waiting for jump merge to finish…');
                         await waitForJumpIdle(ctrl, 90000);
                         if (ctrl.aborted) return finishPanel('Stopped');
                     }
-                    const mergedHint = jumpWasMerged();
-                    updatePanel(mergedHint
-                        ? `Positioning tweet from ${timeStr}…`
-                        : `Jumping near tweet from ${timeStr}…`);
+                    const resultCode = readJumpResultCode();
+                    const mergedHint = jumpWasMerged() || /^merge:ok\b/.test(resultCode);
+                    updatePanel(
+                        (mergedHint ? 'Positioning tweet from ' : 'Jumping near tweet from ') +
+                        timeStr + '…' +
+                        (resultCode ? ' [' + resultCode + ']' : '') +
+                        (jumpLate ? ' [jump:late]' : '')
+                    );
                     await waitForContentToSettle(ctrl);
                     if (ctrl.aborted) return finishPanel('Stopped');
 
-                    // Give the hook a moment to publish order after merge.
                     if (!mergedHint) {
                         for (let i = 0; i < 30 && !jumpWasMerged(); i++) {
                             if (ctrl.aborted) return finishPanel('Stopped');
@@ -2133,37 +2398,39 @@ function tpsInjectPageRealmScripts() {
                         await sleep(150);
                     }
 
-                    if (jumpWasMerged()) {
+                    if (jumpWasMerged() || /^merge:ok\b/.test(readJumpResultCode())) {
+                        mergeSucceeded = true;
+                        jumpedNear = true;
                         jumpLog('Using merged-jump positioning');
-                        const mergedResult = await positionMergedJump(saved, ctrl, timeStr);
-                        if (mergedResult !== 'continue') return mergedResult;
-                        jumpedNear = true;
-                        const nearAfterMerge = await searchNearJump(saved, ctrl, timeStr);
-                        if (nearAfterMerge !== 'continue') return nearAfterMerge;
-                    } else {
-                        for (let i = 0; i < 20 && !findTweetById(saved.tweetId); i++) {
-                            if (ctrl.aborted) return finishPanel('Stopped');
-                            await sleep(100);
-                        }
-                        const landed = findTweetById(saved.tweetId);
-                        if (landed) {
-                            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-                            landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                            highlight(landed);
-                            jumpLog('Jumped to', saved.tweetId);
-                            return finishPanel(`Jumped near tweet from ${timeStr}`);
-                        }
-
-                        jumpedNear = true;
-                        const nearResult = await searchNearJump(saved, ctrl, timeStr);
-                        if (nearResult !== 'continue') return nearResult;
+                        // Never fall through to from-top search after a merged jump.
+                        return await positionMergedJump(saved, ctrl, timeStr);
                     }
+
+                    for (let i = 0; i < 20 && !findTweetById(saved.tweetId); i++) {
+                        if (ctrl.aborted) return finishPanel('Stopped');
+                        await sleep(100);
+                    }
+                    const landed = findTweetById(saved.tweetId);
+                    if (landed) {
+                        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+                        landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(landed);
+                        jumpLog('Jumped to', saved.tweetId);
+                        const fb = readJumpResultCode() || 'merge:fallback(single)';
+                        return finishWithCode('Jumped near tweet from ' + timeStr, fb);
+                    }
+
+                    jumpedNear = true;
+                    const nearResult = await searchNearJump(saved, ctrl, timeStr);
+                    if (nearResult !== 'continue') return nearResult;
                 } else {
                     jumpLog('Jump unused; falling back to scroll search from top');
+                    updatePanel('Jump unused — searching from top… [jump:unused]');
                 }
             }
 
-            if (!jumpedNear) {
+            // Never scroll from top after a successful merge (handled above by return).
+            if (!jumpedNear && !mergeSucceeded) {
                 allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
                 scrollRoot().scrollTop = 0;
                 window.scrollTo(0, 0);
@@ -2265,9 +2532,16 @@ function tpsInjectPageRealmScripts() {
 
             if (ctrl.aborted) return finishPanel('Stopped');
             if (jumpedNear) {
-                return finishPanel('Jumped near the post, but it was not on the page');
+                return finishWithCode('Jumped near the post, but it was not on the page', 'pos:missed');
             }
-            return finishPanel(`Tweet from ${timeStr} not found`);
+            let failCode = 'search:miss';
+            if (!readHookInfo()) failCode = 'hook:missing';
+            else if (wantJump && !jumpWasUsed()) failCode = 'jump:unused';
+            else {
+                const rc = readJumpResultCode();
+                if (rc && rc.indexOf('merge:fallback') === 0) failCode = rc;
+            }
+            return finishWithCode('Tweet from ' + timeStr + ' not found', failCode);
         } finally {
             restoring = false;
             gentleRestore = false;
@@ -2760,7 +3034,7 @@ function tpsInjectPageRealmScripts() {
         setTimeout(() => {
             const p = document.getElementById(PANEL_ID);
             if (p) p.remove();
-        }, 3500);
+        }, 8000);
     }
 
     // ============ UI: "START OF TODAY" BUTTON ============

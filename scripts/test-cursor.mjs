@@ -679,7 +679,92 @@ await new Promise((resolve, reject) => {
   }, 5);
 });
 
+
 console.log('info: v3.29 merge/xhr tests done');
+
+// --- v3.30 resolveOrderIndex (displayedId → positionId map) ---
+function resolveOrderIndex(order, tweetId, sortId, sortMap) {
+  if (!order || !order.length) return { idx: -1, how: 'empty', approx: false };
+  const tid = String(tweetId || '');
+  const sid = String(sortId || tweetId || '');
+  let idx = order.indexOf(tid);
+  if (idx >= 0) return { idx, how: 'tweetId', approx: false };
+  if (sid && sid !== tid) {
+    idx = order.indexOf(sid);
+    if (idx >= 0) return { idx, how: 'sortId', approx: false };
+  }
+  const sm = sortMap && typeof sortMap === 'object' ? sortMap : null;
+  function mapPos(key) {
+    if (!sm || key == null) return null;
+    const v = sm[String(key)];
+    if (v == null || typeof v === 'object' || Array.isArray(v) || v === true || v === false) return null;
+    return String(v);
+  }
+  const posFromTweet = mapPos(tid);
+  if (posFromTweet) {
+    idx = order.indexOf(posFromTweet);
+    if (idx >= 0) return { idx, how: 'mapTweet', approx: false };
+  }
+  if (sid && sid !== tid) {
+    const posFromSort = mapPos(sid);
+    if (posFromSort) {
+      idx = order.indexOf(posFromSort);
+      if (idx >= 0) return { idx, how: 'mapSort', approx: false };
+    }
+  }
+  let targetPos = null;
+  try { if (posFromTweet) targetPos = BigInt(posFromTweet); } catch (_) {}
+  if (targetPos == null) {
+    try { targetPos = BigInt(sid || tid); } catch (_) {
+      return { idx: -1, how: 'none', approx: false };
+    }
+  }
+  for (let i = 0; i < order.length; i++) {
+    try {
+      if (BigInt(order[i]) <= targetPos) return { idx: i, how: 'insert', approx: true };
+    } catch (_) {}
+  }
+  return { idx: order.length - 1, how: 'insert-end', approx: true };
+}
+
+const orderV30 = ['500', '400', '300', '200', '100'];
+// Wrong old direction would look up sm[order[i]] === tweetId; correct is sm[tweetId] → pos.
+const smV30 = {
+  // original displayed id of a repost → repost/position id present in order
+  '999001': '300',
+  order: orderV30, // metadata keys must be ignored by mapPos
+  jumpMerged: true,
+  pages: 2
+};
+
+assert(resolveOrderIndex(orderV30, '300', '300', smV30).how === 'tweetId', 'direct tweetId hit');
+assert(resolveOrderIndex(orderV30, '999001', '999001', smV30).idx === 2, 'mapTweet: original→position');
+assert(resolveOrderIndex(orderV30, '999001', '999001', smV30).how === 'mapTweet', 'mapTweet how');
+assert(resolveOrderIndex(orderV30, '888', '400', smV30).how === 'sortId', 'sortId direct in order');
+
+// Insertion: target between 400 and 300 → first with pos <= 350 is 300 (idx 2)
+const ins = resolveOrderIndex(orderV30, '350', '350', {});
+assert(ins.approx === true && ins.how === 'insert', 'insert approx');
+assert(ins.idx === 2, 'insert idx for 350 → 300');
+
+// Newer than head → first entry still satisfies <= ? 500 <= 600 → idx 0
+const newer = resolveOrderIndex(orderV30, '600', '600', {});
+assert(newer.idx === 0 && newer.how === 'insert', 'newer than head → idx 0');
+
+// Older than all → insert-end
+const older = resolveOrderIndex(orderV30, '50', '50', {});
+assert(older.idx === 4 && older.how === 'insert-end', 'older than all → last');
+
+// Backwards lookup must NOT match: sm maps displayed→pos, not pos→displayed
+const backwards = resolveOrderIndex(orderV30, '300', '300', { '300': '999001' });
+assert(backwards.how === 'tweetId', 'tweetId preferred over confusing reverse map');
+// When tweetId not in order and map is reverse-wrong:
+const noHit = resolveOrderIndex(orderV30, '777', '777', { '300': '777' });
+assert(noHit.how === 'insert' || noHit.how === 'insert-end', 'reverse map does not falsely resolve');
+assert(noHit.idx !== 2 || BigInt(orderV30[noHit.idx]) <= 777n, 'no false idx from reverse map');
+
+console.log('info: v3.30 resolveOrderIndex tests done');
+
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);
