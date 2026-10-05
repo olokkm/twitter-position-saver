@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.22
+// @version      3.23
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -422,6 +422,14 @@ function tpsInstallPageScrollGuard(globalObj) {
             suppressSaves = false;
             log('User scroll — resume saving');
         }
+    }
+
+    // A real scroll gesture during a search means the user took over: stop the
+    // search so it does not drag the page back and so saving resumes at once.
+    // Programmatic scrolling never fires wheel/touch/key events.
+    function noteUserScroll() {
+        noteUserGesture();
+        if (restoring) abortRestore();
     }
 
     function userRecentlyScrolled() {
@@ -1213,14 +1221,14 @@ function tpsInstallPageScrollGuard(globalObj) {
             if (e.key === 'Escape') abortRestore();
             // Arrow/Page/Home/End/Space — treat as intentional scroll.
             if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
-                noteUserGesture();
+                noteUserScroll();
             }
         });
 
         // Touch/wheel/pointer mark real user scrolling; plain "scroll" also fires for X yanks.
-        window.addEventListener('wheel', noteUserGesture, { passive: true });
+        window.addEventListener('wheel', noteUserScroll, { passive: true });
         window.addEventListener('touchstart', noteUserGesture, { passive: true });
-        window.addEventListener('touchmove', noteUserGesture, { passive: true });
+        window.addEventListener('touchmove', noteUserScroll, { passive: true });
         // Taps on "Show new posts" (etc.) count as intentional jump-to-top.
         window.addEventListener('pointerdown', noteUserGesture, { passive: true });
         window.addEventListener('scroll', onTimelineScroll, { passive: true });
