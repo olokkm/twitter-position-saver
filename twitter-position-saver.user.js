@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.23
+// @version      3.28
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -152,14 +152,471 @@ function tpsInstallPageScrollGuard(globalObj) {
 }
 /* TPS_SCROLL_GUARD_END */
 
+/* TPS_JUMP_HOOK_BEGIN */
+// Page-realm fetch/XHR rewrite (Tampermonkey: unsafeWindow; Gear: injected <script>).
+// 1) Pending data-tps-jump → first ListLatestTweetsTimeline without cursor gets a
+//    Bottom cursor (type 2) so the list opens near the saved tweet.
+// 2) After a jump, Top cursor (type 1) requests are rewritten to Bottom with
+//    B' = B_top + delta so scrolling up fills the gap toward "now" instead of
+//    leaping to the live head of the list.
+// 3) Every ListLatestTweetsTimeline response is scanned read-only for
+//    displayedTweetId → sortIndex mappings (repost-aware) and published to
+//    <script type="application/json" id="tps-sortmap"> for the content script.
+function tpsInstallPageJumpHook(globalObj) {
+    'use strict';
+    const g = globalObj || (typeof window !== 'undefined' ? window : null);
+    if (!g || g.__tpsJumpHookInstalled) return;
+    g.__tpsJumpHookInstalled = true;
+
+    const TWITTER_EPOCH_MS = 1288834974657n;
+    const DEFAULT_FILL_DELTA = BigInt(3 * 60 * 60 * 1000) << 22n; // ~3 hours
+    const TARGET_PAGE_ENTRIES = 60n;
+    const SORTMAP_MAX = 600;
+
+    // Survives for the document lifetime once a jump cursor was applied.
+    let jumpSession = null; // { fillUp, pageDelta }
+
+    // displayedTweetId → sortIndex (string). Keep max sortIndex on collision.
+    const sortMap = new Map();
+    const sortMapOrder = []; // insertion order for eviction
+
+    function snowflakeFromMs(ms) {
+        return (BigInt(ms) - TWITTER_EPOCH_MS) << 22n;
+    }
+
+    function writeU64BE(view, offset, value) {
+        const v = BigInt(value);
+        view.setUint32(offset, Number((v >> 32n) & 0xffffffffn));
+        view.setUint32(offset + 4, Number(v & 0xffffffffn));
+    }
+
+    function readU64BE(view, offset) {
+        const hi = BigInt(view.getUint32(offset));
+        const lo = BigInt(view.getUint32(offset + 4));
+        return (hi << 32n) | lo;
+    }
+
+    function encodeListCursor(aBig, bBig, type) {
+        const buf = new Uint8Array(34);
+        const view = new DataView(buf.buffer);
+        let i = 0;
+        buf[i++] = 0x0c;
+        view.setUint16(i, 1); i += 2;
+        buf[i++] = 0x0a;
+        view.setUint16(i, 1); i += 2;
+        writeU64BE(view, i, aBig); i += 8;
+        buf[i++] = 0x0a;
+        view.setUint16(i, 2); i += 2;
+        writeU64BE(view, i, bBig); i += 8;
+        buf[i++] = 0x08;
+        view.setUint16(i, 3); i += 2;
+        view.setInt32(i, Number(type)); i += 4;
+        buf[i++] = 0x00;
+        buf[i++] = 0x00;
+        let s = '';
+        for (let j = 0; j < buf.length; j++) s += String.fromCharCode(buf[j]);
+        return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function decodeListCursor(str) {
+        const pad = '='.repeat((4 - (str.length % 4)) % 4);
+        const b64 = (str + pad).replace(/-/g, '+').replace(/_/g, '/');
+        const bin = atob(b64);
+        const buf = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) buf[i] = bin.charCodeAt(i);
+        if (buf.length < 34) throw new Error('cursor too short');
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        let i = 0;
+        if (buf[i++] !== 0x0c) throw new Error('bad struct');
+        if (view.getUint16(i) !== 1) throw new Error('bad outer field');
+        i += 2;
+        if (buf[i++] !== 0x0a) throw new Error('bad A type');
+        if (view.getUint16(i) !== 1) throw new Error('bad A field');
+        i += 2;
+        const A = readU64BE(view, i); i += 8;
+        if (buf[i++] !== 0x0a) throw new Error('bad B type');
+        if (view.getUint16(i) !== 2) throw new Error('bad B field');
+        i += 2;
+        const B = readU64BE(view, i); i += 8;
+        if (buf[i++] !== 0x08) throw new Error('bad type type');
+        if (view.getUint16(i) !== 3) throw new Error('bad type field');
+        i += 2;
+        const type = view.getInt32(i);
+        return { A, B, type };
+    }
+
+    function unwrapTweetResult(result) {
+        if (!result || typeof result !== 'object') return null;
+        if (result.__typename === 'TweetWithVisibilityResults' && result.tweet) {
+            return result.tweet;
+        }
+        return result;
+    }
+
+    function recordSortMapping(displayedId, sortIndex) {
+        if (!displayedId || !sortIndex) return;
+        const id = String(displayedId);
+        const si = String(sortIndex);
+        if (!/^\d+$/.test(id) || !/^\d+$/.test(si)) return;
+        const prev = sortMap.get(id);
+        if (prev != null) {
+            try {
+                if (BigInt(prev) >= BigInt(si)) return; // keep max (most recent repost)
+            } catch (_) {
+                return;
+            }
+            sortMap.set(id, si);
+            return;
+        }
+        sortMap.set(id, si);
+        sortMapOrder.push(id);
+        while (sortMapOrder.length > SORTMAP_MAX) {
+            const old = sortMapOrder.shift();
+            if (old && sortMap.has(old)) sortMap.delete(old);
+        }
+    }
+
+    function publishSortMap() {
+        try {
+            const doc = g.document;
+            if (!doc) return;
+            const obj = {};
+            sortMap.forEach((v, k) => { obj[k] = v; });
+            let el = doc.getElementById('tps-sortmap');
+            if (!el) {
+                el = doc.createElement('script');
+                el.type = 'application/json';
+                el.id = 'tps-sortmap';
+                (doc.documentElement || doc.head || doc.body).appendChild(el);
+            }
+            el.textContent = JSON.stringify(obj);
+        } catch (_) { /* ignore */ }
+    }
+
+    // Pure: walk TimelineAddEntries and return { sortIndexes, pairs: [[id, sortIndex], ...] }
+    function extractSortMapFromListJson(json) {
+        const sortIndexes = [];
+        const pairs = [];
+        try {
+            const tl = json && json.data && json.data.list &&
+                json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+            const instructions = tl && tl.instructions;
+            if (!Array.isArray(instructions)) return { sortIndexes, pairs };
+
+            function addFromTweetResult(result, sortIndex) {
+                const tweet = unwrapTweetResult(result);
+                if (!tweet) return;
+                if (tweet.rest_id) pairs.push([String(tweet.rest_id), sortIndex]);
+                const rt = tweet.legacy && tweet.legacy.retweeted_status_result &&
+                    tweet.legacy.retweeted_status_result.result;
+                if (rt) {
+                    const inner = unwrapTweetResult(rt);
+                    if (inner && inner.rest_id) pairs.push([String(inner.rest_id), sortIndex]);
+                }
+            }
+
+            for (let i = 0; i < instructions.length; i++) {
+                const inst = instructions[i];
+                if (!inst || inst.type !== 'TimelineAddEntries' || !Array.isArray(inst.entries)) continue;
+                for (let j = 0; j < inst.entries.length; j++) {
+                    const ent = inst.entries[j];
+                    if (!ent) continue;
+                    const eid = ent.entryId;
+                    const sortIndex = ent.sortIndex != null ? String(ent.sortIndex) : null;
+                    if (typeof eid !== 'string' || eid.indexOf('tweet-') !== 0 || !sortIndex) continue;
+                    if (!/^\d+$/.test(sortIndex)) continue;
+                    // sortIndex is a per-request ordering value anchored near "now", not
+                    // a time, so it cannot be used as a cursor position. The entry's own
+                    // tweet id (for a repost: the repost's id) is the real timeline position.
+                    const result = ent.content && ent.content.itemContent &&
+                        ent.content.itemContent.tweet_results &&
+                        ent.content.itemContent.tweet_results.result;
+                    const outer = unwrapTweetResult(result);
+                    const fromEntry = eid.slice(6);
+                    const pos = outer && outer.rest_id && /^\d+$/.test(String(outer.rest_id))
+                        ? String(outer.rest_id)
+                        : (/^\d+$/.test(fromEntry) ? fromEntry : null);
+                    if (!pos) continue;
+                    sortIndexes.push(BigInt(pos));
+                    pairs.push([pos, pos]);
+                    if (/^\d+$/.test(fromEntry)) pairs.push([fromEntry, pos]);
+                    addFromTweetResult(result, pos);
+                }
+            }
+        } catch (_) { /* ignore */ }
+        return { sortIndexes, pairs };
+    }
+
+    function noteTimelineDensity(newestId, oldestId, entryCount) {
+        if (!jumpSession || entryCount < 2) return;
+        try {
+            const newest = BigInt(newestId);
+            const oldest = BigInt(oldestId);
+            if (newest <= oldest) return;
+            const span = newest - oldest;
+            const denom = BigInt(entryCount - 1);
+            jumpSession.pageDelta = (span * TARGET_PAGE_ENTRIES) / denom;
+            if (jumpSession.pageDelta <= 0n) jumpSession.pageDelta = null;
+        } catch (_) { /* ignore */ }
+    }
+
+    function inspectResponseText(text) {
+        if (!text) return;
+        try {
+            const json = JSON.parse(text);
+            const extracted = extractSortMapFromListJson(json);
+            for (let i = 0; i < extracted.pairs.length; i++) {
+                recordSortMapping(extracted.pairs[i][0], extracted.pairs[i][1]);
+            }
+            if (extracted.pairs.length) publishSortMap();
+
+            if (jumpSession && extracted.sortIndexes.length >= 2) {
+                // sortIndexes are newest → oldest (strictly decreasing).
+                const arr = extracted.sortIndexes;
+                noteTimelineDensity(arr[0], arr[arr.length - 1], arr.length);
+            }
+        } catch (_) { /* ignore */ }
+    }
+
+    function readPendingJump() {
+        try {
+            const raw = g.document && g.document.documentElement &&
+                g.document.documentElement.getAttribute('data-tps-jump');
+            if (!raw) return null;
+            const parts = String(raw).split('|');
+            if (parts.length < 3) return null;
+            const B = BigInt(parts[0]);
+            const A = BigInt(parts[1]);
+            const expires = Number(parts[2]);
+            if (!Number.isFinite(expires) || Date.now() > expires) return null;
+            const fillUp = parts.length < 4 ? true : parts[3] !== '0';
+            return { A, B, fillUp };
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function startJumpSession(fillUp) {
+        jumpSession = {
+            fillUp: fillUp !== false,
+            pageDelta: null
+        };
+        try {
+            const el = g.document.documentElement;
+            el.removeAttribute('data-tps-jump');
+            el.setAttribute('data-tps-jump-used', String(Date.now()));
+            el.setAttribute('data-tps-jump-session', '1');
+        } catch (_) { /* ignore */ }
+    }
+
+    function rewriteTopCursorToFillUp(decoded, pageDelta, nowMs) {
+        if (!decoded || decoded.type !== 1) return null;
+        const delta = pageDelta && pageDelta > 0n ? pageDelta : DEFAULT_FILL_DELTA;
+        const nowSf = snowflakeFromMs(nowMs == null ? Date.now() : nowMs);
+        const Btop = decoded.B;
+        if (Btop >= nowSf) return null;
+        let Bp = Btop + delta;
+        if (Bp >= nowSf) return null;
+        return encodeListCursor(decoded.A, Bp, 2);
+    }
+
+    function maybeRewriteUrl(urlStr) {
+        try {
+            if (!urlStr || typeof urlStr !== 'string') return null;
+            if (urlStr.indexOf('/ListLatestTweetsTimeline') === -1) return null;
+            const u = new URL(urlStr, g.location.href);
+            if (u.pathname.indexOf('/ListLatestTweetsTimeline') === -1) return null;
+            const varsRaw = u.searchParams.get('variables');
+            if (!varsRaw) return null;
+            const vars = JSON.parse(varsRaw);
+
+            if (vars.cursor == null || vars.cursor === '') {
+                const jump = readPendingJump();
+                if (!jump) return null;
+                vars.cursor = encodeListCursor(jump.A, jump.B, 2);
+                u.searchParams.set('variables', JSON.stringify(vars));
+                startJumpSession(jump.fillUp);
+                return u.toString();
+            }
+
+            if (!jumpSession || !jumpSession.fillUp) return null;
+            let decoded;
+            try {
+                decoded = decodeListCursor(String(vars.cursor));
+            } catch (_) {
+                return null;
+            }
+            const nextCursor = rewriteTopCursorToFillUp(decoded, jumpSession.pageDelta, Date.now());
+            if (!nextCursor) return null;
+            vars.cursor = nextCursor;
+            u.searchParams.set('variables', JSON.stringify(vars));
+            return u.toString();
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function isListTimelineUrl(url) {
+        return typeof url === 'string' && url.indexOf('/ListLatestTweetsTimeline') !== -1;
+    }
+
+    const origFetch = g.fetch;
+    if (typeof origFetch === 'function') {
+        g.fetch = function (input, init) {
+            let url = null;
+            try {
+                if (typeof input === 'string') url = input;
+                else if (input && typeof input.url === 'string') url = input.url;
+                if (url) {
+                    const rewritten = maybeRewriteUrl(url);
+                    if (rewritten) {
+                        url = rewritten;
+                        if (typeof input === 'string') {
+                            input = rewritten;
+                        } else if (typeof Request !== 'undefined' && input instanceof Request) {
+                            input = new Request(rewritten, input);
+                        } else {
+                            input = rewritten;
+                        }
+                    }
+                }
+            } catch (_) { /* ignore */ }
+
+            const result = origFetch.call(this, input, init);
+            // Always sample ListLatestTweetsTimeline for sortmap (+ density in session).
+            if (isListTimelineUrl(url)) {
+                try {
+                    return Promise.resolve(result).then((res) => {
+                        try {
+                            const clone = res.clone();
+                            clone.text().then(inspectResponseText).catch(() => {});
+                        } catch (_) { /* ignore */ }
+                        return res;
+                    });
+                } catch (_) { /* fall through */ }
+            }
+            return result;
+        };
+    }
+
+    const XHR = g.XMLHttpRequest;
+    if (XHR && XHR.prototype) {
+        const origOpen = XHR.prototype.open;
+        const origSend = XHR.prototype.send;
+
+        XHR.prototype.open = function (method, url) {
+            try {
+                this.__tpsListUrl = typeof url === 'string' ? url : null;
+                if (typeof url === 'string') {
+                    const rewritten = maybeRewriteUrl(url);
+                    if (rewritten) {
+                        arguments[1] = rewritten;
+                        this.__tpsListUrl = rewritten;
+                    }
+                }
+            } catch (_) { /* ignore */ }
+            return origOpen.apply(this, arguments);
+        };
+
+        XHR.prototype.send = function () {
+            try {
+                if (isListTimelineUrl(this.__tpsListUrl)) {
+                    const xhr = this;
+                    const onLoad = function () {
+                        try { xhr.removeEventListener('load', onLoad); } catch (_) { /* ignore */ }
+                        try { inspectResponseText(xhr.responseText); } catch (_) { /* ignore */ }
+                    };
+                    this.addEventListener('load', onLoad);
+                }
+            } catch (_) { /* ignore */ }
+            return origSend.apply(this, arguments);
+        };
+    }
+
+    g.__tpsRewriteTopCursorToFillUp = rewriteTopCursorToFillUp;
+    g.__tpsDecodeListCursor = decodeListCursor;
+    g.__tpsEncodeListCursor = encodeListCursor;
+    g.__tpsExtractSortMapFromListJson = extractSortMapFromListJson;
+}
+/* TPS_JUMP_HOOK_END */
+
+// Gear (isolated world): inject page-realm hooks as a real <script> with the
+// page CSP nonce. Tampermonkey uses unsafeWindow instead and skips this.
+function tpsInjectPageRealmScripts() {
+    'use strict';
+    if (typeof document === 'undefined') return;
+
+    const code = [
+        '(' + tpsInstallPageScrollGuard.toString() + ')(window);',
+        '(' + tpsInstallPageJumpHook.toString() + ')(window);'
+    ].join('\n');
+
+    function findNonce() {
+        try {
+            const scripts = document.querySelectorAll('script[nonce]');
+            for (let i = 0; i < scripts.length; i++) {
+                const n = scripts[i].nonce || scripts[i].getAttribute('nonce');
+                if (n) return n;
+            }
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
+    function inject(nonce) {
+        try {
+            if (document.documentElement.getAttribute('data-tps-page-injected') === '1') return true;
+            const s = document.createElement('script');
+            if (nonce) {
+                try { s.nonce = nonce; } catch (_) { /* ignore */ }
+                try { s.setAttribute('nonce', nonce); } catch (_) { /* ignore */ }
+            }
+            s.textContent = code;
+            const parent = document.documentElement || document.head || document.body;
+            if (!parent) return false;
+            parent.appendChild(s);
+            s.remove();
+            document.documentElement.setAttribute('data-tps-page-injected', '1');
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function tryInject() {
+        const nonce = findNonce();
+        if (!nonce) return false;
+        return inject(nonce);
+    }
+
+    if (tryInject()) return;
+
+    const root = document.documentElement || document;
+    const mo = new MutationObserver(() => {
+        if (tryInject()) mo.disconnect();
+    });
+    try {
+        mo.observe(root, { childList: true, subtree: true });
+    } catch (_) { /* ignore */ }
+    setTimeout(() => { try { mo.disconnect(); } catch (_) { /* ignore */ } }, 15000);
+}
+
+
 (function() {
     'use strict';
 
     try {
-        if (typeof unsafeWindow !== 'undefined') tpsInstallPageScrollGuard(unsafeWindow);
+        if (typeof unsafeWindow !== 'undefined') {
+            tpsInstallPageScrollGuard(unsafeWindow);
+            tpsInstallPageJumpHook(unsafeWindow);
+        } else {
+            // Gear WebExtension: isolated world — inject into the page with CSP nonce.
+            tpsInjectPageRealmScripts();
+        }
     } catch (_) { /* ignore */ }
     try {
+        // Best-effort local install (no-op if already installed / wrong realm).
         tpsInstallPageScrollGuard(window);
+        tpsInstallPageJumpHook(window);
     } catch (_) { /* ignore */ }
 
     const CONFIG = {
@@ -188,7 +645,13 @@ function tpsInstallPageScrollGuard(globalObj) {
         // and tall media posts while still catching a DOM that keeps growing.
         // Raised to 100 on request: only a runaway DOM should stop the search.
         maxMountedTweets: 100,
-        autoRestore: true         // jump back automatically when the timeline loads
+        autoRestore: true,        // jump back automatically when the timeline loads
+        // Cursor jump: rewrite the first ListLatestTweetsTimeline request so the
+        // Olo list opens near the saved tweet instead of scrolling from the top.
+        cursorJump: true,
+        jumpLeadMs: 60 * 60 * 1000, // ~1h of newer tweets above the pin (Olo: ~8/h measured Oct 3) so the page is scrolled, not at the top; X only requests newer posts (Top cursor) when you scroll back up to the top
+        jumpAnchor: 'now',         // 'now' = snowflakeFromMs(Date.now()); 'b' = use B
+        jumpFillUp: true           // rewrite Top cursors to Bottom fill-ups after a jump
     };
 
     const DEBUG = false;
@@ -229,10 +692,172 @@ function tpsInstallPageScrollGuard(globalObj) {
 
     const KEY_TWEET_ID = 'tweet_id';
     const KEY_TWEET_TIME = 'tweet_time';
+    const KEY_SORT_ID = 'sort_pos'; // 3.26 stored sortIndex under 'sort_id'; ignore it
     const KEY_TIMESTAMP = 'timestamp';
     const KEY_PATH = 'path';
     const KEY_RESTORE_ACTIVE = 'restore_active';
     const KEY_RESTORE_CRASHES = 'restore_crashes';
+
+    // ============ LIST CURSOR / SNOWFLAKE HELPERS ============
+
+    const TWITTER_EPOCH_MS = 1288834974657n;
+
+    function snowflakeFromMs(ms) {
+        return (BigInt(ms) - TWITTER_EPOCH_MS) << 22n;
+    }
+
+    function msFromSnowflake(id) {
+        return Number((BigInt(id) >> 22n) + TWITTER_EPOCH_MS);
+    }
+
+    function writeU64BE(view, offset, value) {
+        const v = BigInt(value);
+        view.setUint32(offset, Number((v >> 32n) & 0xffffffffn));
+        view.setUint32(offset + 4, Number(v & 0xffffffffn));
+    }
+
+    function readU64BE(view, offset) {
+        const hi = BigInt(view.getUint32(offset));
+        const lo = BigInt(view.getUint32(offset + 4));
+        return (hi << 32n) | lo;
+    }
+
+    function bytesToB64Url(bytes) {
+        let s = '';
+        for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
+        const b64 = btoa(s);
+        return b64.replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+    }
+
+    function b64UrlToBytes(str) {
+        const pad = '='.repeat((4 - (str.length % 4)) % 4);
+        const b64 = (str + pad).replace(/-/g, '+').replace(/_/g, '/');
+        const bin = atob(b64);
+        const out = new Uint8Array(bin.length);
+        for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+        return out;
+    }
+
+    function encodeListCursor(aBig, bBig, type) {
+        const buf = new Uint8Array(34);
+        const view = new DataView(buf.buffer);
+        let i = 0;
+        buf[i++] = 0x0c;
+        view.setUint16(i, 1); i += 2;
+        buf[i++] = 0x0a;
+        view.setUint16(i, 1); i += 2;
+        writeU64BE(view, i, aBig); i += 8;
+        buf[i++] = 0x0a;
+        view.setUint16(i, 2); i += 2;
+        writeU64BE(view, i, bBig); i += 8;
+        buf[i++] = 0x08;
+        view.setUint16(i, 3); i += 2;
+        view.setInt32(i, Number(type)); i += 4;
+        buf[i++] = 0x00;
+        buf[i++] = 0x00;
+        return bytesToB64Url(buf);
+    }
+
+    function decodeListCursor(str) {
+        const buf = b64UrlToBytes(str);
+        if (buf.length < 34) throw new Error('cursor too short');
+        const view = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+        let i = 0;
+        if (buf[i++] !== 0x0c) throw new Error('bad struct');
+        if (view.getUint16(i) !== 1) throw new Error('bad outer field');
+        i += 2;
+        if (buf[i++] !== 0x0a) throw new Error('bad A type');
+        if (view.getUint16(i) !== 1) throw new Error('bad A field');
+        i += 2;
+        const A = readU64BE(view, i); i += 8;
+        if (buf[i++] !== 0x0a) throw new Error('bad B type');
+        if (view.getUint16(i) !== 2) throw new Error('bad B field');
+        i += 2;
+        const B = readU64BE(view, i); i += 8;
+        if (buf[i++] !== 0x08) throw new Error('bad type type');
+        if (view.getUint16(i) !== 3) throw new Error('bad type field');
+        i += 2;
+        const type = view.getInt32(i);
+        return { A, B, type };
+    }
+
+    function isHomeTimelinePath(p) {
+        return p === '/home' || p === '/';
+    }
+
+    function jumpWasUsed() {
+        try {
+            return !!document.documentElement.getAttribute('data-tps-jump-used');
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function clearJumpUsed() {
+        try { document.documentElement.removeAttribute('data-tps-jump-used'); } catch (_) { /* ignore */ }
+    }
+
+    // Arm a one-shot cursor rewrite: B|A|expiresAtMs|fillUp on <html data-tps-jump>.
+    // B is based on sortId (timeline order / repost id), not the displayed status id.
+    function armCursorJump(saved, expiresMs) {
+        if (!CONFIG.cursorJump || !saved || !saved.tweetId) return false;
+        const path = saved.path || currentPath();
+        if (!isHomeTimelinePath(path)) return false;
+        try {
+            const sortId = BigInt(String(saved.sortId || saved.tweetId));
+            const leadMs = BigInt(CONFIG.jumpLeadMs == null ? 60 * 60 * 1000 : CONFIG.jumpLeadMs);
+            const B = sortId + (leadMs << 22n);
+            let A;
+            if (CONFIG.jumpAnchor === 'b') {
+                A = B;
+            } else {
+                A = snowflakeFromMs(Date.now());
+            }
+            const expires = Date.now() + (expiresMs == null ? 20000 : expiresMs);
+            clearJumpUsed();
+            try { document.documentElement.removeAttribute('data-tps-jump-session'); } catch (_) { /* ignore */ }
+            const fillUp = CONFIG.jumpFillUp === false ? '0' : '1';
+            document.documentElement.setAttribute(
+                'data-tps-jump',
+                B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp
+            );
+            log('Armed cursor jump B=', B.toString(), 'A=', A.toString());
+            return true;
+        } catch (e) {
+            log('armCursorJump failed', e);
+            return false;
+        }
+    }
+
+    async function waitForJumpUsed(ctrl, maxWaitMs) {
+        const start = Date.now();
+        const limit = maxWaitMs == null ? 3000 : maxWaitMs;
+        while (Date.now() - start < limit) {
+            if (ctrl && ctrl.aborted) return false;
+            if (jumpWasUsed()) return true;
+            await sleep(40);
+        }
+        return jumpWasUsed();
+    }
+
+    // One-shot: leave Olo, re-arm, come back so ListLatestTweetsTimeline fires again.
+    async function refetchTargetTabWithJump(saved, ctrl) {
+        const tabs = getNavigationTabs();
+        const other = tabs.find(t => {
+            const label = getTabLabel(t);
+            return label && label !== CONFIG.targetTab;
+        });
+        if (!other) return false;
+        try {
+            other.click();
+        } catch (_) {
+            return false;
+        }
+        await sleep(350);
+        if (ctrl.aborted) return false;
+        armCursorJump(saved, 15000);
+        return ensureTargetTab(ctrl, 6000);
+    }
 
     let gentleRestore = false;
     let lastScrollStepAt = 0;
@@ -280,6 +905,77 @@ function tpsInstallPageScrollGuard(globalObj) {
         return time ? time.getAttribute('datetime') : null;
     }
 
+    function readSortMap() {
+        try {
+            const el = document.getElementById('tps-sortmap');
+            if (!el || !el.textContent) return {};
+            const obj = JSON.parse(el.textContent);
+            return obj && typeof obj === 'object' ? obj : {};
+        } catch (_) {
+            return {};
+        }
+    }
+
+    function lookupSortId(tweetId) {
+        if (!tweetId) return null;
+        const mapped = readSortMap()[String(tweetId)];
+        return mapped != null ? String(mapped) : null;
+    }
+
+    function isRepostArticle(article) {
+        try {
+            const ctx = article.querySelector('[data-testid="socialContext"]');
+            if (!ctx) return false;
+            const t = (ctx.textContent || '').toLowerCase();
+            return /repost|reposted|retweet|retweeted|podał dalej|reenvi|reposté|hat retweetet/.test(t);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Timeline order id for jumping/saving. Prefer GraphQL sortIndex; for reposts
+    // without a map entry, use the nearest non-repost article above in the DOM.
+    function resolveSortIdForArticle(article, tweetId) {
+        const mapped = lookupSortId(tweetId);
+        if (mapped) return mapped;
+        if (article && isRepostArticle(article)) {
+            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const idx = articles.indexOf(article);
+            for (let i = idx - 1; i >= 0; i--) {
+                if (isRepostArticle(articles[i])) continue;
+                const aboveId = extractTweetId(articles[i]);
+                if (!aboveId) continue;
+                return lookupSortId(aboveId) || aboveId;
+            }
+        }
+        return tweetId;
+    }
+
+    function articleSortPosition(article) {
+        const id = extractTweetId(article);
+        if (id) {
+            const mapped = lookupSortId(id);
+            if (mapped) {
+                try { return BigInt(mapped); } catch (_) { /* fall through */ }
+            }
+        }
+        const iso = getTweetTime(article);
+        if (iso) {
+            const ms = Date.parse(iso);
+            if (!isNaN(ms)) return snowflakeFromMs(ms);
+        }
+        if (id) {
+            try { return BigInt(id); } catch (_) { /* ignore */ }
+        }
+        return null;
+    }
+
+    function targetSortPosition(saved) {
+        const raw = (saved && (saved.sortId || saved.tweetId)) || null;
+        if (!raw) return null;
+        try { return BigInt(String(raw)); } catch (_) { return null; }
+    }
+
     // Topmost tweet occupying the upper half of the viewport (including ones
     // partially tucked under the sticky mobile header where rect.top < 0).
     function getTopTweet() {
@@ -295,7 +991,7 @@ function tpsInstallPageScrollGuard(globalObj) {
                 const id = extractTweetId(article);
                 if (!id) continue;
                 bestTop = rect.top;
-                best = { id, time: getTweetTime(article) };
+                best = { id, time: getTweetTime(article), article };
             }
         }
         return best;
@@ -308,6 +1004,16 @@ function tpsInstallPageScrollGuard(globalObj) {
             if (article) return article;
         }
         return null;
+    }
+
+    function newestMountedSortPosition() {
+        let newest = null;
+        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+            const pos = articleSortPosition(article);
+            if (pos == null) continue;
+            if (newest == null || pos > newest) newest = pos;
+        }
+        return newest;
     }
 
     function formatTweetTime(iso) {
@@ -488,24 +1194,39 @@ function tpsInstallPageScrollGuard(globalObj) {
         const top = getTopTweet();
         if (!top) return;
 
+        const sortId = resolveSortIdForArticle(top.article, top.id);
         gmSet(KEY_TWEET_ID, top.id);
         gmSet(KEY_TWEET_TIME, top.time);
+        gmSet(KEY_SORT_ID, sortId);
         gmSet(KEY_TIMESTAMP, Date.now());
         gmSet(KEY_PATH, currentPath());
-        log('Saved', top.id, top.time);
+        log('Saved', top.id, top.time, 'sort', sortId);
     }
 
     function readSavedPosition() {
         const id = gmGet(KEY_TWEET_ID);
         const timestamp = gmGet(KEY_TIMESTAMP);
         if (!id || !timestamp) return null;
+        const sortId = gmGet(KEY_SORT_ID);
         return {
             tweetId: id,
             tweetTime: gmGet(KEY_TWEET_TIME),
+            sortId: sortId || id,
             timestamp,
             path: gmGet(KEY_PATH)
         };
     }
+
+    // Arm as early as possible so the first ListLatestTweetsTimeline (which may
+    // fire before restore()) can pick up the cursor. Expires in ~20s.
+    try {
+        if (CONFIG.autoRestore && CONFIG.cursorJump) {
+            const earlySaved = readSavedPosition();
+            if (earlySaved && isHomeTimelinePath(earlySaved.path || currentPath())) {
+                armCursorJump(earlySaved, 20000);
+            }
+        }
+    } catch (_) { /* ignore */ }
 
     function highlight(tweet) {
         tweet.style.transition = 'box-shadow 0.3s ease';
@@ -527,6 +1248,56 @@ function tpsInstallPageScrollGuard(globalObj) {
         const startedAt = Number(gmGet(KEY_RESTORE_ACTIVE) || 0);
         if (!startedAt || Date.now() - startedAt > 3 * 60 * 1000) return false;
         return navigationType() === 'reload';
+    }
+
+    // After a cursor jump, search a limited number of steps toward the target.
+    // Returns a finishPanel() result, or 'continue' to fall through to full search.
+    async function searchNearJump(saved, ctrl, timeStr) {
+        const target = targetSortPosition(saved);
+        const newest = newestMountedSortPosition();
+        let dirUp = target != null && newest != null && target > newest;
+        const maxSteps = 20;
+
+        updatePanel(
+            dirUp
+                ? `Jump landed below — searching up for tweet from ${timeStr}`
+                : `Jump landed nearby — searching for tweet from ${timeStr}`
+        );
+
+        for (let attempt = 1; attempt <= maxSteps && !ctrl.aborted; attempt++) {
+            const tweet = findTweetById(saved.tweetId);
+            if (tweet) {
+                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+                tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                highlight(tweet);
+                log('Found near jump', saved.tweetId);
+                return finishPanel(`Jumped near tweet from ${timeStr}`);
+            }
+
+            if (!dirUp && passedTarget(saved)) dirUp = true;
+
+            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+            await paceStep(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+
+            if (dirUp) {
+                updatePanel(`Searching up near jump (step ${attempt}/${maxSteps})`);
+                scrollUpStep();
+                await waitForStep(saved.tweetId, ctrl, currentTweetIds());
+            } else {
+                updatePanel(`Searching down near jump (step ${attempt}/${maxSteps})`);
+                const outcome = await scrollDownAndWait(saved.tweetId, ctrl);
+                if (outcome === 'aborted') return finishPanel('Stopped');
+                if (outcome === 'end' || outcome === 'timeout') {
+                    // Nothing older — try the other direction once.
+                    dirUp = true;
+                }
+            }
+            await waitForVirtualizer(ctrl);
+        }
+
+        if (ctrl.aborted) return finishPanel('Stopped');
+        return finishPanel('Jumped near the post, but it was not on the page');
     }
 
     async function restore(saved) {
@@ -551,6 +1322,10 @@ function tpsInstallPageScrollGuard(globalObj) {
         restoring = true;
 
         const timeStr = formatTweetTime(saved.tweetTime);
+        const wantJump = CONFIG.cursorJump && isHomeTimelinePath(saved.path || currentPath());
+        // Arm before the Olo tab request fires (also armed at script start).
+        if (wantJump) armCursorJump(saved, 20000);
+
         showPanel(gentleRestore
             ? `Switching to "${CONFIG.targetTab}" tab… (slower, after a reload)`
             : `Switching to "${CONFIG.targetTab}" tab…`);
@@ -566,20 +1341,71 @@ function tpsInstallPageScrollGuard(globalObj) {
                 return finishPanel(`On "${CONFIG.targetTab}"`);
             }
 
-            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
-            scrollRoot().scrollTop = 0;
-            window.scrollTo(0, 0);
-            // Wait for the fresh Olo timeline to actually render before searching.
-            await waitForContentToSettle(ctrl);
-            if (ctrl.aborted) return finishPanel('Stopped');
+            let jumpedNear = false;
+
+            if (wantJump) {
+                updatePanel(`Jumping near tweet from ${timeStr}…`);
+                let used = jumpWasUsed() || await waitForJumpUsed(ctrl, 2500);
+                if (ctrl.aborted) return finishPanel('Stopped');
+
+                // Timeline may have loaded before the hook was armed — try one
+                // tab switch away and back to force a fresh ListLatestTweetsTimeline.
+                if (!used) {
+                    log('Jump not consumed; trying tab-switch refetch');
+                    updatePanel(`Refreshing "${CONFIG.targetTab}" for jump…`);
+                    armCursorJump(saved, 15000);
+                    const refetched = await refetchTargetTabWithJump(saved, ctrl);
+                    if (ctrl.aborted) return finishPanel('Stopped');
+                    if (refetched) {
+                        used = jumpWasUsed() || await waitForJumpUsed(ctrl, 2500);
+                    }
+                }
+
+                if (used) {
+                    // Do NOT scroll to top — wait for the jumped page to render.
+                    await waitForContentToSettle(ctrl);
+                    if (ctrl.aborted) return finishPanel('Stopped');
+                    for (let i = 0; i < 20 && !findTweetById(saved.tweetId); i++) {
+                        if (ctrl.aborted) return finishPanel('Stopped');
+                        await sleep(100);
+                    }
+                    const landed = findTweetById(saved.tweetId);
+                    if (landed) {
+                        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+                        landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        highlight(landed);
+                        log('Jumped to', saved.tweetId);
+                        return finishPanel(`Jumped near tweet from ${timeStr}`);
+                    }
+
+                    // Limited near-jump search: UP first if target sort is newer than
+                    // the newest mounted post, otherwise DOWN.
+                    jumpedNear = true;
+                    const nearResult = await searchNearJump(saved, ctrl, timeStr);
+                    if (nearResult !== 'continue') return nearResult;
+                } else {
+                    log('Jump unused; falling back to scroll search from top');
+                }
+            }
+
+            if (!jumpedNear) {
+                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
+                scrollRoot().scrollTop = 0;
+                window.scrollTo(0, 0);
+                await waitForContentToSettle(ctrl);
+                if (ctrl.aborted) return finishPanel('Stopped');
+            }
 
             let stuckSteps = 0;
             let endSteps = 0;
             let capHolds = 0;
             let lastDir = 'down';
             let passCrossings = 0;
+            const maxAttempts = jumpedNear
+                ? Math.min(30, CONFIG.maxScrollAttempts)
+                : CONFIG.maxScrollAttempts;
 
-            for (let attempt = 1; attempt <= CONFIG.maxScrollAttempts && !ctrl.aborted; attempt++) {
+            for (let attempt = 1; attempt <= maxAttempts && !ctrl.aborted; attempt++) {
                 let tweet = findTweetById(saved.tweetId);
 
                 if (!tweet && passedTarget(saved)) {
@@ -599,7 +1425,11 @@ function tpsInstallPageScrollGuard(globalObj) {
 
                 if (!tweet) {
                     lastDir = 'down';
-                    updatePanel(`Searching for tweet from ${timeStr} (step ${attempt})`);
+                    updatePanel(
+                        jumpedNear
+                            ? `Searching near jump for tweet from ${timeStr} (step ${attempt})`
+                            : `Searching for tweet from ${timeStr} (step ${attempt})`
+                    );
                     allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
 
                     const outcome = await scrollDownAndWait(saved.tweetId, ctrl);
@@ -648,14 +1478,21 @@ function tpsInstallPageScrollGuard(globalObj) {
                     }
                 }
 
-                // Act immediately so virtualization can't recycle the node away.
                 tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 highlight(tweet);
                 log('Restored to', saved.tweetId);
-                return finishPanel(`Found tweet from ${timeStr}`);
+                return finishPanel(
+                    jumpedNear
+                        ? `Jumped near tweet from ${timeStr}`
+                        : `Found tweet from ${timeStr}`
+                );
             }
 
-            finishPanel(ctrl.aborted ? 'Stopped' : `Tweet from ${timeStr} not found`);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            if (jumpedNear) {
+                return finishPanel('Jumped near the post, but it was not on the page');
+            }
+            return finishPanel(`Tweet from ${timeStr} not found`);
         } finally {
             restoring = false;
             gentleRestore = false;
@@ -780,24 +1617,23 @@ function tpsInstallPageScrollGuard(globalObj) {
         return mountedTweetCount() <= cap ? 'ok' : 'capped';
     }
 
-    // Every mounted tweet is older than the saved one, so we scrolled past it.
-    // Using the newest (not the oldest) ignores a single old promoted tweet.
+    // Every mounted tweet is older (by timeline sort position) than the saved
+    // pin, so we scrolled past it. Prefer sortIndex / sortId over wall-clock
+    // tweetTime so reposts compare correctly.
     function passedTarget(saved) {
-        if (!saved || !saved.tweetTime) return false;
-        const target = new Date(saved.tweetTime);
-        if (isNaN(target)) return false;
+        const target = targetSortPosition(saved);
+        if (target == null) return false;
         let newest = null;
         let count = 0;
         for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
-            const iso = getTweetTime(article);
-            if (!iso) continue;
-            const date = new Date(iso);
-            if (isNaN(date)) continue;
+            const pos = articleSortPosition(article);
+            if (pos == null) continue;
             count++;
-            if (!newest || date > newest) newest = date;
+            if (newest == null || pos > newest) newest = pos;
         }
-        if (count < 3 || !newest) return false;
-        return newest.getTime() < target.getTime() - 60 * 1000;
+        if (count < 3 || newest == null) return false;
+        const margin = BigInt(60 * 1000) << 22n; // ~1 minute of snowflake space
+        return newest + margin < target;
     }
 
     // Advance as soon as a new tweet id renders (content loaded). Fall back to the
@@ -1139,8 +1975,9 @@ function tpsInstallPageScrollGuard(globalObj) {
     }
 
     // Show a final status for a moment, then remove the panel.
+    // Always ensures a panel exists so the message is never lost.
     function finishPanel(text) {
-        updatePanel(text);
+        showPanel(text);
         const panel = document.getElementById(PANEL_ID);
         if (!panel) return;
         const stop = panel.querySelector('button');
@@ -1148,7 +1985,7 @@ function tpsInstallPageScrollGuard(globalObj) {
         setTimeout(() => {
             const p = document.getElementById(PANEL_ID);
             if (p) p.remove();
-        }, 2500);
+        }, 3500);
     }
 
     // ============ UI: "START OF TODAY" BUTTON ============

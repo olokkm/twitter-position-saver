@@ -7,3 +7,4 @@ scripts/*
 !scripts/build-gear-extension.mjs
 !scripts/build-gear-xpi.sh
 !scripts/bump-version.mjs
+!scripts/test-cursor.mjs
