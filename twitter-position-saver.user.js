@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.33
+// @version      3.34
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,12 +16,13 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.33';
+const TPS_VERSION = '3.34';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
 // page-hook.js (Gear/Chrome extension). Blocks X's jump-to-top while mid-feed
 // unless a recent user gesture or data-tps-allow-scroll window is active.
+// Optional on-screen overlay: localStorage tps_debug_scroll=1 or #tpsdebug.
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -42,23 +43,193 @@ function tpsInstallPageScrollGuard(globalObj) {
     let momentumUntil = 0;
     g.__tpsAllowScrollUntil = 0;
 
+    function readDebugEnabled() {
+        try {
+            const h = String(g.location && g.location.hash || '');
+            if (/(?:^|[&#])tpsdebugoff(?:&|$)/.test(h)) return false;
+            if (/(?:^|[&#])tpsdebug(?:&|$)/.test(h)) return true;
+        } catch (_) { /* ignore */ }
+        try {
+            return g.localStorage && g.localStorage.getItem('tps_debug_scroll') === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    const DEBUG = readDebugEnabled();
+
+    // ---- optional overlay (zero cost when DEBUG is false) ----
+    const RING_MAX = 8;
+    const dbgRing = DEBUG ? [] : null;
+    let dbgEl = null;
+    let dbgRaf = 0;
+    let dbgTouching = false;
+    let dbgLastScrollY = 0;
+    let dbgLastFrameDy = 0;
+    let dbgMomentumMarked = false;
+    let dbgTouchLastY = 0;
+    let dbgAnchorSupports = '';
+
+    function dbgNow() {
+        return Date.now();
+    }
+
+    function dbgPush(line) {
+        if (!DEBUG || !dbgRing) return;
+        const t = dbgNow();
+        dbgRing.push({ t: t, line: line });
+        while (dbgRing.length > RING_MAX) dbgRing.shift();
+        if (!dbgRaf) {
+            dbgRaf = g.requestAnimationFrame(function () {
+                dbgRaf = 0;
+                dbgRender();
+            });
+        }
+    }
+
+    function dbgEnsureOverlay() {
+        if (!DEBUG || dbgEl) return dbgEl;
+        try {
+            const doc = g.document;
+            if (!doc || !doc.documentElement) return null;
+            try {
+                dbgAnchorSupports = (typeof CSS !== 'undefined' && CSS.supports)
+                    ? String(CSS.supports('overflow-anchor', 'auto'))
+                    : '?';
+            } catch (_) {
+                dbgAnchorSupports = '?';
+            }
+            const el = doc.createElement('div');
+            el.id = 'tps-scroll-debug';
+            el.setAttribute('data-tps-inject', 'debug');
+            el.style.cssText = [
+                'position:fixed',
+                'left:6px',
+                'bottom:72px',
+                'z-index:2147483646',
+                'pointer-events:none',
+                'max-width:min(96vw,420px)',
+                'max-height:42vh',
+                'overflow:hidden',
+                'padding:6px 8px',
+                'border-radius:8px',
+                'background:rgba(0,0,0,0.72)',
+                'color:#b8f5c5',
+                'font:10px/1.35 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace',
+                'white-space:pre-wrap',
+                'word-break:break-word',
+                'box-shadow:0 2px 10px rgba(0,0,0,0.45)'
+            ].join(';');
+            (doc.documentElement || doc.body).appendChild(el);
+            dbgEl = el;
+            dbgPush('overlay on anchor=' + dbgAnchorSupports);
+            return el;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function dbgRender() {
+        if (!DEBUG) return;
+        const el = dbgEnsureOverlay();
+        if (!el || !dbgRing) return;
+        const now = dbgNow();
+        const lines = ['TPS dbg anchor=' + dbgAnchorSupports];
+        for (let i = 0; i < dbgRing.length; i++) {
+            const age = now - dbgRing[i].t;
+            lines.push('-' + age + 'ms ' + dbgRing[i].line);
+        }
+        el.textContent = lines.join('\n');
+    }
+
+    function isOurWrite() {
+        try {
+            const el = g.document && g.document.documentElement;
+            if (!el) return null;
+            const until = Number(el.getAttribute('data-tps-our-scroll-until') || 0);
+            if (Date.now() <= until) {
+                return el.getAttribute('data-tps-our-scroll') || 'tps';
+            }
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
+    function dbgLogWrite(kind, fromY, toY, blocked, ours) {
+        if (!DEBUG) return;
+        const who = ours ? ('us:' + ours) : 'X';
+        const d = (typeof toY === 'number' && typeof fromY === 'number')
+            ? Math.round(toY - fromY) : '?';
+        const fr = typeof fromY === 'number' ? Math.round(fromY) : '?';
+        const to = typeof toY === 'number' ? Math.round(toY) : '?';
+        dbgPush((blocked ? 'BLK ' : 'WR  ') + kind + ' ' + who + ' ' + fr + '→' + to +
+            ' d=' + d);
+    }
+
     const markGesture = () => {
         lastGestureAt = Date.now();
         momentumUntil = Date.now() + MOMENTUM_ARM_MS;
     };
     g.addEventListener('wheel', markGesture, true);
-    g.addEventListener('touchstart', markGesture, true);
-    g.addEventListener('touchmove', markGesture, true);
+    g.addEventListener('touchstart', function (e) {
+        markGesture();
+        if (!DEBUG) return;
+        dbgTouching = true;
+        dbgMomentumMarked = false;
+        try {
+            dbgTouchLastY = e.touches && e.touches[0] ? e.touches[0].clientY : 0;
+        } catch (_) { dbgTouchLastY = 0; }
+        dbgPush('touchstart y=' + Math.round(currentY()));
+    }, true);
+    g.addEventListener('touchmove', function (e) {
+        markGesture();
+        if (!DEBUG) return;
+        try {
+            if (e.touches && e.touches[0]) dbgTouchLastY = e.touches[0].clientY;
+        } catch (_) { /* ignore */ }
+    }, true);
+    g.addEventListener('touchend', function () {
+        if (!DEBUG) return;
+        dbgTouching = false;
+        dbgPush('touchend y=' + Math.round(currentY()));
+    }, true);
+    g.addEventListener('touchcancel', function () {
+        if (!DEBUG) return;
+        dbgTouching = false;
+        dbgPush('touchcancel');
+    }, true);
     g.addEventListener('pointerdown', markGesture, true);
     g.addEventListener('keydown', (e) => {
         if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
             markGesture();
         }
     }, true);
+
     g.addEventListener('scroll', () => {
         if (Date.now() < momentumUntil) {
             momentumUntil = Date.now() + MOMENTUM_EXTEND_MS;
         }
+        if (!DEBUG) return;
+        const y = currentY();
+        const dy = y - dbgLastScrollY;
+        const abs = dy < 0 ? -dy : dy;
+        // Unexplained jump: single-frame delta >> recent frame delta, and >30px,
+        // while not actively dragging (momentum or programmatic).
+        if (!dbgTouching && abs > 30) {
+            const prev = dbgLastFrameDy < 0 ? -dbgLastFrameDy : dbgLastFrameDy;
+            if (prev < 1 || abs > prev * 3) {
+                const ours = isOurWrite();
+                dbgPush('JUMP d=' + Math.round(dy) + ' ' + Math.round(dbgLastScrollY) +
+                    '→' + Math.round(y) + (ours ? ' us:' + ours : ' ?'));
+            }
+        }
+        if (!dbgTouching && Date.now() < momentumUntil && !dbgMomentumMarked && abs < 1.5) {
+            // fling likely ended (scroll events trickle with tiny dy)
+            dbgMomentumMarked = true;
+            dbgPush('momentum-end? y=' + Math.round(y));
+        }
+        if (abs >= 1.5) dbgMomentumMarked = false;
+        dbgLastFrameDy = dy;
+        dbgLastScrollY = y;
     }, true);
 
     g.addEventListener('message', (e) => {
@@ -111,30 +282,44 @@ function tpsInstallPageScrollGuard(globalObj) {
         return { left: args[0], top: args[1], opts: null };
     }
 
-    function wrapScrollFn(orig) {
+    function wrapScrollFn(kind, orig, isDelta) {
         return function (...args) {
+            const from = currentY();
             const { top } = parseScrollArgs(args);
-            if (typeof top === 'number' && shouldBlockJumpTo(top)) return;
+            let nextY = null;
+            if (typeof top === 'number') {
+                nextY = isDelta ? (from + top) : top;
+            }
+            const ours = isOurWrite();
+            const block = typeof nextY === 'number' && shouldBlockJumpTo(nextY);
+            if (DEBUG) dbgLogWrite(kind, from, nextY, block, ours);
+            if (block) return;
             return orig.apply(this, args);
         };
     }
 
     try {
-        g.scrollTo = wrapScrollFn(g.scrollTo.bind(g));
-        g.scroll = wrapScrollFn(g.scroll.bind(g));
-        g.scrollBy = wrapScrollFn(g.scrollBy.bind(g));
+        g.scrollTo = wrapScrollFn('scrollTo', g.scrollTo.bind(g), false);
+        g.scroll = wrapScrollFn('scroll', g.scroll.bind(g), false);
+        g.scrollBy = wrapScrollFn('scrollBy', g.scrollBy.bind(g), true);
     } catch (_) { /* ignore */ }
 
     try {
         const origSIV = g.Element.prototype.scrollIntoView;
         g.Element.prototype.scrollIntoView = function (...args) {
-            if (!isAllowed()) {
-                try {
-                    const rect = this.getBoundingClientRect();
-                    const targetY = currentY() + rect.top;
-                    if (shouldBlockJumpTo(Math.max(0, targetY))) return;
-                } catch (_) { /* fall through */ }
+            const from = currentY();
+            let nextY = null;
+            try {
+                const rect = this.getBoundingClientRect();
+                nextY = from + rect.top;
+            } catch (_) { /* ignore */ }
+            const ours = isOurWrite();
+            let block = false;
+            if (!isAllowed() && typeof nextY === 'number') {
+                block = shouldBlockJumpTo(Math.max(0, nextY));
             }
+            if (DEBUG) dbgLogWrite('siv', from, nextY, block, ours);
+            if (block) return;
             return origSIV.apply(this, args);
         };
     } catch (_) { /* ignore */ }
@@ -150,14 +335,26 @@ function tpsInstallPageScrollGuard(globalObj) {
                 get() { return desc.get.call(this); },
                 set(value) {
                     const next = Number(value);
+                    const from = currentY();
+                    let block = false;
                     try {
                         const doc = g.document;
                         const se = doc && (doc.scrollingElement || doc.documentElement);
                         if ((this === se || this === doc.documentElement || this === doc.body) &&
                             shouldBlockJumpTo(next)) {
-                            return;
+                            block = true;
                         }
                     } catch (_) { /* fall through */ }
+                    if (DEBUG) {
+                        try {
+                            const doc = g.document;
+                            const se = doc && (doc.scrollingElement || doc.documentElement);
+                            if (this === se || this === doc.documentElement || this === doc.body) {
+                                dbgLogWrite('scrollTop', from, next, block, isOurWrite());
+                            }
+                        } catch (_) { /* ignore */ }
+                    }
+                    if (block) return;
                     desc.set.call(this, value);
                 }
             });
@@ -168,6 +365,19 @@ function tpsInstallPageScrollGuard(globalObj) {
         patchScrollTop(g.Element.prototype);
         patchScrollTop(g.HTMLElement && g.HTMLElement.prototype);
     } catch (_) { /* ignore */ }
+
+    if (DEBUG) {
+        dbgLastScrollY = currentY();
+        try {
+            if (g.document && g.document.documentElement) {
+                dbgEnsureOverlay();
+            } else {
+                g.document.addEventListener('DOMContentLoaded', function () {
+                    dbgEnsureOverlay();
+                }, { once: true });
+            }
+        } catch (_) { /* ignore */ }
+    }
 }
 /* TPS_SCROLL_GUARD_END */
 
@@ -1503,13 +1713,27 @@ function tpsInjectPageRealmScripts() {
     }
 
     // ---- Scroll debug / write helpers (tps_debug_scroll=1 or #tpsdebug) ----
+    // Persist hash toggles so Gear reloads keep the overlay.
+    try {
+        const h0 = String(location.hash || '');
+        if (/(?:^|[&#])tpsdebugoff(?:&|$)/.test(h0)) {
+            localStorage.setItem('tps_debug_scroll', '0');
+        } else if (/(?:^|[&#])tpsdebug(?:&|$)/.test(h0)) {
+            localStorage.setItem('tps_debug_scroll', '1');
+        }
+        if (/(?:^|[&#])tpsnoanchor(?:&|$)/.test(h0)) {
+            localStorage.setItem('tps_debug_noanchor', '1');
+        }
+    } catch (_) { /* ignore */ }
+
     function tpsDebugFlag(name) {
         try {
             if (localStorage.getItem(name) === '1') return true;
         } catch (_) { /* ignore */ }
         try {
             const h = String(location.hash || '');
-            if (name === 'tps_debug_scroll' && /(?:^|[&#])tpsdebug(?:&|$)/.test(h)) return true;
+            if (name === 'tps_debug_scroll' && /(?:^|[&#])tpsdebug(?:&|$)/.test(h) &&
+                !/(?:^|[&#])tpsdebugoff(?:&|$)/.test(h)) return true;
             if (name === 'tps_debug_noanchor' && /(?:^|[&#])tpsnoanchor(?:&|$)/.test(h)) return true;
         } catch (_) { /* ignore */ }
         return false;
@@ -1531,13 +1755,18 @@ function tpsInjectPageRealmScripts() {
 
     function markOurScroll(reason, ms) {
         tpsLastScrollWriter = String(reason || 'unknown');
-        tpsOurScrollUntil = Date.now() + (ms == null ? 80 : ms);
+        const hold = ms == null ? 80 : ms;
+        tpsOurScrollUntil = Date.now() + hold;
+        try {
+            document.documentElement.setAttribute('data-tps-our-scroll', tpsLastScrollWriter);
+            document.documentElement.setAttribute('data-tps-our-scroll-until', String(tpsOurScrollUntil));
+        } catch (_) { /* ignore */ }
         scrollLog('write', tpsLastScrollWriter);
     }
 
     // All TPS programmatic scroll writes should go through here.
     function tpsScrollWrite(reason, fn) {
-        markOurScroll(reason, 100);
+        markOurScroll(reason, 120);
         allowProgrammaticScroll(Math.max(400, (reason && reason.indexOf('land') >= 0) ? 800 : 600));
         try { return fn(); } catch (e) {
             scrollLog('write-error', reason, e && e.message);

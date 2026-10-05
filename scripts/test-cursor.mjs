@@ -998,7 +998,33 @@ function alignDelta(tweetTop, headerOffset) {
 assert(Math.abs(alignDelta(12, 116) - (-104)) < 0.1, 'align scrolls up when tweet under header');
 assert(Math.abs(alignDelta(200, 116) - 84) < 0.1, 'align scrolls down when tweet too low');
 
+
 console.log('info: v3.33 header-align tests done');
+
+// --- v3.34 debug jump heuristic ---
+function isDebugJumpFrame(touching, absDy, prevAbsDy) {
+  if (touching) return false;
+  if (!(absDy > 30)) return false;
+  if (prevAbsDy < 1) return true;
+  return absDy > prevAbsDy * 3;
+}
+assert(!isDebugJumpFrame(true, 100, 1), 'no jump while touching');
+assert(!isDebugJumpFrame(false, 20, 5), 'below 30px threshold');
+assert(isDebugJumpFrame(false, 100, 10), '3x previous frame');
+assert(isDebugJumpFrame(false, 40, 0), 'first large frame after stillness');
+assert(!isDebugJumpFrame(false, 40, 20), 'smooth deceleration not a jump');
+
+function ringPush(ring, max, item) {
+  ring.push(item);
+  while (ring.length > max) ring.shift();
+  return ring;
+}
+const r = [];
+ringPush(r, 3, 'a'); ringPush(r, 3, 'b'); ringPush(r, 3, 'c'); ringPush(r, 3, 'd');
+assert(r.join(',') === 'b,c,d', 'ring keeps last 3');
+
+console.log('info: v3.34 debug overlay tests done');
+
 
 
 
