@@ -179,7 +179,11 @@ function tpsInstallPageScrollGuard(globalObj) {
         // Hard cap on tweets X may keep mounted during a search. The script
         // cannot set a browser memory quota; it stops scrolling until the count
         // drops, so the tab is not killed and reloaded.
-        maxMountedTweets: 26,
+        // Measured 2026-10-05 on the Olo timeline: at 390x844 X kept at most 14
+        // articles (median 11) at reading pace and at most 11 when scrolling
+        // fast; desktop width peaked at 10. 20 leaves room for taller phones
+        // and tall media posts while still catching a DOM that keeps growing.
+        maxMountedTweets: 20,
         autoRestore: true         // jump back automatically when the timeline loads
     };
 
@@ -734,7 +738,7 @@ function tpsInstallPageScrollGuard(globalObj) {
     }
 
     async function waitForVirtualizer(ctrl) {
-        const cap = CONFIG.maxMountedTweets || 26;
+        const cap = CONFIG.maxMountedTweets || 20;
         const start = Date.now();
         while (Date.now() - start < 2500) {
             if (ctrl && ctrl.aborted) return;
@@ -747,7 +751,7 @@ function tpsInstallPageScrollGuard(globalObj) {
     // Near the top, X often mounts a first batch before virtualizing, so the
     // search is allowed to start. Deeper in, nudge up so off-screen tweets drop.
     async function holdForMountedCap(ctrl) {
-        const cap = CONFIG.maxMountedTweets || 26;
+        const cap = CONFIG.maxMountedTweets || 20;
         for (let pass = 0; pass < 3; pass++) {
             const start = Date.now();
             while (Date.now() - start < 1500) {
