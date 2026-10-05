@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.21
+// @version      3.22
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -170,7 +170,7 @@ function tpsInstallPageScrollGuard(globalObj) {
         // Soft "end" = bottom of *loaded* content while X may still fetch more.
         bottomConfirmMs: 2500,
         endConfirmAttempts: 5,
-        endRetryDelayMs: 1500,
+        endRetryDelayMs: 400,
         stuckConfirmAttempts: 5,
         // Small steps. A big jump skips virtualized tweets and, on iOS, grows the
         // page until the tab is killed and X reloads — which starts the search over.
@@ -186,7 +186,8 @@ function tpsInstallPageScrollGuard(globalObj) {
         // articles (median 11) at reading pace and at most 11 when scrolling
         // fast; desktop width peaked at 10. 20 leaves room for taller phones
         // and tall media posts while still catching a DOM that keeps growing.
-        maxMountedTweets: 20,
+        // Raised to 100 on request: only a runaway DOM should stop the search.
+        maxMountedTweets: 100,
         autoRestore: true         // jump back automatically when the timeline loads
     };
 
@@ -741,7 +742,7 @@ function tpsInstallPageScrollGuard(globalObj) {
     }
 
     async function waitForVirtualizer(ctrl) {
-        const cap = CONFIG.maxMountedTweets || 20;
+        const cap = CONFIG.maxMountedTweets || 100;
         const start = Date.now();
         while (Date.now() - start < 2500) {
             if (ctrl && ctrl.aborted) return;
@@ -754,7 +755,7 @@ function tpsInstallPageScrollGuard(globalObj) {
     // Near the top, X often mounts a first batch before virtualizing, so the
     // search is allowed to start. Deeper in, nudge up so off-screen tweets drop.
     async function holdForMountedCap(ctrl) {
-        const cap = CONFIG.maxMountedTweets || 20;
+        const cap = CONFIG.maxMountedTweets || 100;
         for (let pass = 0; pass < 3; pass++) {
             const start = Date.now();
             while (Date.now() - start < 1500) {
@@ -805,12 +806,19 @@ function tpsInstallPageScrollGuard(globalObj) {
 
             if (isAtScrollBottom()) {
                 const height = scrollRoot().scrollHeight;
-                if (bottomSince === null || height !== bottomHeight) {
+                if (bottomHeight !== null && height > bottomHeight + 40) {
+                    // X appended more posts: move on now instead of idling.
+                    return 'loaded';
+                }
+                if (bottomSince === null) {
                     bottomSince = Date.now();
                     bottomHeight = height;
                 } else if (Date.now() - bottomSince >= (CONFIG.bottomConfirmMs || 2500)) {
                     return 'end';
                 }
+            } else if (Date.now() - start > 600) {
+                // Not at the bottom and no new id yet: the step still moved us, go on.
+                return 'moved';
             } else {
                 bottomSince = null;
                 bottomHeight = null;
@@ -837,7 +845,7 @@ function tpsInstallPageScrollGuard(globalObj) {
         if (outcome === 'aborted' || outcome === 'found' || outcome === 'end' || outcome === 'timeout') {
             return outcome;
         }
-        if (outcome === 'loaded') return 'progress';
+        if (outcome === 'loaded' || outcome === 'moved') return 'progress';
 
         // No new ids yet — if we still moved, keep going; otherwise retry this step.
         // Never jump to scrollHeight: that resets X's virtual timeline.
