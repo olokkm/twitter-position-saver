@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.20
+// @version      3.21
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -174,8 +174,11 @@ function tpsInstallPageScrollGuard(globalObj) {
         stuckConfirmAttempts: 5,
         // Small steps. A big jump skips virtualized tweets and, on iOS, grows the
         // page until the tab is killed and X reloads — which starts the search over.
-        minStepGapMs: 450,
-        stepViewportRatio: 0.5,
+        // In the 2026-10-05 measurement X stayed at <=11 mounted tweets while
+        // scrolling ~5 screens/s, so 0.9 screen every 250ms (~3.6 screens/s) is
+        // safe. A step under one screen still passes every tweet through view.
+        minStepGapMs: 250,
+        stepViewportRatio: 0.9,
         // Hard cap on tweets X may keep mounted during a search. The script
         // cannot set a browser memory quota; it stops scrolling until the count
         // drops, so the tab is not killed and reloaded.
