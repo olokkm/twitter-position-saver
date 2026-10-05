@@ -845,7 +845,8 @@ function tpsInstallPageScrollGuard(globalObj) {
         if (outcome === 'aborted' || outcome === 'found' || outcome === 'end' || outcome === 'timeout') {
             return outcome;
         }
-        if (outcome === 'loaded' || outcome === 'moved') return 'progress';
+        if (outcome === 'loaded') return 'progress';
+        // 'moved' falls through: only counts as progress if the page really moved.
 
         // No new ids yet — if we still moved, keep going; otherwise retry this step.
         // Never jump to scrollHeight: that resets X's virtual timeline.
