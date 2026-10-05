@@ -970,7 +970,36 @@ assert(isLikelyXYank(2000, 0, vh), 'deep 2000→0 is yank');
 assert(!isLikelyXYank(1500, 1400, vh), 'small mid shift not yank');
 assert(!isLikelyXYank(80, 20, vh), 'already-near-top shift not yank');
 
+
 console.log('info: v3.32 yank tests done');
+
+// --- v3.33 sticky header offset (pure measure helper) ---
+function stickyHeaderOffsetFromRects(rects, innerWidth, fallbackMobile, fallbackDesktop) {
+  let bottom = 0;
+  const vh = 800;
+  for (const r of rects) {
+    if (r.top >= -1 && r.top < vh * 0.35 && r.bottom > bottom && r.bottom < vh * 0.5) {
+      bottom = r.bottom;
+    }
+  }
+  if (bottom < 40) bottom = innerWidth <= 500 ? fallbackMobile : fallbackDesktop;
+  return Math.round(bottom + 6);
+}
+
+assert(stickyHeaderOffsetFromRects([{ top: 0, bottom: 100 }], 390, 110, 53) === 106, 'uses measured header bottom+6');
+assert(stickyHeaderOffsetFromRects([], 390, 110, 53) === 116, 'mobile fallback 110+6');
+assert(stickyHeaderOffsetFromRects([], 1200, 110, 53) === 59, 'desktop fallback 53+6');
+assert(stickyHeaderOffsetFromRects([{ top: 500, bottom: 600 }], 390, 110, 53) === 116, 'ignores mid-page sticky');
+
+// land align delta
+function alignDelta(tweetTop, headerOffset) {
+  return tweetTop - headerOffset;
+}
+assert(Math.abs(alignDelta(12, 116) - (-104)) < 0.1, 'align scrolls up when tweet under header');
+assert(Math.abs(alignDelta(200, 116) - 84) < 0.1, 'align scrolls down when tweet too low');
+
+console.log('info: v3.33 header-align tests done');
+
 
 
 

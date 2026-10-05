@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.32
+// @version      3.33
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.32';
+const TPS_VERSION = '3.33';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -28,15 +28,24 @@ function tpsInstallPageScrollGuard(globalObj) {
     if (!g || g.__tpsScrollGuardInstalled) return;
     g.__tpsScrollGuardInstalled = true;
 
+    // Guard ONLY blocks X jump-to-top; it never writes scrollTop/scrollTo itself.
+    // Momentum: after a real gesture, keep allowing while scroll events keep arriving
+    // so we do not block X's layout compensation when iOS fling decelerates.
     const USER_GRACE_MS = 900;
+    const MOMENTUM_ARM_MS = 2500;
+    const MOMENTUM_EXTEND_MS = 180;
     const MID_FEED_Y = 280;
     const TOP_TARGET_Y = 140;
     const BIG_JUMP_PX = 350;
 
     let lastGestureAt = 0;
+    let momentumUntil = 0;
     g.__tpsAllowScrollUntil = 0;
 
-    const markGesture = () => { lastGestureAt = Date.now(); };
+    const markGesture = () => {
+        lastGestureAt = Date.now();
+        momentumUntil = Date.now() + MOMENTUM_ARM_MS;
+    };
     g.addEventListener('wheel', markGesture, true);
     g.addEventListener('touchstart', markGesture, true);
     g.addEventListener('touchmove', markGesture, true);
@@ -44,6 +53,11 @@ function tpsInstallPageScrollGuard(globalObj) {
     g.addEventListener('keydown', (e) => {
         if (['ArrowUp', 'ArrowDown', 'PageUp', 'PageDown', 'Home', 'End', ' '].includes(e.key)) {
             markGesture();
+        }
+    }, true);
+    g.addEventListener('scroll', () => {
+        if (Date.now() < momentumUntil) {
+            momentumUntil = Date.now() + MOMENTUM_EXTEND_MS;
         }
     }, true);
 
@@ -66,7 +80,9 @@ function tpsInstallPageScrollGuard(globalObj) {
     function isAllowed() {
         allowUntilFromDom();
         const now = Date.now();
-        return now < g.__tpsAllowScrollUntil || now - lastGestureAt < USER_GRACE_MS;
+        return now < g.__tpsAllowScrollUntil ||
+            now - lastGestureAt < USER_GRACE_MS ||
+            now < momentumUntil;
     }
 
     function currentY() {
@@ -1554,13 +1570,6 @@ function tpsInjectPageRealmScripts() {
         } catch (_) { /* ignore */ }
     }
 
-    function engineHasScrollAnchoring() {
-        try {
-            return typeof CSS !== 'undefined' && CSS.supports && CSS.supports('overflow-anchor', 'auto');
-        } catch (_) {
-            return false;
-        }
-    }
 
     const STORAGE_PREFIX = 'tps_';
 
@@ -2086,10 +2095,11 @@ function tpsInjectPageRealmScripts() {
     let landedAwaitingUser = false;
     let userControlAfterLand = false;
     let touchActive = false;
-    let anchorObserver = null;
-    let anchorRaf = 0;
-    let anchorLastTopId = null;
-    let anchorLastTopOffset = 0;
+    let landedTweetId = null;
+    let landSettleTimer = 0;
+    let landSettleCount = 0;
+    let scrollIdleTimer = 0;
+    let lastScrollIdleY = 0;
 
     function abortRestore() {
         if (currentAbort) currentAbort.aborted = true;
@@ -2104,8 +2114,8 @@ function tpsInjectPageRealmScripts() {
         if (landedAwaitingUser) {
             landedAwaitingUser = false;
             userControlAfterLand = true;
-            stopManualScrollAnchor('user-gesture');
-            scrollLog('userControlAfterLand — no more yank-undo / anchor writes');
+            cancelLandSettle('user-gesture');
+            scrollLog('userControlAfterLand — no more settle/yank-undo writes');
         }
     }
 
@@ -2127,19 +2137,116 @@ function tpsInjectPageRealmScripts() {
         if (top) lastStableTweetId = top.id;
     }
 
-    function markLanded() {
+    // Sticky header/tabs height so the landed tweet sits just below, not under it.
+    function stickyHeaderOffset() {
+        let bottom = 0;
+        try {
+            const nodes = document.querySelectorAll(
+                'header[role="banner"], [data-testid="SwipeableList"], div[style*="position: sticky"], div[style*="position:sticky"]'
+            );
+            const vh = window.innerHeight || 800;
+            for (let i = 0; i < nodes.length; i++) {
+                const el = nodes[i];
+                const r = el.getBoundingClientRect();
+                if (r.top >= -1 && r.top < vh * 0.35 && r.bottom > bottom && r.bottom < vh * 0.5) {
+                    bottom = r.bottom;
+                }
+            }
+            // Fallback: primary column top bars often ~53–120px on mobile X.
+            if (bottom < 40) bottom = window.innerWidth <= 500 ? 110 : 53;
+        } catch (_) {
+            bottom = 110;
+        }
+        return Math.round(bottom + 6);
+    }
+
+    function alignTweetBelowHeader(tweet, reason) {
+        if (!tweet || userControlAfterLand) return false;
+        try {
+            const offset = stickyHeaderOffset();
+            const top = tweet.getBoundingClientRect().top;
+            const delta = top - offset;
+            if (!isFinite(delta) || Math.abs(delta) < 2) return false;
+            const before = scrollTop();
+            tpsScrollWrite(reason || 'align-header', function () {
+                window.scrollBy(0, delta);
+            });
+            scrollLog('idle: align', reason, 'delta=', Math.round(delta),
+                'y', Math.round(before), '→', Math.round(scrollTop()), 'hdr=', offset);
+            return true;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function cancelLandSettle(why) {
+        if (landSettleTimer) {
+            try { clearTimeout(landSettleTimer); } catch (_) { /* ignore */ }
+            landSettleTimer = 0;
+        }
+        landSettleCount = 0;
+        if (why) scrollLog('idle: land-settle cancel', why);
+    }
+
+    // After land, X often reflows items above (~300px within ~1s). Re-align a few
+    // times, then stop — never a continuous MutationObserver (that fights flings).
+    function scheduleLandSettle(tweetId) {
+        cancelLandSettle(null);
+        landedTweetId = tweetId || landedTweetId;
+        landSettleCount = 0;
+        const step = function () {
+            landSettleTimer = 0;
+            if (userControlAfterLand || restoring) return;
+            landSettleCount++;
+            const before = scrollTop();
+            scrollLog('idle: land-settle', landSettleCount, 'y=', Math.round(before));
+            const el = landedTweetId && findTweetById(landedTweetId);
+            if (el) alignTweetBelowHeader(el, 'land-settle-' + landSettleCount);
+            scrollLog('idle: land-settle done step', landSettleCount,
+                'y=', Math.round(scrollTop()));
+            if (landSettleCount < 6 && !userControlAfterLand) {
+                landSettleTimer = setTimeout(step, landSettleCount < 3 ? 200 : 350);
+            }
+        };
+        landSettleTimer = setTimeout(step, 180);
+    }
+
+    function markLanded(tweetOrId) {
         landedAwaitingUser = true;
         userControlAfterLand = false;
+        const id = typeof tweetOrId === 'string'
+            ? tweetOrId
+            : (tweetOrId && extractTweetId(tweetOrId)) || (getTopTweet() && getTopTweet().id);
+        landedTweetId = id || landedTweetId;
         rememberStablePosition();
-        if (!engineHasScrollAnchoring()) {
-            startManualScrollAnchor();
-        }
-        scrollLog('markLanded', 'y=', lastStableScrollY, 'tweet=', lastStableTweetId);
+        scrollLog('markLanded', 'y=', lastStableScrollY, 'tweet=', landedTweetId,
+            'hdr=', stickyHeaderOffset());
+        scheduleLandSettle(landedTweetId);
+    }
+
+    function onScrollIdle() {
+        scrollIdleTimer = 0;
+        if (!TPS_DEBUG_SCROLL) return;
+        const y = scrollTop();
+        scrollLog('idle: scroll-end', 'y=', Math.round(y),
+            'dy=', Math.round(lastScrollIdleY - y),
+            'userControl=', userControlAfterLand,
+            'touch=', touchActive,
+            'lastWriter=', tpsLastScrollWriter);
+        lastScrollIdleY = y;
+    }
+
+    function noteScrollForIdleDebug() {
+        if (!TPS_DEBUG_SCROLL) return;
+        lastScrollIdleY = scrollTop();
+        if (scrollIdleTimer) clearTimeout(scrollIdleTimer);
+        scrollIdleTimer = setTimeout(onScrollIdle, 140);
     }
 
     function undoXYank() {
-        if (userControlAfterLand) {
-            scrollLog('yank-undo skipped (userControlAfterLand)');
+        if (userControlAfterLand || landedAwaitingUser) {
+            scrollLog('yank-undo skipped',
+                userControlAfterLand ? '(userControl)' : '(land-settle)');
             return;
         }
         suppressSaves = true;
@@ -2165,6 +2272,7 @@ function tpsInjectPageRealmScripts() {
     function onTimelineScroll() {
         const y = scrollTop();
         const prev = lastStableScrollY;
+        noteScrollForIdleDebug();
 
         // Debug: large jumps not from our recent write and not from a gesture.
         if (TPS_DEBUG_SCROLL) {
@@ -2200,81 +2308,16 @@ function tpsInjectPageRealmScripts() {
         }
     }
 
-    function captureAnchorSample() {
-        try {
-            const top = getTopTweet();
-            if (!top || !top.article) {
-                anchorLastTopId = null;
-                return;
-            }
-            anchorLastTopId = top.id;
-            anchorLastTopOffset = top.article.getBoundingClientRect().top;
-        } catch (_) {
-            anchorLastTopId = null;
-        }
-    }
-
-    function applyAnchorCorrection() {
-        anchorRaf = 0;
-        if (userControlAfterLand || touchActive || restoring) return;
-        if (!anchorLastTopId) return;
-        try {
-            const el = findTweetById(anchorLastTopId);
-            if (!el) return;
-            const nowTop = el.getBoundingClientRect().top;
-            const delta = nowTop - anchorLastTopOffset;
-            if (!isFinite(delta) || Math.abs(delta) < 2 || Math.abs(delta) > 2000) {
-                anchorLastTopOffset = nowTop;
-                return;
-            }
-            // Layout shifted the anchored tweet — correct without fighting touch/momentum.
-            tpsScrollWrite('manual-anchor', function () {
-                window.scrollBy(0, delta);
-            });
-            anchorLastTopOffset = el.getBoundingClientRect().top;
-            scrollLog('anchor-correct', Math.round(delta) + 'px', 'id', anchorLastTopId);
-        } catch (_) { /* ignore */ }
-    }
-
-    function startManualScrollAnchor() {
-        stopManualScrollAnchor('restart');
-        if (userControlAfterLand) return;
-        try {
-            const root = document.getElementById('react-root') || document.body || document.documentElement;
-            if (!root || typeof MutationObserver === 'undefined') return;
-            captureAnchorSample();
-            anchorObserver = new MutationObserver(function () {
-                if (userControlAfterLand || touchActive || restoring) return;
-                if (anchorRaf) return;
-                captureAnchorSample();
-                anchorRaf = window.requestAnimationFrame(applyAnchorCorrection);
-            });
-            anchorObserver.observe(root, { childList: true, subtree: true });
-            try { document.documentElement.setAttribute('data-tps-anchor', '1'); } catch (_) { /* ignore */ }
-            scrollLog('manual-anchor start');
-        } catch (_) { /* ignore */ }
-    }
-
-    function stopManualScrollAnchor(why) {
-        if (anchorObserver) {
-            try { anchorObserver.disconnect(); } catch (_) { /* ignore */ }
-            anchorObserver = null;
-        }
-        if (anchorRaf) {
-            try { window.cancelAnimationFrame(anchorRaf); } catch (_) { /* ignore */ }
-            anchorRaf = 0;
-        }
-        try { document.documentElement.removeAttribute('data-tps-anchor'); } catch (_) { /* ignore */ }
-        if (why) scrollLog('manual-anchor stop', why);
-    }
 
     function savePosition() {
         if (restoring || suppressSaves) return;
         if (!isTimelinePage() || !isOnTargetTab()) return;
 
+        const y0 = TPS_DEBUG_SCROLL ? scrollTop() : 0;
         const top = getTopTweet();
         if (!top) return;
 
+        // Storage only — no DOM/history/focus/URL writes (those jump iOS).
         const sortId = resolveSortIdForArticle(top.article, top.id);
         gmSet(KEY_TWEET_ID, top.id);
         gmSet(KEY_TWEET_TIME, top.time);
@@ -2282,6 +2325,9 @@ function tpsInjectPageRealmScripts() {
         gmSet(KEY_TIMESTAMP, Date.now());
         gmSet(KEY_PATH, currentPath());
         log('Saved', top.id, top.time, 'sort', sortId);
+        if (TPS_DEBUG_SCROLL) {
+            scrollLog('idle: savePosition', top.id, 'y=', Math.round(y0), '→', Math.round(scrollTop()));
+        }
     }
 
     function readSavedPosition() {
@@ -2310,9 +2356,18 @@ function tpsInjectPageRealmScripts() {
     } catch (_) { /* ignore */ }
 
     function highlight(tweet) {
-        tweet.style.transition = 'box-shadow 0.3s ease';
-        tweet.style.boxShadow = '0 0 0 3px #1d9bf0';
-        setTimeout(() => { tweet.style.boxShadow = ''; }, 2000);
+        // outline does not affect layout (unlike box-shadow/margins).
+        try {
+            tweet.style.outline = '3px solid #1d9bf0';
+            tweet.style.outlineOffset = '0px';
+        } catch (_) { /* ignore */ }
+        setTimeout(() => {
+            const y0 = TPS_DEBUG_SCROLL ? scrollTop() : 0;
+            try { tweet.style.outline = ''; tweet.style.outlineOffset = ''; } catch (_) { /* ignore */ }
+            if (TPS_DEBUG_SCROLL) {
+                scrollLog('idle: highlight-clear', 'y=', Math.round(y0), '→', Math.round(scrollTop()));
+            }
+        }, 2000);
     }
 
     function navigationType() {
@@ -2413,13 +2468,15 @@ function tpsInjectPageRealmScripts() {
             } catch (_) {
                 try { tweet.scrollIntoView({ block: 'start' }); } catch (__) { /* ignore */ }
             }
+            // Place tweet top just below sticky header (not a blind -12px).
             try {
-                const root = scrollRoot();
-                root.scrollTop = Math.max(0, root.scrollTop - 12);
+                const offset = stickyHeaderOffset();
+                const delta = tweet.getBoundingClientRect().top - offset;
+                if (isFinite(delta) && Math.abs(delta) > 1) window.scrollBy(0, delta);
             } catch (_) { /* ignore */ }
         });
         highlight(tweet);
-        markLanded();
+        markLanded(tweet);
         return finishWithCode('Jumped to tweet from ' + timeStr, code || 'pos:ok');
     }
 
@@ -2616,7 +2673,7 @@ function tpsInjectPageRealmScripts() {
                     tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 });
                 highlight(tweet);
-                markLanded();
+                markLanded(tweet);
                 log('Found near jump', saved.tweetId);
                 return finishPanel(`Jumped near tweet from ${timeStr}`);
             }
@@ -2669,7 +2726,7 @@ function tpsInjectPageRealmScripts() {
         restoring = true;
         userControlAfterLand = false;
         landedAwaitingUser = false;
-        stopManualScrollAnchor('restore-start');
+        cancelLandSettle('restore-start');
 
         const timeStr = formatTweetTime(saved.tweetTime);
         const wantJump = CONFIG.cursorJump && isHomeTimelinePath(saved.path || currentPath());
@@ -2780,7 +2837,7 @@ function tpsInjectPageRealmScripts() {
                             landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
                         });
                         highlight(landed);
-                        markLanded();
+                        markLanded(landed);
                         jumpLog('Jumped to', saved.tweetId);
                         const fb = readJumpResultCode() || 'merge:fallback(single)';
                         return finishWithCode('Jumped near tweet from ' + timeStr, fb);
@@ -2891,7 +2948,7 @@ function tpsInjectPageRealmScripts() {
                     tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
                 });
                 highlight(tweet);
-                markLanded();
+                markLanded(tweet);
                 log('Restored to', saved.tweetId);
                 return finishPanel(
                     jumpedNear
@@ -3402,8 +3459,12 @@ function tpsInjectPageRealmScripts() {
         const stop = panel.querySelector('button');
         if (stop) stop.remove();
         setTimeout(() => {
+            const y0 = TPS_DEBUG_SCROLL ? scrollTop() : 0;
             const p = document.getElementById(PANEL_ID);
             if (p) p.remove();
+            if (TPS_DEBUG_SCROLL) {
+                scrollLog('idle: panel-remove', 'y=', Math.round(y0), '→', Math.round(scrollTop()));
+            }
         }, 8000);
     }
 
