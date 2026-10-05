@@ -1024,7 +1024,61 @@ ringPush(r, 3, 'a'); ringPush(r, 3, 'b'); ringPush(r, 3, 'c'); ringPush(r, 3, 'd
 assert(r.join(',') === 'b,c,d', 'ring keeps last 3');
 
 
+
 console.log('info: v3.34 debug overlay tests done');
+
+// --- v3.38 scrollBy delta vs absolute guard ---
+const MID_FEED_Y = 280;
+const TOP_TARGET_Y = 140;
+const BIG_JUMP_PX = 350;
+
+function resolveScrollTargetY(fromY, top, isDelta) {
+  if (typeof top !== 'number' || !isFinite(top)) return null;
+  return isDelta ? (fromY + top) : top;
+}
+
+function shouldBlockJumpToAt(nextY, cur, allowed) {
+  if (typeof nextY !== 'number' || !isFinite(nextY) || allowed) return false;
+  if (cur < MID_FEED_Y) return false;
+  if (nextY < 0) return false;
+  if (nextY <= TOP_TARGET_Y) return true;
+  if (cur - nextY >= BIG_JUMP_PX && nextY < 800) return true;
+  return false;
+}
+
+function wouldBlockScrollBy(cur, delta, allowed) {
+  const nextY = resolveScrollTargetY(cur, delta, true);
+  if (nextY > TOP_TARGET_Y && Math.abs(nextY - cur) < BIG_JUMP_PX) return false;
+  return shouldBlockJumpToAt(nextY, cur, !!allowed);
+}
+
+function wouldBlockScrollTo(cur, absY, allowed) {
+  return shouldBlockJumpToAt(absY, cur, !!allowed);
+}
+
+const Y = 45000;
+// No gesture: small AbsolutePower-style corrections must pass
+assert(!wouldBlockScrollBy(Y, -313, false), 'scrollBy(0,-313) mid-feed allowed');
+assert(!wouldBlockScrollBy(Y, -313, false), 'scrollBy({top:-313}) same path');
+assert(
+  resolveScrollTargetY(Y, -313, true) === Y - 313,
+  'delta resolves to absolute from+delta'
+);
+assert(
+  resolveScrollTargetY(Y, -313, false) === -313,
+  'without isDelta, -313 would be wrong absolute (legacy bug)'
+);
+// Absolute jump to top blocked
+assert(wouldBlockScrollTo(Y, 0, false), 'scrollTo(0,0) blocked mid-feed');
+assert(shouldBlockJumpToAt(0, Y, false), 'scrollTop=0 blocked mid-feed');
+// Huge scrollBy that lands near top blocked
+assert(wouldBlockScrollBy(Y, -44900, false), 'scrollBy(0,-44900)→100 blocked');
+// Sanity: allowed window never blocks
+assert(!wouldBlockScrollBy(Y, -44900, true), 'allowed window permits large by');
+assert(!wouldBlockScrollTo(Y, 0, true), 'allowed window permits scrollTo top');
+
+console.log('info: v3.38 scrollBy delta guard tests done');
+
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);

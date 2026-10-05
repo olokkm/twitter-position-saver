@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.36
+// @version      3.38
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,13 +16,14 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.36';
+const TPS_VERSION = '3.38';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
 // page-hook.js (Gear/Chrome extension). Blocks X's jump-to-top while mid-feed
 // unless a recent user gesture or data-tps-allow-scroll window is active.
 // Optional on-screen overlay: localStorage tps_debug_scroll=1 or #tpsdebug.
+// v3.38: scrollBy deltas → absolute nextY (fixes iOS idle-normalize blocks).
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -134,7 +135,11 @@ function tpsInstallPageScrollGuard(globalObj) {
         const el = dbgEnsureOverlay();
         if (!el || !dbgRing) return;
         const now = dbgNow();
-        const lines = ['TPS dbg anchor=' + dbgAnchorSupports];
+        const y = Math.round(currentY());
+        const lines = [
+            'TPS dbg y=' + y + ' oa=' + dbgAnchorSupports +
+            (dbgLastBlk ? ' | LAST ' + dbgLastBlk : '')
+        ];
         for (let i = 0; i < dbgRing.length; i++) {
             const age = now - dbgRing[i].t;
             lines.push('-' + age + 'ms ' + dbgRing[i].line);
@@ -154,6 +159,8 @@ function tpsInstallPageScrollGuard(globalObj) {
         return null;
     }
 
+    let dbgLastBlk = '';
+
     function dbgLogWrite(kind, fromY, toY, blocked, ours) {
         if (!DEBUG) return;
         const who = ours ? ('us:' + ours) : 'X';
@@ -161,8 +168,11 @@ function tpsInstallPageScrollGuard(globalObj) {
             ? Math.round(toY - fromY) : '?';
         const fr = typeof fromY === 'number' ? Math.round(fromY) : '?';
         const to = typeof toY === 'number' ? Math.round(toY) : '?';
-        dbgPush((blocked ? 'BLK ' : 'WR  ') + kind + ' ' + who + ' ' + fr + '→' + to +
-            ' d=' + d);
+        // from→to is always the computed ABSOLUTE target (scrollBy already resolved).
+        const line = (blocked ? '!!! BLK ' : 'WR  ') + kind + ' ' + who + ' ' +
+            fr + '→' + to + ' d=' + d;
+        if (blocked) dbgLastBlk = line;
+        dbgPush(line);
     }
 
     const markGesture = () => {
@@ -266,10 +276,14 @@ function tpsInstallPageScrollGuard(globalObj) {
         }
     }
 
+    // nextY is always an ABSOLUTE document scroll position.
+    // For scrollBy, callers must pass currentY()+delta (see wrapScrollFn isDelta).
     function shouldBlockJumpTo(nextY) {
         if (typeof nextY !== 'number' || !isFinite(nextY) || isAllowed()) return false;
         const cur = currentY();
         if (cur < MID_FEED_Y) return false;
+        // Negative absolute Y is not a real jump target (likely a misread delta).
+        if (nextY < 0) return false;
         if (nextY <= TOP_TARGET_Y) return true;
         if (cur - nextY >= BIG_JUMP_PX && nextY < (g.innerHeight || 800)) return true;
         return false;
@@ -277,21 +291,35 @@ function tpsInstallPageScrollGuard(globalObj) {
 
     function parseScrollArgs(args) {
         if (args.length === 1 && args[0] && typeof args[0] === 'object') {
+            // scrollTo({top}) / scrollBy({top}) / scroll({top, behavior})
             return { left: args[0].left, top: args[0].top, opts: args[0] };
         }
         return { left: args[0], top: args[1], opts: null };
+    }
+
+    // Resolve the absolute Y a scroll write would land on.
+    // isDelta=true for scrollBy (window + Element): top is a DELTA, not absolute.
+    function resolveScrollTargetY(fromY, top, isDelta) {
+        if (typeof top !== 'number' || !isFinite(top)) return null;
+        return isDelta ? (fromY + top) : top;
     }
 
     function wrapScrollFn(kind, orig, isDelta) {
         return function (...args) {
             const from = currentY();
             const { top } = parseScrollArgs(args);
-            let nextY = null;
-            if (typeof top === 'number') {
-                nextY = isDelta ? (from + top) : top;
-            }
+            const nextY = resolveScrollTargetY(from, top, !!isDelta);
             const ours = isOurWrite();
-            const block = typeof nextY === 'number' && shouldBlockJumpTo(nextY);
+            // Small mid-feed relative corrections (AbsolutePower normalize) must pass.
+            let block = false;
+            if (typeof nextY === 'number') {
+                if (isDelta && nextY > TOP_TARGET_Y &&
+                    Math.abs(nextY - from) < BIG_JUMP_PX) {
+                    block = false;
+                } else {
+                    block = shouldBlockJumpTo(nextY);
+                }
+            }
             if (DEBUG) dbgLogWrite(kind, from, nextY, block, ours);
             if (block) return;
             return orig.apply(this, args);
@@ -302,6 +330,22 @@ function tpsInstallPageScrollGuard(globalObj) {
         g.scrollTo = wrapScrollFn('scrollTo', g.scrollTo.bind(g), false);
         g.scroll = wrapScrollFn('scroll', g.scroll.bind(g), false);
         g.scrollBy = wrapScrollFn('scrollBy', g.scrollBy.bind(g), true);
+    } catch (_) { /* ignore */ }
+
+    // AbsolutePower may scroll a DOM viewport via Element.scrollBy({top:delta}).
+    try {
+        if (g.Element && g.Element.prototype) {
+            const ep = g.Element.prototype;
+            if (typeof ep.scrollBy === 'function') {
+                ep.scrollBy = wrapScrollFn('el.scrollBy', ep.scrollBy, true);
+            }
+            if (typeof ep.scrollTo === 'function') {
+                ep.scrollTo = wrapScrollFn('el.scrollTo', ep.scrollTo, false);
+            }
+            if (typeof ep.scroll === 'function') {
+                ep.scroll = wrapScrollFn('el.scroll', ep.scroll, false);
+            }
+        }
     } catch (_) { /* ignore */ }
 
     try {
