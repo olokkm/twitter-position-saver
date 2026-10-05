@@ -943,7 +943,35 @@ class FakeMutationObserver {
   assert(result._test.isFinished(), 'finished after nonce attempt');
 }
 
+
 console.log('info: v3.31 bounded injection tests done');
+
+// --- v3.32 yank detection (pure) ---
+function isLikelyXYank(prevY, nextY, viewportH) {
+  const vh = viewportH > 0 ? viewportH : 800;
+  const topBand = Math.min(140, vh * 0.2);
+  const minPrev = vh * 1.5;
+  const minDelta = 250;
+  if (!(nextY < topBand)) return false;
+  if (!(prevY > minPrev)) return false;
+  if (!(prevY - nextY >= minDelta)) return false;
+  return true;
+}
+
+const vh = 844;
+// Gradual upward scroll into first screen — OLD bug would fire; NEW must not
+assert(!isLikelyXYank(900, 600, vh), 'mid upward 900→600 not a yank');
+assert(!isLikelyXYank(500, 200, vh), '500→200 still above deep threshold / topBand');
+assert(!isLikelyXYank(400, 100, vh), '400→100 prev not deep enough (need >1.5*vh)');
+// True yank: deep feed teleport to top
+assert(isLikelyXYank(3000, 40, vh), 'deep 3000→40 is yank');
+assert(isLikelyXYank(2000, 0, vh), 'deep 2000→0 is yank');
+// Small layout shift near mid — not yank
+assert(!isLikelyXYank(1500, 1400, vh), 'small mid shift not yank');
+assert(!isLikelyXYank(80, 20, vh), 'already-near-top shift not yank');
+
+console.log('info: v3.32 yank tests done');
+
 
 
 

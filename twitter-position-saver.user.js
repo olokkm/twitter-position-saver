@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.31
+// @version      3.32
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,11 +16,12 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.31';
+const TPS_VERSION = '3.32';
 
 /* TPS_SCROLL_GUARD_BEGIN */
-// Page-realm scroll block (Tampermonkey: unsafeWindow). Gear content scripts are
-// isolated, so on Gear we rely on yank detection/restore in the main script.
+// Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
+// page-hook.js (Gear/Chrome extension). Blocks X's jump-to-top while mid-feed
+// unless a recent user gesture or data-tps-allow-scroll window is active.
 function tpsInstallPageScrollGuard(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -1485,6 +1486,82 @@ function tpsInjectPageRealmScripts() {
         } catch (_) { /* ignore */ }
     }
 
+    // ---- Scroll debug / write helpers (tps_debug_scroll=1 or #tpsdebug) ----
+    function tpsDebugFlag(name) {
+        try {
+            if (localStorage.getItem(name) === '1') return true;
+        } catch (_) { /* ignore */ }
+        try {
+            const h = String(location.hash || '');
+            if (name === 'tps_debug_scroll' && /(?:^|[&#])tpsdebug(?:&|$)/.test(h)) return true;
+            if (name === 'tps_debug_noanchor' && /(?:^|[&#])tpsnoanchor(?:&|$)/.test(h)) return true;
+        } catch (_) { /* ignore */ }
+        return false;
+    }
+
+    const TPS_DEBUG_SCROLL = tpsDebugFlag('tps_debug_scroll');
+    const TPS_DEBUG_NOANCHOR = tpsDebugFlag('tps_debug_noanchor');
+    let tpsLastScrollWriter = 'none';
+    let tpsOurScrollUntil = 0;
+
+    function scrollLog() {
+        if (!TPS_DEBUG_SCROLL) return;
+        try {
+            const args = Array.prototype.slice.call(arguments);
+            args.unshift('[TPS scroll]');
+            console.log.apply(console, args);
+        } catch (_) { /* ignore */ }
+    }
+
+    function markOurScroll(reason, ms) {
+        tpsLastScrollWriter = String(reason || 'unknown');
+        tpsOurScrollUntil = Date.now() + (ms == null ? 80 : ms);
+        scrollLog('write', tpsLastScrollWriter);
+    }
+
+    // All TPS programmatic scroll writes should go through here.
+    function tpsScrollWrite(reason, fn) {
+        markOurScroll(reason, 100);
+        allowProgrammaticScroll(Math.max(400, (reason && reason.indexOf('land') >= 0) ? 800 : 600));
+        try { return fn(); } catch (e) {
+            scrollLog('write-error', reason, e && e.message);
+            return undefined;
+        }
+    }
+
+    // Pure: true when a scroll delta looks like X teleporting to the top, not a
+    // user scrolling up through the feed (or a small layout shift).
+    function isLikelyXYank(prevY, nextY, viewportH) {
+        const vh = viewportH > 0 ? viewportH : 800;
+        const topBand = Math.min(140, vh * 0.2);
+        const minPrev = vh * 1.5;
+        const minDelta = 250;
+        if (!(nextY < topBand)) return false;
+        if (!(prevY > minPrev)) return false;
+        if (!(prevY - nextY >= minDelta)) return false;
+        return true;
+    }
+
+    function applyDebugNoAnchorCss() {
+        if (!TPS_DEBUG_NOANCHOR) return;
+        try {
+            if (document.getElementById('tps-debug-noanchor')) return;
+            const s = document.createElement('style');
+            s.id = 'tps-debug-noanchor';
+            s.textContent = 'html, body, * { overflow-anchor: none !important; }';
+            (document.documentElement || document.head).appendChild(s);
+            scrollLog('noanchor css injected (Chrome≈iOS)');
+        } catch (_) { /* ignore */ }
+    }
+
+    function engineHasScrollAnchoring() {
+        try {
+            return typeof CSS !== 'undefined' && CSS.supports && CSS.supports('overflow-anchor', 'auto');
+        } catch (_) {
+            return false;
+        }
+    }
+
     const STORAGE_PREFIX = 'tps_';
 
     function gmGet(key) {
@@ -1995,6 +2072,8 @@ function tpsInjectPageRealmScripts() {
 
     // X sometimes yanks the timeline to the top when new tweets arrive. Distinguish
     // that from the user scrolling up (which should update the saved pin).
+    // v3.32: require teleport from DEEP feed to NEAR TOP — not any upward scroll
+    // that ends within one viewport (that false-fired while scrolling up on iOS).
     const USER_SCROLL_GRACE_MS = 800;
     const YANK_JUMP_PX = 250;
     let lastUserGestureAt = 0;
@@ -2002,6 +2081,15 @@ function tpsInjectPageRealmScripts() {
     let lastStableTweetId = null;
     let suppressSaves = false;
     let yankRestoreCooldownUntil = 0;
+    // After a successful land, first real user gesture disables our scroll writes
+    // (yank undo / manual anchoring) so we never fight upward reading.
+    let landedAwaitingUser = false;
+    let userControlAfterLand = false;
+    let touchActive = false;
+    let anchorObserver = null;
+    let anchorRaf = 0;
+    let anchorLastTopId = null;
+    let anchorLastTopOffset = 0;
 
     function abortRestore() {
         if (currentAbort) currentAbort.aborted = true;
@@ -2012,6 +2100,12 @@ function tpsInjectPageRealmScripts() {
         if (suppressSaves) {
             suppressSaves = false;
             log('User scroll — resume saving');
+        }
+        if (landedAwaitingUser) {
+            landedAwaitingUser = false;
+            userControlAfterLand = true;
+            stopManualScrollAnchor('user-gesture');
+            scrollLog('userControlAfterLand — no more yank-undo / anchor writes');
         }
     }
 
@@ -2033,36 +2127,70 @@ function tpsInjectPageRealmScripts() {
         if (top) lastStableTweetId = top.id;
     }
 
+    function markLanded() {
+        landedAwaitingUser = true;
+        userControlAfterLand = false;
+        rememberStablePosition();
+        if (!engineHasScrollAnchoring()) {
+            startManualScrollAnchor();
+        }
+        scrollLog('markLanded', 'y=', lastStableScrollY, 'tweet=', lastStableTweetId);
+    }
+
     function undoXYank() {
+        if (userControlAfterLand) {
+            scrollLog('yank-undo skipped (userControlAfterLand)');
+            return;
+        }
         suppressSaves = true;
         if (Date.now() < yankRestoreCooldownUntil) return;
         yankRestoreCooldownUntil = Date.now() + 1000;
         log('Blocked X auto-jump; restoring position');
-        allowProgrammaticScroll(1500);
+        scrollLog('yank-undo', 'to', lastStableTweetId || lastStableScrollY);
 
         const tweet = lastStableTweetId && findTweetById(lastStableTweetId);
         if (tweet) {
-            tweet.scrollIntoView({ block: 'start', behavior: 'auto' });
+            tpsScrollWrite('yank-undo-siv', function () {
+                tweet.scrollIntoView({ block: 'start', behavior: 'auto' });
+            });
         } else {
-            scrollRoot().scrollTop = lastStableScrollY;
-            window.scrollTo(0, lastStableScrollY);
+            const y = lastStableScrollY;
+            tpsScrollWrite('yank-undo-y', function () {
+                scrollRoot().scrollTop = y;
+                window.scrollTo(0, y);
+            });
         }
     }
 
     function onTimelineScroll() {
+        const y = scrollTop();
+        const prev = lastStableScrollY;
+
+        // Debug: large jumps not from our recent write and not from a gesture.
+        if (TPS_DEBUG_SCROLL) {
+            const dy = prev - y;
+            if (Math.abs(dy) > 40) {
+                const ours = Date.now() < tpsOurScrollUntil;
+                const gest = userRecentlyScrolled();
+                if (!ours && !gest) {
+                    scrollLog('jump', Math.round(dy) + 'px', 'y', Math.round(prev), '→', Math.round(y),
+                        'lastWriter=', tpsLastScrollWriter, 'touch=', touchActive);
+                }
+            }
+        }
+
         if (restoring) {
             rememberStablePosition();
             return;
         }
         if (!isTimelinePage() || !isOnTargetTab()) {
-            lastStableScrollY = scrollTop();
+            lastStableScrollY = y;
             return;
         }
 
-        const y = scrollTop();
-        const jumpedToTop = lastStableScrollY - y > YANK_JUMP_PX && y < window.innerHeight;
-
-        if (jumpedToTop && !userRecentlyScrolled()) {
+        const yank = isLikelyXYank(prev, y, window.innerHeight || 800);
+        if (yank && !userRecentlyScrolled() && !userControlAfterLand) {
+            scrollLog('yank-detect', 'prev', Math.round(prev), 'y', Math.round(y));
             undoXYank();
             return;
         }
@@ -2070,6 +2198,74 @@ function tpsInjectPageRealmScripts() {
         if (userRecentlyScrolled() || !suppressSaves) {
             rememberStablePosition();
         }
+    }
+
+    function captureAnchorSample() {
+        try {
+            const top = getTopTweet();
+            if (!top || !top.article) {
+                anchorLastTopId = null;
+                return;
+            }
+            anchorLastTopId = top.id;
+            anchorLastTopOffset = top.article.getBoundingClientRect().top;
+        } catch (_) {
+            anchorLastTopId = null;
+        }
+    }
+
+    function applyAnchorCorrection() {
+        anchorRaf = 0;
+        if (userControlAfterLand || touchActive || restoring) return;
+        if (!anchorLastTopId) return;
+        try {
+            const el = findTweetById(anchorLastTopId);
+            if (!el) return;
+            const nowTop = el.getBoundingClientRect().top;
+            const delta = nowTop - anchorLastTopOffset;
+            if (!isFinite(delta) || Math.abs(delta) < 2 || Math.abs(delta) > 2000) {
+                anchorLastTopOffset = nowTop;
+                return;
+            }
+            // Layout shifted the anchored tweet — correct without fighting touch/momentum.
+            tpsScrollWrite('manual-anchor', function () {
+                window.scrollBy(0, delta);
+            });
+            anchorLastTopOffset = el.getBoundingClientRect().top;
+            scrollLog('anchor-correct', Math.round(delta) + 'px', 'id', anchorLastTopId);
+        } catch (_) { /* ignore */ }
+    }
+
+    function startManualScrollAnchor() {
+        stopManualScrollAnchor('restart');
+        if (userControlAfterLand) return;
+        try {
+            const root = document.getElementById('react-root') || document.body || document.documentElement;
+            if (!root || typeof MutationObserver === 'undefined') return;
+            captureAnchorSample();
+            anchorObserver = new MutationObserver(function () {
+                if (userControlAfterLand || touchActive || restoring) return;
+                if (anchorRaf) return;
+                captureAnchorSample();
+                anchorRaf = window.requestAnimationFrame(applyAnchorCorrection);
+            });
+            anchorObserver.observe(root, { childList: true, subtree: true });
+            try { document.documentElement.setAttribute('data-tps-anchor', '1'); } catch (_) { /* ignore */ }
+            scrollLog('manual-anchor start');
+        } catch (_) { /* ignore */ }
+    }
+
+    function stopManualScrollAnchor(why) {
+        if (anchorObserver) {
+            try { anchorObserver.disconnect(); } catch (_) { /* ignore */ }
+            anchorObserver = null;
+        }
+        if (anchorRaf) {
+            try { window.cancelAnimationFrame(anchorRaf); } catch (_) { /* ignore */ }
+            anchorRaf = 0;
+        }
+        try { document.documentElement.removeAttribute('data-tps-anchor'); } catch (_) { /* ignore */ }
+        if (why) scrollLog('manual-anchor stop', why);
     }
 
     function savePosition() {
@@ -2211,17 +2407,19 @@ function tpsInjectPageRealmScripts() {
     }
 
     function landTweet(tweet, timeStr, code) {
-        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-        try {
-            tweet.scrollIntoView({ behavior: 'instant', block: 'start' });
-        } catch (_) {
-            try { tweet.scrollIntoView({ block: 'start' }); } catch (__) { /* ignore */ }
-        }
-        try {
-            const root = scrollRoot();
-            root.scrollTop = Math.max(0, root.scrollTop - 12);
-        } catch (_) { /* ignore */ }
+        tpsScrollWrite('land', function () {
+            try {
+                tweet.scrollIntoView({ behavior: 'instant', block: 'start' });
+            } catch (_) {
+                try { tweet.scrollIntoView({ block: 'start' }); } catch (__) { /* ignore */ }
+            }
+            try {
+                const root = scrollRoot();
+                root.scrollTop = Math.max(0, root.scrollTop - 12);
+            } catch (_) { /* ignore */ }
+        });
         highlight(tweet);
+        markLanded();
         return finishWithCode('Jumped to tweet from ' + timeStr, code || 'pos:ok');
     }
 
@@ -2260,13 +2458,13 @@ function tpsInjectPageRealmScripts() {
                 }
             }
 
-            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
             await paceStep(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
+            if (userControlAfterLand) return finishPanel('Stopped');
 
             const root = scrollRoot();
             const view = (window.innerHeight || 600) * 0.8;
-            try {
+            tpsScrollWrite(dirDown ? 'near-down' : 'near-up', function () {
                 if (dirDown) {
                     root.scrollTop = (root.scrollTop || 0) + view;
                     window.scrollBy(0, view);
@@ -2274,7 +2472,7 @@ function tpsInjectPageRealmScripts() {
                     root.scrollTop = Math.max(0, (root.scrollTop || 0) - view);
                     window.scrollBy(0, -view);
                 }
-            } catch (_) { /* ignore */ }
+            });
 
             updatePanel(
                 (dirDown ? 'Searching down' : 'Searching up') +
@@ -2378,9 +2576,10 @@ function tpsInjectPageRealmScripts() {
                 continue;
             }
 
-            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-            try { root.scrollTop = Math.max(0, scrollTarget); } catch (_) { /* ignore */ }
-            try { window.scrollTo(0, Math.max(0, scrollTarget)); } catch (_) { /* ignore */ }
+            tpsScrollWrite('pos-estimate', function () {
+                try { root.scrollTop = Math.max(0, scrollTarget); } catch (_) { /* ignore */ }
+                try { window.scrollTo(0, Math.max(0, scrollTarget)); } catch (_) { /* ignore */ }
+            });
 
             const waitMs = 150 + Math.min(iter * 12, 100);
             await sleep(waitMs);
@@ -2413,9 +2612,11 @@ function tpsInjectPageRealmScripts() {
         for (let attempt = 1; attempt <= maxSteps && !ctrl.aborted; attempt++) {
             const tweet = findTweetById(saved.tweetId);
             if (tweet) {
-                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-                tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                tpsScrollWrite('land-near', function () {
+                    tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                });
                 highlight(tweet);
+                markLanded();
                 log('Found near jump', saved.tweetId);
                 return finishPanel(`Jumped near tweet from ${timeStr}`);
             }
@@ -2466,6 +2667,9 @@ function tpsInjectPageRealmScripts() {
         const ctrl = { aborted: false };
         currentAbort = ctrl;
         restoring = true;
+        userControlAfterLand = false;
+        landedAwaitingUser = false;
+        stopManualScrollAnchor('restore-start');
 
         const timeStr = formatTweetTime(saved.tweetTime);
         const wantJump = CONFIG.cursorJump && isHomeTimelinePath(saved.path || currentPath());
@@ -2572,9 +2776,11 @@ function tpsInjectPageRealmScripts() {
                     }
                     const landed = findTweetById(saved.tweetId);
                     if (landed) {
-                        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-                        landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        tpsScrollWrite('land-fallback', function () {
+                            landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                        });
                         highlight(landed);
+                        markLanded();
                         jumpLog('Jumped to', saved.tweetId);
                         const fb = readJumpResultCode() || 'merge:fallback(single)';
                         return finishWithCode('Jumped near tweet from ' + timeStr, fb);
@@ -2591,9 +2797,10 @@ function tpsInjectPageRealmScripts() {
 
             // Never scroll from top after a successful merge (handled above by return).
             if (!jumpedNear && !mergeSucceeded) {
-                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 5000);
-                scrollRoot().scrollTop = 0;
-                window.scrollTo(0, 0);
+                tpsScrollWrite('search-top', function () {
+                    scrollRoot().scrollTop = 0;
+                    window.scrollTo(0, 0);
+                });
                 await waitForContentToSettle(ctrl);
                 if (ctrl.aborted) return finishPanel('Stopped');
             }
@@ -2680,8 +2887,11 @@ function tpsInjectPageRealmScripts() {
                     }
                 }
 
-                tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                tpsScrollWrite('land-search', function () {
+                    tweet.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                });
                 highlight(tweet);
+                markLanded();
                 log('Restored to', saved.tweetId);
                 return finishPanel(
                     jumpedNear
@@ -3273,11 +3483,18 @@ function tpsInjectPageRealmScripts() {
 
         // Touch/wheel/pointer mark real user scrolling; plain "scroll" also fires for X yanks.
         window.addEventListener('wheel', noteUserScroll, { passive: true });
-        window.addEventListener('touchstart', noteUserGesture, { passive: true });
+        window.addEventListener('touchstart', function () {
+            touchActive = true;
+            noteUserGesture();
+        }, { passive: true });
         window.addEventListener('touchmove', noteUserScroll, { passive: true });
+        window.addEventListener('touchend', function () { touchActive = false; }, { passive: true });
+        window.addEventListener('touchcancel', function () { touchActive = false; }, { passive: true });
         // Taps on "Show new posts" (etc.) count as intentional jump-to-top.
         window.addEventListener('pointerdown', noteUserGesture, { passive: true });
         window.addEventListener('scroll', onTimelineScroll, { passive: true });
+        applyDebugNoAnchorCss();
+        if (TPS_DEBUG_SCROLL) scrollLog('debug on', 'noanchor=', TPS_DEBUG_NOANCHOR);
 
         // X is an SPA — document load only happens once, so watch History API navigations.
         const notify = () => onPathChange();
