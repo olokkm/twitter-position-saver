@@ -25,6 +25,15 @@ function writeVersion(version) {
     throw new Error('No @version found in userscript');
   }
   src = src.replace(/\/\/\s*@version\s+\d+(?:\.\d+)+/, `// @version      ${version}`);
+  if (/const TPS_VERSION = '[^']*'/.test(src)) {
+    src = src.replace(/const TPS_VERSION = '[^']*'/, `const TPS_VERSION = '${version}'`);
+  } else {
+    // Insert after userscript header if missing.
+    src = src.replace(
+      /(\/\/ ==\/UserScript==\n\n)/,
+      `$1const TPS_VERSION = '${version}';\n\n`
+    );
+  }
   fs.writeFileSync(userscriptPath, src);
 
   const manifest = JSON.parse(fs.readFileSync(manifestPath, 'utf8'));
