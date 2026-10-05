@@ -1024,41 +1024,7 @@ ringPush(r, 3, 'a'); ringPush(r, 3, 'b'); ringPush(r, 3, 'c'); ringPush(r, 3, 'd
 assert(r.join(',') === 'b,c,d', 'ring keeps last 3');
 
 
-
 console.log('info: v3.34 debug overlay tests done');
-
-// --- v3.37 AbsolutePower bridge helpers ---
-function xapEntryIdCandidates(tweetId) {
-  const id = String(tweetId || '');
-  if (!id) return [];
-  return ['tweet-' + id, id, 'tweet-' + id + '-conversation', 'home-conversation-' + id];
-}
-
-function xapOverscanSlice(slice, boostPosts, listLen) {
-  const boost = Math.max(0, boostPosts | 0);
-  if (!slice || boost <= 0) return slice;
-  const start = Math.max(0, slice.start - boost);
-  const end = Math.min(listLen == null ? slice.end : listLen, slice.end);
-  return { start, end };
-}
-
-function xapResultIsOk(code) {
-  return /^xanchor:ok/.test(String(code || ''));
-}
-
-const ids = xapEntryIdCandidates('12345');
-assert(ids[0] === 'tweet-12345', 'primary entryId form');
-assert(ids.includes('12345'), 'raw id candidate');
-assert(xapOverscanSlice({ start: 40, end: 50 }, 30, 100).start === 10, 'boost extends upward');
-assert(xapOverscanSlice({ start: 5, end: 20 }, 30, 100).start === 0, 'boost clamps at 0');
-assert(xapOverscanSlice({ start: 10, end: 20 }, 0, 100).start === 10, 'zero boost no-op');
-assert(xapResultIsOk('xanchor:ok;overscan:ok n=12'), 'ok result');
-assert(xapResultIsOk('xanchor:ok-inject;overscan:miss(none) n=0'), 'ok-inject');
-assert(!xapResultIsOk('xanchor:miss(no-scroller-shape)'), 'miss not ok');
-assert(!xapResultIsOk(''), 'empty not ok');
-
-console.log('info: v3.37 xap bridge tests done');
-
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);

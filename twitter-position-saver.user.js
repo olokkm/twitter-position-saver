@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.37
+// @version      3.36
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.37';
+const TPS_VERSION = '3.36';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -380,404 +380,6 @@ function tpsInstallPageScrollGuard(globalObj) {
     }
 }
 /* TPS_SCROLL_GUARD_END */
-
-
-/* TPS_XAP_BRIDGE_BEGIN */
-// AbsolutePower bridge (page realm). Hooks window.scroller (X leaves this debug
-// assignment on the virtual list). Boosts render-window ABOVE the viewport so
-// heights are measured while idle, then lands via scroller scroll math instead
-// of DOM scrollIntoView. Cross-world arming: data-tps-xap / data-tps-xap-result.
-function tpsInstallAbsolutePowerBridge(globalObj) {
-    'use strict';
-    const g = globalObj || (typeof window !== 'undefined' ? window : null);
-    if (!g || g.__tpsXapBridgeInstalled) return;
-    g.__tpsXapBridgeInstalled = true;
-
-    const ATTR_CMD = 'data-tps-xap';
-    const ATTR_RESULT = 'data-tps-xap-result';
-    const ATTR_HAVE = 'data-tps-xap-scroller';
-
-    let patched = null; // { scroller, origGet, boostPosts, boostUntil, entryId }
-    let pollTimer = 0;
-
-    function docEl() {
-        try { return g.document && g.document.documentElement; } catch (_) { return null; }
-    }
-
-    function setResult(code) {
-        try {
-            const el = docEl();
-            if (el) el.setAttribute(ATTR_RESULT, String(code || ''));
-        } catch (_) { /* ignore */ }
-        try {
-            if (g.console && g.console.log) g.console.log('[TPS xap]', code);
-        } catch (_) { /* ignore */ }
-    }
-
-    function readCmd() {
-        try {
-            const el = docEl();
-            const raw = el && el.getAttribute(ATTR_CMD);
-            if (!raw) return null;
-            return JSON.parse(raw);
-        } catch (_) {
-            return null;
-        }
-    }
-
-    function clearCmd() {
-        try {
-            const el = docEl();
-            if (el) el.removeAttribute(ATTR_CMD);
-        } catch (_) { /* ignore */ }
-    }
-
-    function entryIdCandidates(tweetId) {
-        const id = String(tweetId || '');
-        if (!id) return [];
-        return [
-            'tweet-' + id,
-            id,
-            'tweet-' + id + '-conversation',
-            'home-conversation-' + id
-        ];
-    }
-
-    function looksLikeScroller(s) {
-        return !!(s && typeof s === 'object' &&
-            typeof s._getRenderCandidates === 'function' &&
-            typeof s._getDistanceFromTop === 'function' &&
-            s._heights && typeof s._heights.get === 'function' &&
-            s._viewport);
-    }
-
-    function resolveEntryId(scroller, tweetId) {
-        const cands = entryIdCandidates(tweetId);
-        const list = scroller.props && scroller.props.list;
-        if (list && list.length) {
-            for (let i = 0; i < cands.length; i++) {
-                for (let j = 0; j < list.length; j++) {
-                    if (list[j] && list[j].id === cands[i]) return cands[i];
-                }
-            }
-            // fuzzy: id contains tweet snowflake
-            for (let j = 0; j < list.length; j++) {
-                const lid = list[j] && list[j].id;
-                if (lid && String(lid).indexOf(String(tweetId)) >= 0) return lid;
-            }
-        }
-        return cands[0] || null;
-    }
-
-    function countMountedAbove(entryId) {
-        try {
-            const articles = g.document.querySelectorAll('article[data-testid="tweet"]');
-            let targetTop = null;
-            const tops = [];
-            for (let i = 0; i < articles.length; i++) {
-                const a = articles[i];
-                const hrefs = a.querySelectorAll('a[href*="/status/"]');
-                let tid = '';
-                for (let h = 0; h < hrefs.length; h++) {
-                    const m = String(hrefs[h].getAttribute('href') || '').match(/\/status\/(\d+)/);
-                    if (m) { tid = m[1]; break; }
-                }
-                const r = a.getBoundingClientRect();
-                tops.push({ tid: tid, top: r.top });
-                if (entryId && tid && entryId.indexOf(tid) >= 0) targetTop = r.top;
-            }
-            if (targetTop == null) return articles.length;
-            let n = 0;
-            for (let i = 0; i < tops.length; i++) {
-                if (tops[i].top < targetTop - 2) n++;
-            }
-            return n;
-        } catch (_) {
-            return 0;
-        }
-    }
-
-    function allowScroll(ms) {
-        const until = Date.now() + (ms == null ? 4000 : ms);
-        try { g.__tpsAllowScrollUntil = until; } catch (_) { /* ignore */ }
-        try {
-            const el = docEl();
-            if (el) el.setAttribute('data-tps-allow-scroll', String(until));
-        } catch (_) { /* ignore */ }
-    }
-
-    function patchOverscan(scroller, boostPosts) {
-        if (!looksLikeScroller(scroller)) return false;
-        if (patched && patched.scroller === scroller && patched.origGet) {
-            patched.boostPosts = boostPosts;
-            return true;
-        }
-        const origGet = scroller._getRenderCandidates;
-        scroller._getRenderCandidates = function (anchor, viewportRect) {
-            const r = origGet.call(this, anchor, viewportRect);
-            const boost = (patched && patched.boostPosts) || 0;
-            const until = patched && patched.boostUntil;
-            if (!boost || !until || Date.now() > until) return r;
-            if (!r || !r.allItemsWithPositions || !r.slice) return r;
-            const start = Math.max(0, r.slice.start - boost);
-            if (start >= r.slice.start) return r;
-            const slice = { start: start, end: r.slice.end };
-            const items = r.allItemsWithPositions.slice(slice.start, slice.end);
-            return {
-                allItemsWithPositions: r.allItemsWithPositions,
-                newRenderedItems: items,
-                slice: slice,
-                arePreferredItemsRendered: true
-            };
-        };
-        patched = {
-            scroller: scroller,
-            origGet: origGet,
-            boostPosts: boostPosts,
-            boostUntil: 0,
-            entryId: null
-        };
-        return true;
-    }
-
-    function unboost() {
-        if (!patched) return;
-        patched.boostPosts = 0;
-        patched.boostUntil = 0;
-        try {
-            const s = patched.scroller;
-            if (s && typeof s._scheduleCriticalUpdate === 'function') s._scheduleCriticalUpdate();
-            else if (s && typeof s._update === 'function') s._update();
-        } catch (_) { /* ignore */ }
-    }
-
-    function injectInitialAnchor(scroller, entryId, dist) {
-        // Prefer Anchor type (scrollBy correction) with distanceToViewportTop.
-        const anchor = {
-            type: 'anchor',
-            anchor: {
-                id: entryId,
-                distanceToViewportTop: dist,
-                wasFocused: true
-            }
-        };
-        const focused = { type: 'focusedItem', itemId: entryId };
-        let ok = false;
-        try {
-            const p = scroller.props;
-            try {
-                Object.defineProperty(p, 'initialAnchor', {
-                    value: anchor,
-                    configurable: true,
-                    enumerable: true,
-                    writable: true
-                });
-                ok = true;
-            } catch (_) {
-                try { p.initialAnchor = anchor; ok = true; } catch (__) { /* ignore */ }
-            }
-        } catch (_) { /* ignore */ }
-
-        // Wrap didMount once so late prop freeze still sees our anchor.
-        if (!scroller.__tpsXapMountWrapped && typeof scroller.componentDidMount === 'function') {
-            const orig = scroller.componentDidMount;
-            scroller.componentDidMount = function () {
-                try {
-                    const p = this.props;
-                    try {
-                        Object.defineProperty(p, 'initialAnchor', {
-                            value: anchor,
-                            configurable: true,
-                            enumerable: true,
-                            writable: true
-                        });
-                    } catch (_) {
-                        try { p.initialAnchor = focused; } catch (__) { /* ignore */ }
-                    }
-                } catch (_) { /* ignore */ }
-                return orig.apply(this, arguments);
-            };
-            scroller.__tpsXapMountWrapped = true;
-            ok = true;
-        }
-        return ok;
-    }
-
-    function landViaScroller(scroller, entryId, headerOffset) {
-        allowScroll(5000);
-        const dist = scroller._getDistanceFromTop(entryId);
-        if (!isFinite(dist)) return false;
-        const y = Math.max(0, dist - (headerOffset || 0));
-        try {
-            if (scroller._viewport && typeof scroller._viewport.scrollTo === 'function') {
-                // WindowViewport: scrollTo(scrollX, scrollY)
-                scroller._viewport.scrollTo(0, y);
-            } else if (scroller._viewport && typeof scroller._viewport.scrollBy === 'function') {
-                const cur = typeof scroller._viewport.scrollY === 'function'
-                    ? scroller._viewport.scrollY()
-                    : (g.scrollY || 0);
-                scroller._viewport.scrollBy(y - cur);
-            } else {
-                g.scrollTo(0, y);
-            }
-        } catch (_) {
-            try { g.scrollTo(0, y); } catch (__) { return false; }
-        }
-        try {
-            if (typeof scroller._update === 'function') scroller._update();
-            else if (typeof scroller._scheduleCriticalUpdate === 'function') scroller._scheduleCriticalUpdate();
-        } catch (_) { /* ignore */ }
-        try {
-            if (typeof scroller._updateFocusToItem === 'function' &&
-                scroller._cells && scroller._cells.get(entryId)) {
-                scroller._updateFocusToItem(entryId, { block: 'start' });
-            }
-        } catch (_) { /* ignore */ }
-        return true;
-    }
-
-    function kickUpdate(scroller) {
-        try {
-            scroller._isIdle = true;
-            if (typeof scroller._scheduleCriticalUpdate === 'function') scroller._scheduleCriticalUpdate();
-            else if (typeof scroller._update === 'function') scroller._update();
-        } catch (_) { /* ignore */ }
-    }
-
-    function runCommand(cmd, scroller) {
-        if (!cmd || !cmd.op) return;
-        if (!looksLikeScroller(scroller)) {
-            setResult('xanchor:miss(no-scroller-shape)');
-            return;
-        }
-        if (!patchOverscan(scroller, 0)) {
-            setResult('xanchor:miss(patch-fail)');
-            return;
-        }
-
-        const tweetId = cmd.tweetId;
-        const headerOffset = Number(cmd.headerOffset) || 0;
-        const boostPosts = Math.max(0, Math.min(60, Number(cmd.boostPosts) || 30));
-        const boostMs = Math.max(400, Math.min(8000, Number(cmd.boostMs) || 2200));
-        const entryId = resolveEntryId(scroller, tweetId);
-        if (!entryId) {
-            setResult('xanchor:miss(no-entry)');
-            return;
-        }
-        patched.entryId = entryId;
-
-        // Try initialAnchor injection (helps on fresh mount).
-        const injected = injectInitialAnchor(scroller, entryId, headerOffset);
-
-        // Active land via AbsolutePower scroll math (works on already-mounted scroller).
-        const landed = landViaScroller(scroller, entryId, headerOffset);
-        if (!landed && !injected) {
-            setResult('xanchor:miss(land-fail)');
-            return;
-        }
-
-        // Boost overscan ABOVE while idle so ResizeObserver fills _heights.
-        patched.boostPosts = boostPosts;
-        patched.boostUntil = Date.now() + boostMs;
-        kickUpdate(scroller);
-
-        // Give AbsolutePower a few idle update turns to measure + normalize.
-        let steps = 0;
-        const maxSteps = Math.max(4, Math.ceil(boostMs / 250));
-        const tick = function () {
-            steps++;
-            kickUpdate(scroller);
-            const above = countMountedAbove(entryId);
-            if (steps >= maxSteps || Date.now() >= patched.boostUntil) {
-                unboost();
-                kickUpdate(scroller);
-                const why = landed ? 'ok' : 'ok-inject';
-                setResult(
-                    'xanchor:' + why +
-                    ';overscan:' + (above > 0 ? 'ok' : 'miss(none)') +
-                    ' n=' + above +
-                    (injected ? ';inject=1' : '')
-                );
-                clearCmd();
-                return;
-            }
-            g.setTimeout(tick, 250);
-        };
-        setResult('xanchor:pending;overscan:boost posts=' + boostPosts);
-        g.setTimeout(tick, 120);
-    }
-
-    function onScroller(scroller) {
-        try {
-            const el = docEl();
-            if (el) el.setAttribute(ATTR_HAVE, '1');
-        } catch (_) { /* ignore */ }
-        const cmd = readCmd();
-        if (cmd && cmd.op === 'land') runCommand(cmd, scroller);
-        else if (cmd && cmd.op === 'arm') {
-            // Prepare patch; land arrives later.
-            patchOverscan(scroller, 0);
-            if (cmd.tweetId) {
-                const eid = resolveEntryId(scroller, cmd.tweetId);
-                if (eid) injectInitialAnchor(scroller, eid, Number(cmd.headerOffset) || 0);
-            }
-            setResult('xanchor:armed');
-        }
-    }
-
-    // Intercept window.scroller writes (AbsolutePower constructor assigns it).
-    try {
-        const desc = Object.getOwnPropertyDescriptor(g, 'scroller');
-        if (!desc || desc.configurable) {
-            let cur = g.scroller;
-            Object.defineProperty(g, 'scroller', {
-                configurable: true,
-                enumerable: true,
-                get: function () { return cur; },
-                set: function (v) {
-                    cur = v;
-                    if (looksLikeScroller(v)) onScroller(v);
-                }
-            });
-            if (looksLikeScroller(cur)) onScroller(cur);
-        } else if (looksLikeScroller(g.scroller)) {
-            onScroller(g.scroller);
-        }
-    } catch (_) {
-        setResult('xanchor:miss(scroller-hook)');
-    }
-
-    // Poll for commands when scroller already exists (arm after mount).
-    function pollCmd() {
-        pollTimer = 0;
-        const cmd = readCmd();
-        if (!cmd) return;
-        const s = g.scroller;
-        if (looksLikeScroller(s)) runCommand(cmd, s);
-        else setResult('xanchor:miss(waiting-scroller)');
-    }
-
-    try {
-        const el = docEl();
-        if (el && g.MutationObserver) {
-            const mo = new g.MutationObserver(function (muts) {
-                for (let i = 0; i < muts.length; i++) {
-                    if (muts[i].attributeName === ATTR_CMD) {
-                        if (!pollTimer) pollTimer = g.setTimeout(pollCmd, 0);
-                    }
-                }
-            });
-            mo.observe(el, { attributes: true, attributeFilter: [ATTR_CMD] });
-        }
-    } catch (_) { /* ignore */ }
-
-    // Expose tiny test helpers on the page (non-enumerable).
-    try {
-        g.__tpsXapEntryIds = entryIdCandidates;
-        g.__tpsXapLooksLike = looksLikeScroller;
-    } catch (_) { /* ignore */ }
-}
-/* TPS_XAP_BRIDGE_END */
 
 /* TPS_JUMP_HOOK_BEGIN */
 // Page-realm fetch/XHR rewrite (Tampermonkey: unsafeWindow; Gear: injected <script>).
@@ -2023,7 +1625,6 @@ function tpsInjectPageRealmScripts() {
     function buildInlineCode() {
         return [
             '(' + tpsInstallPageScrollGuard.toString() + ')(window);',
-            '(' + tpsInstallAbsolutePowerBridge.toString() + ')(window);',
             '(' + tpsInstallPageJumpHook.toString() + ')(window,"injected",' + JSON.stringify(ver) + ');'
         ].join('\n');
     }
@@ -2046,7 +1647,6 @@ function tpsInjectPageRealmScripts() {
     try {
         if (typeof unsafeWindow !== 'undefined') {
             tpsInstallPageScrollGuard(unsafeWindow);
-            tpsInstallAbsolutePowerBridge(unsafeWindow);
             tpsInstallPageJumpHook(unsafeWindow, 'tm', TPS_VERSION);
         } else {
             // Extension isolated world: bounded WAR / nonce fallbacks (MAIN world
@@ -2057,7 +1657,6 @@ function tpsInjectPageRealmScripts() {
     try {
         // Best-effort local install. Skips if a page-realm hook is already marked.
         tpsInstallPageScrollGuard(window);
-        tpsInstallAbsolutePowerBridge(window);
         tpsInstallPageJumpHook(window, 'local', TPS_VERSION);
     } catch (_) { /* ignore */ }
 
@@ -2097,10 +1696,6 @@ function tpsInjectPageRealmScripts() {
         // Merged jump: chain head→Bottom pages until saved pos (+1 page), deliver one response.
         jumpMerge: true,
         jumpMergeMaxPages: 12,     // ~1200 posts; if target not reached → v3.28 fallback
-        // AbsolutePower land + temporary above-overscan measure (v3.37)
-        xAnchorLand: true,
-        overscanBoostPosts: 30,    // extend render slice upward by N items while idle
-        overscanBoostMs: 2200,
     };
 
     const DEBUG = false;
@@ -3096,89 +2691,6 @@ function tpsInjectPageRealmScripts() {
     }
 
 
-
-    function xapEntryIdCandidates(tweetId) {
-        const id = String(tweetId || '');
-        if (!id) return [];
-        return ['tweet-' + id, id, 'tweet-' + id + '-conversation', 'home-conversation-' + id];
-    }
-
-    function armXapLand(saved, headerOffset) {
-        if (CONFIG.xAnchorLand === false) return false;
-        try {
-            const payload = {
-                op: 'land',
-                tweetId: String(saved.tweetId),
-                headerOffset: headerOffset == null ? stickyHeaderOffset() : headerOffset,
-                boostPosts: CONFIG.overscanBoostPosts == null ? 30 : CONFIG.overscanBoostPosts,
-                boostMs: CONFIG.overscanBoostMs == null ? 2200 : CONFIG.overscanBoostMs
-            };
-            document.documentElement.setAttribute('data-tps-xap', JSON.stringify(payload));
-            document.documentElement.removeAttribute('data-tps-xap-result');
-            return true;
-        } catch (_) {
-            return false;
-        }
-    }
-
-    function readXapResult() {
-        try {
-            return document.documentElement.getAttribute('data-tps-xap-result') || '';
-        } catch (_) {
-            return '';
-        }
-    }
-
-    function xapResultIsOk(code) {
-        return /^xanchor:ok/.test(String(code || ''));
-    }
-
-    async function waitForXapResult(ctrl, maxMs) {
-        const limit = maxMs == null ? 4000 : maxMs;
-        const t0 = Date.now();
-        while (Date.now() - t0 < limit) {
-            if (ctrl && ctrl.aborted) return readXapResult();
-            const r = readXapResult();
-            if (r && r.indexOf('xanchor:pending') < 0 && r.indexOf('xanchor:armed') < 0 &&
-                r.indexOf('waiting-scroller') < 0) {
-                return r;
-            }
-            await sleep(80);
-        }
-        return readXapResult() || 'xanchor:miss(timeout)';
-    }
-
-    // Try AbsolutePower land + overscan boost; returns finishPanel result or null to fallback.
-    async function tryXapLand(saved, ctrl, timeStr, codePrefix) {
-        if (CONFIG.xAnchorLand === false) return null;
-        if (!armXapLand(saved)) return null;
-        updatePanel('X-anchor land… [' + (codePrefix || 'xap') + ']');
-        allowProgrammaticScroll((CONFIG.overscanBoostMs || 2200) + 3000);
-        const result = await waitForXapResult(ctrl, (CONFIG.overscanBoostMs || 2200) + 2500);
-        jumpLog('xap result', result);
-        if (ctrl && ctrl.aborted) return finishPanel('Stopped');
-        if (!xapResultIsOk(result)) {
-            updatePanel('X-anchor miss — fallback… [' + result + ']');
-            return null;
-        }
-        let tweet = findTweetById(saved.tweetId);
-        for (let i = 0; i < 15 && !tweet && !(ctrl && ctrl.aborted); i++) {
-            await sleep(80);
-            tweet = findTweetById(saved.tweetId);
-        }
-        if (!tweet) {
-            jumpLog('xap ok but tweet DOM missing — fallback');
-            return null;
-        }
-        alignTweetBelowHeader(tweet, 'xap-align');
-        highlight(tweet);
-        markLanded(tweet);
-        return finishWithCode(
-            'Jumped to tweet from ' + timeStr,
-            (codePrefix || 'pos:ok') + ';' + result
-        );
-    }
-
     function landTweet(tweet, timeStr, code) {
         tpsScrollWrite('land', function () {
             try {
@@ -3305,11 +2817,7 @@ function tpsInjectPageRealmScripts() {
                 if (ctrl.aborted) return finishPanel('Stopped');
                 if (userControlAfterLand) return finishPanel('Stopped');
                 const again = findTweetById(saved.tweetId) || landed;
-                {
-                    const xap = await tryXapLand(saved, ctrl, timeStr, 'pos:ok');
-                    if (xap) return xap;
-                    return landTweet(again, timeStr, 'pos:ok;xanchor:fallback');
-                }
+                return landTweet(again, timeStr, 'pos:ok');
             }
 
             const root = scrollRoot();
@@ -3377,11 +2885,7 @@ function tpsInjectPageRealmScripts() {
             if (ctrl.aborted) return finishPanel('Stopped');
             if (userControlAfterLand) return finishPanel('Stopped');
             const again = findTweetById(saved.tweetId) || last;
-            {
-                const xap = await tryXapLand(saved, ctrl, timeStr, 'pos:ok');
-                if (xap) return xap;
-                return landTweet(again, timeStr, 'pos:ok;xanchor:fallback');
-            }
+            return landTweet(again, timeStr, 'pos:ok');
         }
 
         jumpLog('positionMergedJump estimate missed — order near-search');
