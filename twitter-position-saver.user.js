@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.30
+// @version      3.31
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.30';
+const TPS_VERSION = '3.31';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block (Tampermonkey: unsafeWindow). Gear content scripts are
@@ -174,14 +174,15 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     const realm = realmHint || 'local';
     const ver = versionHint || '0';
 
-    // Prefer page realm (tm / injected) over a content-script-local install.
+    // Prefer page realm (main / war / injected / tm) over content-script-local.
     // Same-realm double-patch is blocked by __tpsJumpHookInstalled.
     try {
         const existing = g.document && g.document.documentElement &&
             g.document.documentElement.getAttribute('data-tps-hook');
         if (existing) {
             const er = String(existing).split('|')[1] || '';
-            if (realm === 'local' && (er === 'tm' || er === 'injected')) return;
+            const pageRealms = { main: 1, war: 1, injected: 1, tm: 1 };
+            if (realm === 'local' && pageRealms[er]) return;
             if (er === realm && g.__tpsJumpHookInstalled) return;
         }
     } catch (_) { /* ignore */ }
@@ -1123,135 +1124,294 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
 /* TPS_JUMP_HOOK_END */
 
 
-// Gear (isolated world): inject page-realm hooks as a real <script> with the
-// page CSP nonce. Tampermonkey uses unsafeWindow instead and skips this.
-function tpsInjectPageRealmScripts() {
-    'use strict';
-    if (typeof document === 'undefined') return;
+// Gear / extension (isolated world): bounded page-realm injection.
+// Primary path on Chrome/Firefox is a separate MAIN-world content script
+// (page-hook.js). Fallbacks here: extension WAR <script src> once, then
+// nonce-inline once. Never blob:, never unbounded MutationObserver loops.
+function tpsPageHookRealmsRe() {
+    return /\|(main|war|injected|tm)$/;
+}
 
-    const ver = typeof TPS_VERSION !== 'undefined' ? TPS_VERSION : '0';
-    const code = [
-        '(' + tpsInstallPageScrollGuard.toString() + ')(window);',
-        '(' + tpsInstallPageJumpHook.toString() + ')(window,"injected",' + JSON.stringify(ver) + ');'
-    ].join('\n');
+function tpsPageHookPresent(doc) {
+    try {
+        const d = doc || document;
+        const v = d.documentElement.getAttribute('data-tps-hook') || '';
+        return tpsPageHookRealmsRe().test(v);
+    } catch (_) {
+        return false;
+    }
+}
 
-    function pageHookPresent() {
+function tpsFindCspNonce(doc) {
+    const d = doc || document;
+    try {
+        const scripts = d.querySelectorAll('script[nonce]');
+        for (let i = 0; i < scripts.length; i++) {
+            let n = null;
+            try { n = scripts[i].nonce; } catch (_) { /* ignore */ }
+            if (!n) {
+                try { n = scripts[i].getAttribute('nonce'); } catch (_) { /* ignore */ }
+            }
+            if (n) return n;
+        }
+    } catch (_) { /* ignore */ }
+    try {
+        const all = d.querySelectorAll('[nonce]');
+        for (let i = 0; i < all.length; i++) {
+            let n = null;
+            try { n = all[i].nonce; } catch (_) { /* ignore */ }
+            if (!n) {
+                try { n = all[i].getAttribute('nonce'); } catch (_) { /* ignore */ }
+            }
+            if (n) return n;
+        }
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+function tpsGetExtensionPageHookUrl() {
+    try {
+        if (typeof chrome !== 'undefined' && chrome.runtime && typeof chrome.runtime.getURL === 'function') {
+            return chrome.runtime.getURL('page-hook.js');
+        }
+    } catch (_) { /* ignore */ }
+    try {
+        if (typeof browser !== 'undefined' && browser.runtime && typeof browser.runtime.getURL === 'function') {
+            return browser.runtime.getURL('page-hook.js');
+        }
+    } catch (_) { /* ignore */ }
+    return null;
+}
+
+// Pure-ish orchestrator for tests: each method at most once; observer cannot loop.
+// opts: { document, getWarUrl, buildInlineCode, findNonce, pageHookPresent, markAttemptedAttr }
+function tpsRunBoundedPageInject(opts) {
+    const doc = opts.document;
+    if (!doc || !doc.documentElement) {
+        return { appended: 0, attempted: {}, present: false, _test: { getObserverTicks: function () { return 0; }, isFinished: function () { return true; } } };
+    }
+    const attemptedAttr = opts.markAttemptedAttr || 'data-tps-inject-attempted';
+    if (doc.documentElement.getAttribute(attemptedAttr) === '1') {
+        return {
+            appended: 0,
+            attempted: { already: true },
+            present: !!(opts.pageHookPresent && opts.pageHookPresent(doc)),
+            _test: { getObserverTicks: function () { return 0; }, isFinished: function () { return true; } }
+        };
+    }
+    try { doc.documentElement.setAttribute(attemptedAttr, '1'); } catch (_) { /* ignore */ }
+
+    const attempted = { war: false, nonceInline: false };
+    const stats = {
+        appended: 0,
+        attempted: attempted,
+        present: false,
+        disconnect: null,
+        _test: null
+    };
+    let finished = false;
+    let mo = null;
+    let observerTicks = 0;
+    const MAX_OBSERVER_TICKS = 8;
+
+    function present() {
+        try { return !!(opts.pageHookPresent && opts.pageHookPresent(doc)); }
+        catch (_) { return false; }
+    }
+
+    function done() {
+        finished = true;
+        if (mo) {
+            try { mo.disconnect(); } catch (_) { /* ignore */ }
+            mo = null;
+        }
+    }
+
+    function isOurInjectNode(node) {
         try {
-            const v = document.documentElement.getAttribute('data-tps-hook') || '';
-            return /\|(injected|tm)$/.test(v);
+            return !!(node && node.nodeType === 1 && node.getAttribute &&
+                node.getAttribute('data-tps-inject'));
         } catch (_) {
             return false;
         }
     }
 
-    function findNonce() {
-        try {
-            const scripts = document.querySelectorAll('script[nonce]');
-            for (let i = 0; i < scripts.length; i++) {
-                const n = scripts[i].nonce || scripts[i].getAttribute('nonce');
-                if (n) return n;
-            }
-        } catch (_) { /* ignore */ }
-        try {
-            const all = document.querySelectorAll('[nonce]');
-            for (let i = 0; i < all.length; i++) {
-                let n = null;
-                try { n = all[i].nonce; } catch (_) { /* ignore */ }
-                if (!n) {
-                    try { n = all[i].getAttribute('nonce'); } catch (_) { /* ignore */ }
+    function mutationsAreOnlyOurs(mutations) {
+        if (!mutations || !mutations.length) return false;
+        for (let i = 0; i < mutations.length; i++) {
+            const m = mutations[i];
+            if (m.type === 'attributes') {
+                if (!isOurInjectNode(m.target) && m.attributeName !== attemptedAttr &&
+                    m.attributeName !== 'data-tps-page-injected') {
+                    return false;
                 }
-                if (n) return n;
+                continue;
             }
-        } catch (_) { /* ignore */ }
-        return null;
-    }
-
-    function injectInline(nonce) {
-        try {
-            if (pageHookPresent()) return true;
-            if (document.documentElement.getAttribute('data-tps-page-injected') === '1' && pageHookPresent()) {
-                return true;
+            const lists = [m.addedNodes, m.removedNodes];
+            for (let li = 0; li < lists.length; li++) {
+                const list = lists[li];
+                if (!list) continue;
+                for (let j = 0; j < list.length; j++) {
+                    if (!isOurInjectNode(list[j])) return false;
+                }
             }
-            const s = document.createElement('script');
-            if (nonce) {
-                try { s.nonce = nonce; } catch (_) { /* ignore */ }
-                try { s.setAttribute('nonce', nonce); } catch (_) { /* ignore */ }
-            }
-            s.textContent = code;
-            const parent = document.documentElement || document.head || document.body;
-            if (!parent) return false;
-            parent.appendChild(s);
-            s.remove();
-            document.documentElement.setAttribute('data-tps-page-injected', '1');
-            return pageHookPresent();
-        } catch (_) {
-            return false;
         }
+        return true;
     }
 
-    function injectBlob(nonce) {
+    function injectWar() {
+        if (attempted.war || finished || present()) return present();
+        attempted.war = true;
+        let url = null;
+        try { url = opts.getWarUrl && opts.getWarUrl(); } catch (_) { url = null; }
+        if (!url) return false;
         try {
-            if (pageHookPresent()) return true;
-            const blob = new Blob([code], { type: 'text/javascript' });
-            const url = URL.createObjectURL(blob);
-            const s = document.createElement('script');
-            if (nonce) {
-                try { s.nonce = nonce; } catch (_) { /* ignore */ }
-                try { s.setAttribute('nonce', nonce); } catch (_) { /* ignore */ }
-            }
+            const s = doc.createElement('script');
             s.src = url;
-            const parent = document.documentElement || document.head || document.body;
+            s.async = false;
+            s.setAttribute('data-tps-inject', 'war');
+            const parent = doc.documentElement || doc.head || doc.body;
             if (!parent) return false;
             parent.appendChild(s);
-            // Revoke after a tick; keep element briefly so it can execute.
-            setTimeout(() => {
+            stats.appended++;
+            // Leave in DOM until load/error so the browser can fetch it.
+            const cleanup = function () {
                 try { s.remove(); } catch (_) { /* ignore */ }
-                try { URL.revokeObjectURL(url); } catch (_) { /* ignore */ }
-            }, 2000);
-            document.documentElement.setAttribute('data-tps-page-injected', '1');
+                if (present()) done();
+            };
+            try { s.addEventListener('load', cleanup); } catch (_) { /* ignore */ }
+            try { s.addEventListener('error', cleanup); } catch (_) { /* ignore */ }
             return true;
         } catch (_) {
             return false;
         }
     }
 
-    function tryInject(allowNoNonce) {
-        if (pageHookPresent()) return true;
-        const nonce = findNonce();
-        if (nonce) {
-            if (injectInline(nonce)) return true;
-            if (injectBlob(nonce)) return pageHookPresent();
+    function injectNonceInline() {
+        if (attempted.nonceInline || finished || present()) return present();
+        let nonce = null;
+        try { nonce = opts.findNonce ? opts.findNonce(doc) : null; } catch (_) { nonce = null; }
+        if (!nonce) return false;
+        attempted.nonceInline = true;
+        let code = '';
+        try { code = opts.buildInlineCode ? opts.buildInlineCode() : ''; } catch (_) { code = ''; }
+        if (!code) return false;
+        try {
+            const s = doc.createElement('script');
+            try { s.nonce = nonce; } catch (_) { /* ignore */ }
+            try { s.setAttribute('nonce', nonce); } catch (_) { /* ignore */ }
+            s.setAttribute('data-tps-inject', 'nonce');
+            s.textContent = code;
+            const parent = doc.documentElement || doc.head || doc.body;
+            if (!parent) return false;
+            parent.appendChild(s);
+            stats.appended++;
+            try { s.remove(); } catch (_) { /* ignore */ }
+            try { doc.documentElement.setAttribute('data-tps-page-injected', '1'); } catch (_) { /* ignore */ }
+            return present();
+        } catch (_) {
+            return false;
         }
-        if (allowNoNonce) {
-            if (injectInline(null)) return true;
-            if (injectBlob(null)) return pageHookPresent();
-        }
-        return pageHookPresent();
     }
 
-    if (tryInject(false)) return;
+    if (present()) {
+        done();
+        stats.present = true;
+        stats.disconnect = done;
+        stats._test = {
+            getObserverTicks: function () { return observerTicks; },
+            isFinished: function () { return finished; }
+        };
+        return stats;
+    }
 
-    const root = document.documentElement || document;
-    const started = Date.now();
-    const mo = new MutationObserver(() => {
-        if (tryInject(Date.now() - started > 800)) mo.disconnect();
-    });
+    injectWar();
+    if (present()) {
+        done();
+        stats.present = true;
+        stats.disconnect = done;
+        stats._test = {
+            getObserverTicks: function () { return observerTicks; },
+            isFinished: function () { return finished; }
+        };
+        return stats;
+    }
+
+    injectNonceInline();
+    if (present() || (attempted.war && attempted.nonceInline)) {
+        // If nonce was available we tried it; if not, watch briefly for a nonce.
+        if (present() || attempted.nonceInline) {
+            done();
+            stats.present = present();
+            stats.disconnect = done;
+            stats._test = {
+                getObserverTicks: function () { return observerTicks; },
+                isFinished: function () { return finished; }
+            };
+            return stats;
+        }
+    }
+
+    // Observer: only to catch a late nonce. Never re-tries WAR. Ignores our nodes.
     try {
-        mo.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['nonce'] });
-    } catch (_) { /* ignore */ }
+        const root = doc.documentElement || doc;
+        mo = new (opts.MutationObserver || MutationObserver)(function (mutations) {
+            if (finished) return;
+            observerTicks++;
+            if (present()) { done(); return; }
+            if (mutationsAreOnlyOurs(mutations)) {
+                if (observerTicks >= MAX_OBSERVER_TICKS) done();
+                return;
+            }
+            if (!attempted.nonceInline) {
+                injectNonceInline();
+            }
+            if (present() || attempted.nonceInline || observerTicks >= MAX_OBSERVER_TICKS) {
+                done();
+            }
+        });
+        mo.observe(root, {
+            childList: true,
+            subtree: true,
+            attributes: true,
+            attributeFilter: ['nonce']
+        });
+    } catch (_) {
+        done();
+    }
 
-    // Escalating fallbacks: wait for nonce ~1s, then try without nonce / blob.
-    setTimeout(() => {
-        if (pageHookPresent()) { try { mo.disconnect(); } catch (_) {} return; }
-        tryInject(true);
-    }, 1000);
-    setTimeout(() => {
-        if (pageHookPresent()) { try { mo.disconnect(); } catch (_) {} return; }
-        tryInject(true);
-        try { mo.disconnect(); } catch (_) { /* ignore */ }
-    }, 2500);
-    setTimeout(() => { try { mo.disconnect(); } catch (_) { /* ignore */ } }, 15000);
+    stats.present = present();
+    stats.disconnect = done;
+    stats._test = {
+        getObserverTicks: function () { return observerTicks; },
+        isFinished: function () { return finished; }
+    };
+    return stats;
 }
+
+function tpsInjectPageRealmScripts() {
+    'use strict';
+    if (typeof document === 'undefined') return;
+
+    const ver = typeof TPS_VERSION !== 'undefined' ? TPS_VERSION : '0';
+
+    function buildInlineCode() {
+        return [
+            '(' + tpsInstallPageScrollGuard.toString() + ')(window);',
+            '(' + tpsInstallPageJumpHook.toString() + ')(window,"injected",' + JSON.stringify(ver) + ');'
+        ].join('\n');
+    }
+
+    tpsRunBoundedPageInject({
+        document: document,
+        getWarUrl: tpsGetExtensionPageHookUrl,
+        buildInlineCode: buildInlineCode,
+        findNonce: tpsFindCspNonce,
+        pageHookPresent: tpsPageHookPresent,
+        MutationObserver: typeof MutationObserver !== 'undefined' ? MutationObserver : null
+    });
+}
+
 
 
 (function() {
@@ -1262,13 +1422,13 @@ function tpsInjectPageRealmScripts() {
             tpsInstallPageScrollGuard(unsafeWindow);
             tpsInstallPageJumpHook(unsafeWindow, 'tm', TPS_VERSION);
         } else {
-            // Gear WebExtension: isolated world — inject into the page with CSP nonce.
+            // Extension isolated world: bounded WAR / nonce fallbacks (MAIN world
+            // page-hook.js is the primary path via manifest).
             tpsInjectPageRealmScripts();
         }
     } catch (_) { /* ignore */ }
     try {
-        // Best-effort local install. Skips if a page-realm hook (tm/injected) is
-        // already marked on <html data-tps-hook>.
+        // Best-effort local install. Skips if a page-realm hook is already marked.
         tpsInstallPageScrollGuard(window);
         tpsInstallPageJumpHook(window, 'local', TPS_VERSION);
     } catch (_) { /* ignore */ }

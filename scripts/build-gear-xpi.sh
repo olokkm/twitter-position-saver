@@ -2,7 +2,7 @@
 set -e
 cd "$(dirname "$0")/.."
 
-echo "Building gear-extension/content.js from userscript..."
+echo "Building gear-extension from userscript..."
 node scripts/build-gear-extension.mjs
 
 echo "Packaging twitter-position-saver-gear.xpi (ZIPFoundation-compatible)..."
@@ -13,7 +13,7 @@ from pathlib import Path
 
 root = Path('gear-extension')
 out = Path('twitter-position-saver-gear.xpi')
-files = ['manifest.json', 'content.js']
+files = ['manifest.json', 'page-hook.js', 'content.js']
 
 with zipfile.ZipFile(out, 'w', compression=zipfile.ZIP_DEFLATED, compresslevel=9) as zf:
     for name in files:

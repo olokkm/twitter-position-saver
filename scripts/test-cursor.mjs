@@ -1,4 +1,7 @@
 #!/usr/bin/env node
+import fs from 'fs';
+import path from 'path';
+import { fileURLToPath } from 'url';
 /**
  * Unit tests for ListLatestTweetsTimeline cursor encode/decode + snowflake helpers
  * and the Top→Bottom fill-up rewrite math. Duplicates pure helpers from the userscript.
@@ -763,7 +766,185 @@ const noHit = resolveOrderIndex(orderV30, '777', '777', { '300': '777' });
 assert(noHit.how === 'insert' || noHit.how === 'insert-end', 'reverse map does not falsely resolve');
 assert(noHit.idx !== 2 || BigInt(orderV30[noHit.idx]) <= 777n, 'no false idx from reverse map');
 
+
 console.log('info: v3.30 resolveOrderIndex tests done');
+
+// --- v3.31 bounded page injection (safe fake document; no sync MO recursion) ---
+const userscriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'twitter-position-saver.user.js');
+const userscriptSrc = fs.readFileSync(userscriptPath, 'utf8');
+{
+  const start = userscriptSrc.indexOf('function tpsRunBoundedPageInject(opts)');
+  const end = userscriptSrc.indexOf('\nfunction tpsInjectPageRealmScripts', start);
+  assert(start >= 0 && end > start, 'locate tpsRunBoundedPageInject');
+  const slice = userscriptSrc.slice(start, end);
+  assert(slice.length > 500 && slice.length < 20000, `inject fn size sane (${slice.length})`);
+  var tpsRunBoundedPageInject = new Function(
+    slice.replace(/^function tpsRunBoundedPageInject/, 'return function tpsRunBoundedPageInject') + ';'
+  )();
+}
+
+function makeFakeDocument() {
+  const html = {
+    attrs: Object.create(null),
+    children: [],
+    nodeType: 1,
+    getAttribute(name) { return this.attrs[name] == null ? null : this.attrs[name]; },
+    setAttribute(name, value) { this.attrs[name] = String(value); },
+    removeAttribute(name) { delete this.attrs[name]; },
+    // Intentionally does NOT notify MutationObserver (avoids sync recursion).
+    appendChild(node) {
+      this.children.push(node);
+      node.parent = this;
+      return node;
+    },
+    querySelectorAll() { return []; }
+  };
+  return {
+    documentElement: html,
+    head: html,
+    body: html,
+    createElement(tag) {
+      const el = {
+        tag,
+        attrs: Object.create(null),
+        nodeType: 1,
+        textContent: '',
+        nonce: '',
+        async: false,
+        _src: '',
+        _load: [],
+        _err: [],
+        setAttribute(name, value) {
+          this.attrs[name] = String(value);
+          if (name === 'nonce') this.nonce = String(value);
+        },
+        getAttribute(name) { return this.attrs[name] == null ? null : this.attrs[name]; },
+        addEventListener(type, fn) {
+          if (type === 'load') this._load.push(fn);
+          if (type === 'error') this._err.push(fn);
+        },
+        remove() {
+          const p = this.parent;
+          if (!p) return;
+          const i = p.children.indexOf(this);
+          if (i >= 0) p.children.splice(i, 1);
+        }
+      };
+      Object.defineProperty(el, 'src', {
+        get() { return this._src || ''; },
+        set(v) { this._src = v; },
+        configurable: true
+      });
+      return el;
+    }
+  };
+}
+
+class FakeMutationObserver {
+  constructor(cb) {
+    this.cb = cb;
+    this.root = null;
+    this.live = false;
+  }
+  observe(root) {
+    this.root = root;
+    this.live = true;
+    root._mo = this;
+  }
+  disconnect() {
+    this.live = false;
+    if (this.root && this.root._mo === this) this.root._mo = null;
+    this.root = null;
+  }
+  // Manual fire only — tests call this; never from appendChild.
+  fire(mutations) {
+    if (!this.live) return;
+    this.cb(mutations);
+  }
+}
+
+{
+  const doc = makeFakeDocument();
+  let warCalls = 0;
+  const result = tpsRunBoundedPageInject({
+    document: doc,
+    MutationObserver: FakeMutationObserver,
+    getWarUrl() {
+      warCalls++;
+      return 'chrome-extension://testid/page-hook.js';
+    },
+    findNonce() { return null; },
+    buildInlineCode() { return 'window.__tps = 1'; },
+    pageHookPresent() {
+      return doc.documentElement.getAttribute('data-tps-hook') != null;
+    }
+  });
+
+  assert(result.attempted.war === true, 'war attempted once (flag)');
+  assert(warCalls === 1, 'getWarUrl called once');
+  assert(result.appended === 1, `exactly one script appended (got ${result.appended})`);
+  assert(result.attempted.nonceInline === false, 'nonce not attempted without nonce');
+  assert(doc.documentElement.getAttribute('data-tps-inject-attempted') === '1', 'attempted flag set');
+
+  // Mutation storm: foreign nodes, CSP never sets hook. Must not append more scripts.
+  const mo = doc.documentElement._mo;
+  for (let i = 0; i < 50; i++) {
+    if (!mo || !mo.live) break;
+    const foreign = doc.createElement('script');
+    mo.fire([{
+      type: 'childList',
+      addedNodes: [foreign],
+      removedNodes: [],
+      target: doc.documentElement
+    }]);
+  }
+  const scriptsAfter = doc.documentElement.children.filter((c) => c.tag === 'script').length;
+  assert(scriptsAfter <= 1, `no injection loop under mutation storm (scripts=${scriptsAfter})`);
+  assert(warCalls === 1, 'war still once after storm');
+  assert(!mo || !mo.live || result._test.isFinished(), 'observer finished or disconnected');
+
+  const again = tpsRunBoundedPageInject({
+    document: doc,
+    MutationObserver: FakeMutationObserver,
+    getWarUrl() { warCalls++; return 'chrome-extension://testid/page-hook.js'; },
+    findNonce() { return 'abc'; },
+    buildInlineCode() { return 'x'; },
+    pageHookPresent() { return false; }
+  });
+  assert(again.attempted.already === true, 'second run short-circuits');
+  assert(warCalls === 1, 'second run did not call getWarUrl');
+}
+
+{
+  const doc = makeFakeDocument();
+  let nonce = null;
+  const result = tpsRunBoundedPageInject({
+    document: doc,
+    MutationObserver: FakeMutationObserver,
+    getWarUrl() { return null; },
+    findNonce() { return nonce; },
+    buildInlineCode() { return '/* inline */'; },
+    pageHookPresent() { return false; }
+  });
+  assert(result.appended === 0, 'no append without war url or nonce');
+  assert(doc.documentElement._mo, 'observer installed waiting for nonce');
+  nonce = 'secret-nonce';
+  const foreign = doc.createElement('script');
+  foreign.setAttribute('nonce', 'secret-nonce');
+  doc.documentElement._mo.fire([{
+    type: 'attributes',
+    attributeName: 'nonce',
+    target: foreign,
+    addedNodes: [],
+    removedNodes: []
+  }]);
+  assert(result.attempted.nonceInline === true, 'nonce inline attempted once after nonce appears');
+  assert(result.appended === 1, 'one inline script appended');
+  assert(result._test.isFinished(), 'finished after nonce attempt');
+}
+
+console.log('info: v3.31 bounded injection tests done');
+
 
 
 if (failed) {
