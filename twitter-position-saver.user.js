@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.28
+// @version      3.29
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -154,14 +154,17 @@ function tpsInstallPageScrollGuard(globalObj) {
 
 /* TPS_JUMP_HOOK_BEGIN */
 // Page-realm fetch/XHR rewrite (Tampermonkey: unsafeWindow; Gear: injected <script>).
-// 1) Pending data-tps-jump → first ListLatestTweetsTimeline without cursor gets a
-//    Bottom cursor (type 2) so the list opens near the saved tweet.
-// 2) After a jump, Top cursor (type 1) requests are rewritten to Bottom with
-//    B' = B_top + delta so scrolling up fills the gap toward "now" instead of
-//    leaping to the live head of the list.
-// 3) Every ListLatestTweetsTimeline response is scanned read-only for
-//    displayedTweetId → sortIndex mappings (repost-aware) and published to
-//    <script type="application/json" id="tps-sortmap"> for the content script.
+// 1) Pending data-tps-jump → first ListLatestTweetsTimeline without cursor is
+//    intercepted: the hook fetches the live head + Bottom-cursor pages until the
+//    saved position is covered (+ one page below), then delivers ONE merged
+//    TimelineAddEntries response so scrolling up/down is native and gap-free.
+// 2) If the target is not reached within the page cap, fall back to a single
+//    Bottom-cursor jump near the target (v3.28) and keep Top→Bottom fill-up.
+// 3) After a non-merged jump, Top cursor (type 1) requests are rewritten to
+//    Bottom with B' = B_top + delta (fill-up). Disabled when jump was merged.
+// 4) Every ListLatestTweetsTimeline response is scanned for displayedTweetId →
+//    positionId mappings and published to <script id="tps-sortmap"> (plus
+//    order/jumpMerged/pages after a merge).
 function tpsInstallPageJumpHook(globalObj) {
     'use strict';
     const g = globalObj || (typeof window !== 'undefined' ? window : null);
@@ -172,13 +175,24 @@ function tpsInstallPageJumpHook(globalObj) {
     const DEFAULT_FILL_DELTA = BigInt(3 * 60 * 60 * 1000) << 22n; // ~3 hours
     const TARGET_PAGE_ENTRIES = 60n;
     const SORTMAP_MAX = 600;
+    const DEFAULT_MERGE_MAX_PAGES = 12;
 
     // Survives for the document lifetime once a jump cursor was applied.
-    let jumpSession = null; // { fillUp, pageDelta }
+    // { fillUp, pageDelta, merged }
+    let jumpSession = null;
 
-    // displayedTweetId → sortIndex (string). Keep max sortIndex on collision.
+    // displayedTweetId → positionId (string). Keep max on collision.
     const sortMap = new Map();
     const sortMapOrder = []; // insertion order for eviction
+    let lastJumpMeta = null; // { order, jumpMerged, pages }
+
+    function jumpLog() {
+        try {
+            const args = Array.prototype.slice.call(arguments);
+            args.unshift('[TPS jump]');
+            console.log.apply(console, args);
+        } catch (_) { /* ignore */ }
+    }
 
     function snowflakeFromMs(ms) {
         return (BigInt(ms) - TWITTER_EPOCH_MS) << 22n;
@@ -261,7 +275,7 @@ function tpsInstallPageJumpHook(globalObj) {
         const prev = sortMap.get(id);
         if (prev != null) {
             try {
-                if (BigInt(prev) >= BigInt(si)) return; // keep max (most recent repost)
+                if (BigInt(prev) >= BigInt(si)) return;
             } catch (_) {
                 return;
             }
@@ -282,6 +296,11 @@ function tpsInstallPageJumpHook(globalObj) {
             if (!doc) return;
             const obj = {};
             sortMap.forEach((v, k) => { obj[k] = v; });
+            if (lastJumpMeta) {
+                if (Array.isArray(lastJumpMeta.order)) obj.order = lastJumpMeta.order;
+                if (lastJumpMeta.jumpMerged) obj.jumpMerged = true;
+                if (lastJumpMeta.pages != null) obj.pages = lastJumpMeta.pages;
+            }
             let el = doc.getElementById('tps-sortmap');
             if (!el) {
                 el = doc.createElement('script');
@@ -293,15 +312,20 @@ function tpsInstallPageJumpHook(globalObj) {
         } catch (_) { /* ignore */ }
     }
 
-    // Pure: walk TimelineAddEntries and return { sortIndexes, pairs: [[id, sortIndex], ...] }
+    // Pure: walk TimelineAddEntries → { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds }
     function extractSortMapFromListJson(json) {
         const sortIndexes = [];
         const pairs = [];
+        const tweets = [];
+        let topCursor = null;
+        let bottomCursor = null;
         try {
             const tl = json && json.data && json.data.list &&
                 json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
             const instructions = tl && tl.instructions;
-            if (!Array.isArray(instructions)) return { sortIndexes, pairs };
+            if (!Array.isArray(instructions)) {
+                return { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds: [] };
+            }
 
             function addFromTweetResult(result, sortIndex) {
                 const tweet = unwrapTweetResult(result);
@@ -322,12 +346,22 @@ function tpsInstallPageJumpHook(globalObj) {
                     const ent = inst.entries[j];
                     if (!ent) continue;
                     const eid = ent.entryId;
+                    if (typeof eid === 'string' && eid.indexOf('cursor-top-') === 0) {
+                        topCursor = ent;
+                        continue;
+                    }
+                    if (typeof eid === 'string' && eid.indexOf('cursor-bottom-') === 0) {
+                        bottomCursor = ent;
+                        continue;
+                    }
+                    // Also detect via content.cursorType when entryId shape differs.
+                    const ct = ent.content && ent.content.cursorType;
+                    if (ct === 'Top') { topCursor = ent; continue; }
+                    if (ct === 'Bottom') { bottomCursor = ent; continue; }
+
                     const sortIndex = ent.sortIndex != null ? String(ent.sortIndex) : null;
                     if (typeof eid !== 'string' || eid.indexOf('tweet-') !== 0 || !sortIndex) continue;
                     if (!/^\d+$/.test(sortIndex)) continue;
-                    // sortIndex is a per-request ordering value anchored near "now", not
-                    // a time, so it cannot be used as a cursor position. The entry's own
-                    // tweet id (for a repost: the repost's id) is the real timeline position.
                     const result = ent.content && ent.content.itemContent &&
                         ent.content.itemContent.tweet_results &&
                         ent.content.itemContent.tweet_results.result;
@@ -341,10 +375,90 @@ function tpsInstallPageJumpHook(globalObj) {
                     pairs.push([pos, pos]);
                     if (/^\d+$/.test(fromEntry)) pairs.push([fromEntry, pos]);
                     addFromTweetResult(result, pos);
+                    tweets.push(ent);
                 }
             }
         } catch (_) { /* ignore */ }
-        return { sortIndexes, pairs };
+        const positionIds = sortIndexes.map((x) => String(x));
+        return { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds };
+    }
+
+    function pagePassesTarget(positionIds, targetPosId) {
+        if (!targetPosId || !positionIds || !positionIds.length) return false;
+        try {
+            const target = BigInt(String(targetPosId));
+            for (let i = 0; i < positionIds.length; i++) {
+                if (BigInt(positionIds[i]) === target) return true;
+            }
+            const oldest = BigInt(positionIds[positionIds.length - 1]);
+            return oldest <= target;
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Pure: merge page JSONs (newest-first chain) into one TimelineAddEntries response.
+    // Dedupe tweets by entryId, keep server sortIndexes, first top cursor, last bottom cursor.
+    function mergeTimelinePages(pageJsons) {
+        if (!pageJsons || !pageJsons.length) return null;
+        try {
+            const base = JSON.parse(JSON.stringify(pageJsons[0]));
+            const tl = base && base.data && base.data.list &&
+                base.data.list.tweets_timeline && base.data.list.tweets_timeline.timeline;
+            if (!tl || !Array.isArray(tl.instructions)) return null;
+
+            let addInst = null;
+            for (let i = 0; i < tl.instructions.length; i++) {
+                if (tl.instructions[i] && tl.instructions[i].type === 'TimelineAddEntries') {
+                    addInst = tl.instructions[i];
+                    break;
+                }
+            }
+            if (!addInst) {
+                addInst = { type: 'TimelineAddEntries', entries: [] };
+                tl.instructions.push(addInst);
+            }
+
+            const seen = new Set();
+            const mergedTweets = [];
+            let topCursor = null;
+            let bottomCursor = null;
+            const order = [];
+
+            for (let p = 0; p < pageJsons.length; p++) {
+                const extracted = extractSortMapFromListJson(pageJsons[p]);
+                if (p === 0 && extracted.topCursor) topCursor = extracted.topCursor;
+                if (extracted.bottomCursor) bottomCursor = extracted.bottomCursor;
+                for (let t = 0; t < extracted.tweets.length; t++) {
+                    const ent = extracted.tweets[t];
+                    const eid = ent && ent.entryId;
+                    if (!eid || seen.has(eid)) continue;
+                    seen.add(eid);
+                    mergedTweets.push(ent);
+                }
+                for (let i = 0; i < extracted.positionIds.length; i++) {
+                    const pid = extracted.positionIds[i];
+                    if (order.length && order[order.length - 1] === pid) continue;
+                    // Dedupe order by first occurrence (newest pages first).
+                    if (order.indexOf(pid) === -1) order.push(pid);
+                }
+            }
+
+            const entries = mergedTweets.slice();
+            if (topCursor) entries.push(topCursor);
+            if (bottomCursor) entries.push(bottomCursor);
+            addInst.entries = entries;
+
+            // Drop other TimelineAddEntries to avoid duplicate instructions.
+            tl.instructions = tl.instructions.filter((inst, idx) => {
+                if (!inst || inst.type !== 'TimelineAddEntries') return true;
+                return inst === addInst;
+            });
+
+            return { json: base, order: order, tweetCount: mergedTweets.length };
+        } catch (_) {
+            return null;
+        }
     }
 
     function noteTimelineDensity(newestId, oldestId, entryCount) {
@@ -368,10 +482,9 @@ function tpsInstallPageJumpHook(globalObj) {
             for (let i = 0; i < extracted.pairs.length; i++) {
                 recordSortMapping(extracted.pairs[i][0], extracted.pairs[i][1]);
             }
-            if (extracted.pairs.length) publishSortMap();
+            if (extracted.pairs.length || lastJumpMeta) publishSortMap();
 
             if (jumpSession && extracted.sortIndexes.length >= 2) {
-                // sortIndexes are newest → oldest (strictly decreasing).
                 const arr = extracted.sortIndexes;
                 noteTimelineDensity(arr[0], arr[arr.length - 1], arr.length);
             }
@@ -390,22 +503,35 @@ function tpsInstallPageJumpHook(globalObj) {
             const expires = Number(parts[2]);
             if (!Number.isFinite(expires) || Date.now() > expires) return null;
             const fillUp = parts.length < 4 ? true : parts[3] !== '0';
-            return { A, B, fillUp };
+            let targetPos = null;
+            if (parts.length >= 5 && /^\d+$/.test(parts[4])) targetPos = parts[4];
+            let maxPages = DEFAULT_MERGE_MAX_PAGES;
+            if (parts.length >= 6) {
+                const n = Number(parts[5]);
+                if (Number.isFinite(n) && n > 0) maxPages = Math.floor(n);
+            }
+            // Prefer merge when we have a target position id.
+            const preferMerge = !!targetPos;
+            return { A, B, fillUp, targetPos, maxPages, preferMerge };
         } catch (_) {
             return null;
         }
     }
 
-    function startJumpSession(fillUp) {
+    function startJumpSession(fillUp, merged) {
         jumpSession = {
-            fillUp: fillUp !== false,
-            pageDelta: null
+            fillUp: merged ? false : (fillUp !== false),
+            pageDelta: null,
+            merged: !!merged
         };
         try {
             const el = g.document.documentElement;
             el.removeAttribute('data-tps-jump');
             el.setAttribute('data-tps-jump-used', String(Date.now()));
-            el.setAttribute('data-tps-jump-session', '1');
+            el.setAttribute('data-tps-jump-session', merged ? 'merged' : '1');
+            if (merged) el.setAttribute('data-tps-jump-merged', '1');
+            else el.removeAttribute('data-tps-jump-merged');
+            el.removeAttribute('data-tps-jump-busy');
         } catch (_) { /* ignore */ }
     }
 
@@ -420,7 +546,47 @@ function tpsInstallPageJumpHook(globalObj) {
         return encodeListCursor(decoded.A, Bp, 2);
     }
 
-    function maybeRewriteUrl(urlStr) {
+    function urlWithCursor(urlStr, cursor) {
+        const u = new URL(urlStr, g.location.href);
+        const varsRaw = u.searchParams.get('variables');
+        if (!varsRaw) return null;
+        const vars = JSON.parse(varsRaw);
+        if (cursor == null || cursor === '') delete vars.cursor;
+        else vars.cursor = cursor;
+        u.searchParams.set('variables', JSON.stringify(vars));
+        return u.toString();
+    }
+
+    function parseListVariables(urlStr) {
+        try {
+            const u = new URL(urlStr, g.location.href);
+            const varsRaw = u.searchParams.get('variables');
+            if (!varsRaw) return null;
+            return JSON.parse(varsRaw);
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function isCursorlessListUrl(urlStr) {
+        const vars = parseListVariables(urlStr);
+        return !!(vars && (vars.cursor == null || vars.cursor === ''));
+    }
+
+    function bottomCursorValue(extracted) {
+        const ent = extracted && extracted.bottomCursor;
+        if (!ent) return null;
+        try {
+            if (ent.content && typeof ent.content.value === 'string') return ent.content.value;
+            if (ent.content && ent.content.itemContent && typeof ent.content.itemContent.value === 'string') {
+                return ent.content.itemContent.value;
+            }
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
+    // Only rewrite Top→Bottom fill-up. Initial jump is handled in send()/fetch.
+    function maybeRewriteFillUpUrl(urlStr) {
         try {
             if (!urlStr || typeof urlStr !== 'string') return null;
             if (urlStr.indexOf('/ListLatestTweetsTimeline') === -1) return null;
@@ -429,17 +595,8 @@ function tpsInstallPageJumpHook(globalObj) {
             const varsRaw = u.searchParams.get('variables');
             if (!varsRaw) return null;
             const vars = JSON.parse(varsRaw);
-
-            if (vars.cursor == null || vars.cursor === '') {
-                const jump = readPendingJump();
-                if (!jump) return null;
-                vars.cursor = encodeListCursor(jump.A, jump.B, 2);
-                u.searchParams.set('variables', JSON.stringify(vars));
-                startJumpSession(jump.fillUp);
-                return u.toString();
-            }
-
-            if (!jumpSession || !jumpSession.fillUp) return null;
+            if (vars.cursor == null || vars.cursor === '') return null;
+            if (!jumpSession || !jumpSession.fillUp || jumpSession.merged) return null;
             let decoded;
             try {
                 decoded = decodeListCursor(String(vars.cursor));
@@ -450,6 +607,7 @@ function tpsInstallPageJumpHook(globalObj) {
             if (!nextCursor) return null;
             vars.cursor = nextCursor;
             u.searchParams.set('variables', JSON.stringify(vars));
+            jumpLog('fill-up rewrite Top→Bottom');
             return u.toString();
         } catch (_) {
             return null;
@@ -460,6 +618,296 @@ function tpsInstallPageJumpHook(globalObj) {
         return typeof url === 'string' && url.indexOf('/ListLatestTweetsTimeline') !== -1;
     }
 
+    function headersToObject(headerPairs) {
+        const out = {};
+        if (!headerPairs) return out;
+        for (let i = 0; i < headerPairs.length; i++) {
+            const pair = headerPairs[i];
+            if (!pair || pair.length < 2) continue;
+            out[pair[0]] = pair[1];
+        }
+        return out;
+    }
+
+    function omitTransactionId(headerObj) {
+        const out = {};
+        const keys = Object.keys(headerObj || {});
+        for (let i = 0; i < keys.length; i++) {
+            const k = keys[i];
+            if (k && k.toLowerCase() === 'x-client-transaction-id') continue;
+            out[k] = headerObj[k];
+        }
+        return out;
+    }
+
+    async function fetchListPageOnce(url, headerObj, useTransactionId) {
+        const headers = useTransactionId ? headerObj : omitTransactionId(headerObj);
+        const init = {
+            method: 'GET',
+            headers: headers,
+            credentials: 'include',
+            cache: 'no-store'
+        };
+        if (typeof origFetch === 'function') {
+            const res = await origFetch.call(g, url, init);
+            const text = await res.text();
+            return { ok: res.ok, status: res.status, text: text, url: res.url || url };
+        }
+        // Fallback: fresh XHR
+        return await new Promise((resolve, reject) => {
+            try {
+                const xhr = new XHR();
+                xhr.open('GET', url, true);
+                xhr.withCredentials = true;
+                const keys = Object.keys(headers || {});
+                for (let i = 0; i < keys.length; i++) {
+                    try { xhr.setRequestHeader(keys[i], headers[keys[i]]); } catch (_) { /* ignore */ }
+                }
+                xhr.onload = function () {
+                    resolve({
+                        ok: xhr.status >= 200 && xhr.status < 300,
+                        status: xhr.status,
+                        text: xhr.responseText,
+                        url: xhr.responseURL || url
+                    });
+                };
+                xhr.onerror = function () { reject(new Error('xhr network error')); };
+                xhr.send();
+            } catch (e) {
+                reject(e);
+            }
+        });
+    }
+
+    async function fetchListPage(url, headerObj) {
+        let result = await fetchListPageOnce(url, headerObj, true);
+        if (!result.ok) {
+            jumpLog('page fetch status', result.status, '— retry without x-client-transaction-id');
+            result = await fetchListPageOnce(url, headerObj, false);
+        }
+        return result;
+    }
+
+    // Cap / stop-condition decision helper (exported for tests).
+    function mergeStopDecision(pagesFetched, reachedAt, maxPages, hasBottom) {
+        if (pagesFetched >= maxPages) return 'cap';
+        if (reachedAt >= 0 && pagesFetched > reachedAt + 1) return 'done';
+        if (!hasBottom) return reachedAt >= 0 ? 'done' : 'no-bottom';
+        return 'continue';
+    }
+
+    async function collectMergedPages(headUrl, headerObj, targetPos, maxPages) {
+        const pages = [];
+        let reachedAt = -1;
+        let url = headUrl;
+        let lastStatus = 0;
+
+        while (pages.length < maxPages) {
+            jumpLog('fetching page', pages.length + 1, '/', maxPages, reachedAt >= 0 ? '(past target, +1)' : '');
+            const result = await fetchListPage(url, headerObj);
+            lastStatus = result.status;
+            if (!result.ok) {
+                jumpLog('page fetch failed', result.status);
+                return { pages, reachedAt, error: 'status-' + result.status, lastStatus };
+            }
+            let json;
+            try {
+                json = JSON.parse(result.text);
+            } catch (e) {
+                return { pages, reachedAt, error: 'bad-json', lastStatus };
+            }
+            pages.push(json);
+            const extracted = extractSortMapFromListJson(json);
+            if (reachedAt < 0 && pagePassesTarget(extracted.positionIds, targetPos)) {
+                reachedAt = pages.length - 1;
+                jumpLog('target reached on page', pages.length,
+                    'oldest=', extracted.positionIds[extracted.positionIds.length - 1] || '?');
+            }
+            const bottomVal = bottomCursorValue(extracted);
+            const decision = mergeStopDecision(
+                pages.length, reachedAt, maxPages, !!bottomVal
+            );
+            if (decision === 'done') break;
+            if (decision === 'cap') {
+                jumpLog('hit page cap', maxPages, 'without target');
+                break;
+            }
+            if (decision === 'no-bottom') {
+                jumpLog('no bottom cursor; stopping');
+                break;
+            }
+            const nextUrl = urlWithCursor(headUrl, bottomVal);
+            if (!nextUrl) break;
+            url = nextUrl;
+        }
+
+        return { pages, reachedAt, error: null, lastStatus };
+    }
+
+    function applySortMapFromPages(pages, order, merged, pageCount) {
+        for (let p = 0; p < pages.length; p++) {
+            const extracted = extractSortMapFromListJson(pages[p]);
+            for (let i = 0; i < extracted.pairs.length; i++) {
+                recordSortMapping(extracted.pairs[i][0], extracted.pairs[i][1]);
+            }
+        }
+        lastJumpMeta = {
+            order: order || [],
+            jumpMerged: !!merged,
+            pages: pageCount
+        };
+        publishSortMap();
+    }
+
+    function fakeXhrComplete(xhr, bodyText, responseURL) {
+        const rt = xhr.responseType || '';
+        let parsedJson = null;
+        const getJson = () => {
+            if (parsedJson == null) parsedJson = JSON.parse(bodyText);
+            return parsedJson;
+        };
+
+        try {
+            Object.defineProperty(xhr, 'readyState', { configurable: true, get: function () { return 4; } });
+            Object.defineProperty(xhr, 'status', { configurable: true, get: function () { return 200; } });
+            Object.defineProperty(xhr, 'statusText', { configurable: true, get: function () { return 'OK'; } });
+            Object.defineProperty(xhr, 'responseURL', {
+                configurable: true,
+                get: function () { return responseURL || ''; }
+            });
+            Object.defineProperty(xhr, 'responseText', {
+                configurable: true,
+                get: function () {
+                    if (rt === 'json') {
+                        // Some engines still expose responseText for json.
+                        return bodyText;
+                    }
+                    return bodyText;
+                }
+            });
+            Object.defineProperty(xhr, 'response', {
+                configurable: true,
+                get: function () {
+                    if (rt === 'json') {
+                        try { return getJson(); } catch (_) { return null; }
+                    }
+                    if (rt === '' || rt === 'text') return bodyText;
+                    return bodyText;
+                }
+            });
+        } catch (e) {
+            jumpLog('defineProperty on xhr failed', e && e.message);
+        }
+
+        xhr.getResponseHeader = function (name) {
+            if (!name) return null;
+            const n = String(name).toLowerCase();
+            if (n === 'content-type') return 'application/json';
+            return null;
+        };
+        xhr.getAllResponseHeaders = function () {
+            return 'content-type: application/json\r\n';
+        };
+
+        const fire = function () {
+            try {
+                if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange();
+            } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('readystatechange')); } catch (_) { /* ignore */ }
+            try {
+                if (typeof xhr.onload === 'function') xhr.onload();
+            } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('load')); } catch (_) { /* ignore */ }
+            try { xhr.dispatchEvent(new Event('loadend')); } catch (_) { /* ignore */ }
+            try {
+                if (typeof xhr.onloadend === 'function') xhr.onloadend();
+            } catch (_) { /* ignore */ }
+        };
+
+        // Async, matching normal XHR completion timing.
+        try {
+            g.setTimeout(fire, 0);
+        } catch (_) {
+            try { fire(); } catch (__) { /* ignore */ }
+        }
+    }
+
+    function beginJumpHandling() {
+        // Consume the one-shot arm immediately so the content script sees
+        // data-tps-jump-used while chained pages are still in flight.
+        try {
+            const el = g.document.documentElement;
+            el.removeAttribute('data-tps-jump');
+            el.setAttribute('data-tps-jump-used', String(Date.now()));
+            el.setAttribute('data-tps-jump-busy', '1');
+        } catch (_) { /* ignore */ }
+    }
+
+    function endJumpBusy() {
+        try { g.document.documentElement.removeAttribute('data-tps-jump-busy'); } catch (_) { /* ignore */ }
+    }
+
+    async function performJumpForUrl(headUrl, headerObj, jump) {
+        const maxPages = jump.maxPages || DEFAULT_MERGE_MAX_PAGES;
+        const targetPos = jump.targetPos;
+        beginJumpHandling();
+
+        if (jump.preferMerge && targetPos) {
+            try {
+                jumpLog('merge start target=', targetPos, 'maxPages=', maxPages);
+                const collected = await collectMergedPages(headUrl, headerObj, targetPos, maxPages);
+                if (collected.reachedAt >= 0 && collected.pages.length) {
+                    // Ensure we have the +1 page when possible (collectMergedPages handles it).
+                    const merged = mergeTimelinePages(collected.pages);
+                    if (merged && merged.json) {
+                        startJumpSession(false, true);
+                        applySortMapFromPages(collected.pages, merged.order, true, collected.pages.length);
+                        jumpLog('merge ok pages=', collected.pages.length,
+                            'tweets=', merged.tweetCount, 'order=', merged.order.length);
+                        return {
+                            ok: true,
+                            merged: true,
+                            text: JSON.stringify(merged.json),
+                            url: headUrl
+                        };
+                    }
+                    jumpLog('merge synthesize failed — falling back');
+                } else {
+                    jumpLog('merge cap/miss — fallback to single Bottom jump',
+                        'pages=', collected.pages.length, 'err=', collected.error || 'not-reached');
+                }
+            } catch (e) {
+                jumpLog('merge error — fallback', e && (e.message || e));
+            }
+        }
+
+        // v3.28 fallback: single Bottom-cursor page near target (B/A from arm).
+        try {
+            const cursor = encodeListCursor(jump.A, jump.B, 2);
+            const jumpUrl = urlWithCursor(headUrl, cursor);
+            jumpLog('fallback single Bottom jump');
+            const result = await fetchListPage(jumpUrl, headerObj);
+            if (!result.ok) {
+                jumpLog('fallback fetch failed', result.status);
+                endJumpBusy();
+                return { ok: false, status: result.status };
+            }
+            startJumpSession(jump.fillUp, false);
+            try {
+                const json = JSON.parse(result.text);
+                const extracted = extractSortMapFromListJson(json);
+                applySortMapFromPages([json], extracted.positionIds, false, 1);
+            } catch (_) {
+                inspectResponseText(result.text);
+            }
+            return { ok: true, merged: false, text: result.text, url: result.url || jumpUrl };
+        } catch (e) {
+            jumpLog('fallback error', e && (e.message || e));
+            endJumpBusy();
+            return { ok: false, error: e };
+        }
+    }
+
     const origFetch = g.fetch;
     if (typeof origFetch === 'function') {
         g.fetch = function (input, init) {
@@ -467,8 +915,44 @@ function tpsInstallPageJumpHook(globalObj) {
             try {
                 if (typeof input === 'string') url = input;
                 else if (input && typeof input.url === 'string') url = input.url;
+            } catch (_) { /* ignore */ }
+
+            // Merged / fallback jump for cursorless list timeline.
+            try {
+                if (url && isListTimelineUrl(url) && isCursorlessListUrl(url)) {
+                    const jump = readPendingJump();
+                    if (jump) {
+                        const headerObj = {};
+                        try {
+                            const h = init && init.headers;
+                            if (h && typeof h.forEach === 'function') {
+                                h.forEach((v, k) => { headerObj[k] = v; });
+                            } else if (h && typeof h === 'object') {
+                                Object.keys(h).forEach((k) => { headerObj[k] = h[k]; });
+                            }
+                        } catch (_) { /* ignore */ }
+                        return performJumpForUrl(url, headerObj, jump).then((result) => {
+                            if (!result || !result.ok) {
+                                // Last resort: let the original cursorless request through.
+                                jumpLog('jump failed entirely — passthrough');
+                                return origFetch.call(this, input, init);
+                            }
+                            return new Response(result.text, {
+                                status: 200,
+                                statusText: 'OK',
+                                headers: { 'content-type': 'application/json' }
+                            });
+                        }).catch((e) => {
+                            jumpLog('fetch jump path error', e && (e.message || e));
+                            return origFetch.call(this, input, init);
+                        });
+                    }
+                }
+            } catch (_) { /* fall through */ }
+
+            try {
                 if (url) {
-                    const rewritten = maybeRewriteUrl(url);
+                    const rewritten = maybeRewriteFillUpUrl(url);
                     if (rewritten) {
                         url = rewritten;
                         if (typeof input === 'string') {
@@ -483,7 +967,6 @@ function tpsInstallPageJumpHook(globalObj) {
             } catch (_) { /* ignore */ }
 
             const result = origFetch.call(this, input, init);
-            // Always sample ListLatestTweetsTimeline for sortmap (+ density in session).
             if (isListTimelineUrl(url)) {
                 try {
                     return Promise.resolve(result).then((res) => {
@@ -503,12 +986,16 @@ function tpsInstallPageJumpHook(globalObj) {
     if (XHR && XHR.prototype) {
         const origOpen = XHR.prototype.open;
         const origSend = XHR.prototype.send;
+        const origSetRequestHeader = XHR.prototype.setRequestHeader;
 
         XHR.prototype.open = function (method, url) {
             try {
                 this.__tpsListUrl = typeof url === 'string' ? url : null;
+                this.__tpsMethod = method;
+                this.__tpsHeaders = [];
+                this.__tpsJumpHandled = false;
                 if (typeof url === 'string') {
-                    const rewritten = maybeRewriteUrl(url);
+                    const rewritten = maybeRewriteFillUpUrl(url);
                     if (rewritten) {
                         arguments[1] = rewritten;
                         this.__tpsListUrl = rewritten;
@@ -518,10 +1005,54 @@ function tpsInstallPageJumpHook(globalObj) {
             return origOpen.apply(this, arguments);
         };
 
+        XHR.prototype.setRequestHeader = function (name, value) {
+            try {
+                if (!this.__tpsHeaders) this.__tpsHeaders = [];
+                this.__tpsHeaders.push([name, value]);
+            } catch (_) { /* ignore */ }
+            return origSetRequestHeader.apply(this, arguments);
+        };
+
         XHR.prototype.send = function () {
+            const xhr = this;
+            const args = arguments;
+            try {
+                if (isListTimelineUrl(xhr.__tpsListUrl) && isCursorlessListUrl(xhr.__tpsListUrl)) {
+                    const jump = readPendingJump();
+                    if (jump) {
+                        xhr.__tpsJumpHandled = true;
+                        const headerObj = headersToObject(xhr.__tpsHeaders);
+                        const headUrl = xhr.__tpsListUrl;
+                        performJumpForUrl(headUrl, headerObj, jump).then((result) => {
+                            if (result && result.ok) {
+                                fakeXhrComplete(xhr, result.text, result.url || headUrl);
+                                return;
+                            }
+                            // Fall through: send original cursorless request.
+                            jumpLog('XHR jump failed — origSend passthrough');
+                            try {
+                                if (isListTimelineUrl(xhr.__tpsListUrl)) {
+                                    const onLoad = function () {
+                                        try { xhr.removeEventListener('load', onLoad); } catch (_) { /* ignore */ }
+                                        try { inspectResponseText(xhr.responseText); } catch (_) { /* ignore */ }
+                                    };
+                                    xhr.addEventListener('load', onLoad);
+                                }
+                            } catch (_) { /* ignore */ }
+                            return origSend.apply(xhr, args);
+                        }).catch((e) => {
+                            jumpLog('XHR jump path error', e && (e.message || e));
+                            try { return origSend.apply(xhr, args); } catch (_) { /* ignore */ }
+                        });
+                        return;
+                    }
+                }
+            } catch (e) {
+                jumpLog('XHR send jump detect error', e && (e.message || e));
+            }
+
             try {
                 if (isListTimelineUrl(this.__tpsListUrl)) {
-                    const xhr = this;
                     const onLoad = function () {
                         try { xhr.removeEventListener('load', onLoad); } catch (_) { /* ignore */ }
                         try { inspectResponseText(xhr.responseText); } catch (_) { /* ignore */ }
@@ -537,8 +1068,13 @@ function tpsInstallPageJumpHook(globalObj) {
     g.__tpsDecodeListCursor = decodeListCursor;
     g.__tpsEncodeListCursor = encodeListCursor;
     g.__tpsExtractSortMapFromListJson = extractSortMapFromListJson;
+    g.__tpsMergeTimelinePages = mergeTimelinePages;
+    g.__tpsPagePassesTarget = pagePassesTarget;
+    g.__tpsMergeStopDecision = mergeStopDecision;
+    g.__tpsFakeXhrComplete = fakeXhrComplete;
 }
 /* TPS_JUMP_HOOK_END */
+
 
 // Gear (isolated world): inject page-realm hooks as a real <script> with the
 // page CSP nonce. Tampermonkey uses unsafeWindow instead and skips this.
@@ -649,9 +1185,12 @@ function tpsInjectPageRealmScripts() {
         // Cursor jump: rewrite the first ListLatestTweetsTimeline request so the
         // Olo list opens near the saved tweet instead of scrolling from the top.
         cursorJump: true,
-        jumpLeadMs: 60 * 60 * 1000, // ~1h of newer tweets above the pin (Olo: ~8/h measured Oct 3) so the page is scrolled, not at the top; X only requests newer posts (Top cursor) when you scroll back up to the top
+        jumpLeadMs: 60 * 60 * 1000, // fallback single-jump: ~1h of newer tweets above the pin
         jumpAnchor: 'now',         // 'now' = snowflakeFromMs(Date.now()); 'b' = use B
-        jumpFillUp: true           // rewrite Top cursors to Bottom fill-ups after a jump
+        jumpFillUp: true,          // Top→Bottom fill-up after a non-merged (fallback) jump
+        // Merged jump: chain head→Bottom pages until saved pos (+1 page), deliver one response.
+        jumpMerge: true,
+        jumpMergeMaxPages: 12      // ~1200 posts; if target not reached → v3.28 fallback
     };
 
     const DEBUG = false;
@@ -795,10 +1334,48 @@ function tpsInjectPageRealmScripts() {
 
     function clearJumpUsed() {
         try { document.documentElement.removeAttribute('data-tps-jump-used'); } catch (_) { /* ignore */ }
+        try { document.documentElement.removeAttribute('data-tps-jump-merged'); } catch (_) { /* ignore */ }
+        try { document.documentElement.removeAttribute('data-tps-jump-busy'); } catch (_) { /* ignore */ }
     }
 
-    // Arm a one-shot cursor rewrite: B|A|expiresAtMs|fillUp on <html data-tps-jump>.
-    // B is based on sortId (timeline order / repost id), not the displayed status id.
+    function jumpIsBusy() {
+        try {
+            return document.documentElement.getAttribute('data-tps-jump-busy') === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    async function waitForJumpIdle(ctrl, maxWaitMs) {
+        const start = Date.now();
+        const limit = maxWaitMs == null ? 60000 : maxWaitMs;
+        while (Date.now() - start < limit) {
+            if (ctrl && ctrl.aborted) return false;
+            if (!jumpIsBusy()) return true;
+            await sleep(100);
+        }
+        return !jumpIsBusy();
+    }
+
+    function jumpWasMerged() {
+        try {
+            if (document.documentElement.getAttribute('data-tps-jump-merged') === '1') return true;
+            if (document.documentElement.getAttribute('data-tps-jump-session') === 'merged') return true;
+            const meta = readJumpSortMeta();
+            return !!(meta && meta.jumpMerged && Array.isArray(meta.order) && meta.order.length);
+        } catch (_) {
+            return false;
+        }
+    }
+
+    // Always-on console for jump/positioning (DEBUG may be false).
+    function jumpLog(...args) {
+        try { console.log('[Timeline Saver]', ...args); } catch (_) { /* ignore */ }
+        try { log(...args); } catch (_) { /* ignore */ }
+    }
+
+    // Arm: B|A|expires|fillUp|targetPos|maxPages on <html data-tps-jump>.
+    // B/A used for v3.28 single-jump fallback; targetPos drives the merged path.
     function armCursorJump(saved, expiresMs) {
         if (!CONFIG.cursorJump || !saved || !saved.tweetId) return false;
         const path = saved.path || currentPath();
@@ -817,14 +1394,18 @@ function tpsInjectPageRealmScripts() {
             clearJumpUsed();
             try { document.documentElement.removeAttribute('data-tps-jump-session'); } catch (_) { /* ignore */ }
             const fillUp = CONFIG.jumpFillUp === false ? '0' : '1';
-            document.documentElement.setAttribute(
-                'data-tps-jump',
-                B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp
-            );
-            log('Armed cursor jump B=', B.toString(), 'A=', A.toString());
+            const maxPages = CONFIG.jumpMergeMaxPages == null ? 12 : CONFIG.jumpMergeMaxPages;
+            const preferMerge = CONFIG.jumpMerge !== false;
+            const payload = preferMerge
+                ? (B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp +
+                    '|' + sortId.toString(10) + '|' + String(maxPages))
+                : (B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp);
+            document.documentElement.setAttribute('data-tps-jump', payload);
+            jumpLog('Armed cursor jump target=', sortId.toString(), 'B=', B.toString(),
+                'merge=', preferMerge, 'maxPages=', maxPages);
             return true;
         } catch (e) {
-            log('armCursorJump failed', e);
+            jumpLog('armCursorJump failed', e);
             return false;
         }
     }
@@ -916,10 +1497,35 @@ function tpsInjectPageRealmScripts() {
         }
     }
 
+    function readJumpSortMeta() {
+        const obj = readSortMap();
+        const order = Array.isArray(obj.order) ? obj.order.map(String) : null;
+        return {
+            order,
+            jumpMerged: obj.jumpMerged === true,
+            pages: obj.pages != null ? Number(obj.pages) : null
+        };
+    }
+
+    async function waitForJumpOrder(ctrl, maxWaitMs) {
+        const start = Date.now();
+        const limit = maxWaitMs == null ? 8000 : maxWaitMs;
+        while (Date.now() - start < limit) {
+            if (ctrl && ctrl.aborted) return null;
+            const meta = readJumpSortMeta();
+            if (meta.order && meta.order.length) return meta;
+            await sleep(50);
+        }
+        return readJumpSortMeta().order ? readJumpSortMeta() : null;
+    }
+
     function lookupSortId(tweetId) {
         if (!tweetId) return null;
         const mapped = readSortMap()[String(tweetId)];
-        return mapped != null ? String(mapped) : null;
+        // Skip metadata keys accidentally looked up.
+        if (mapped == null || typeof mapped === 'object' || Array.isArray(mapped)) return null;
+        if (mapped === true || mapped === false) return null;
+        return String(mapped);
     }
 
     function isRepostArticle(article) {
@@ -1250,6 +1856,145 @@ function tpsInjectPageRealmScripts() {
         return navigationType() === 'reload';
     }
 
+    // After a merged jump, X renders from the top of a deep timeline. Use the
+    // published order list to estimate scroll position, correct from mounted
+    // articles, and land on the saved tweet near the top of the viewport.
+    async function positionMergedJump(saved, ctrl, timeStr) {
+        const meta = await waitForJumpOrder(ctrl, 6000);
+        if (ctrl.aborted) return finishPanel('Stopped');
+        if (!meta || !meta.order || !meta.order.length) {
+            jumpLog('positionMergedJump: no order list — fall through');
+            return 'continue';
+        }
+
+        const order = meta.order;
+        const N = order.length;
+        const tweetId = String(saved.tweetId);
+        const sortId = String(saved.sortId || saved.tweetId);
+        let idx = order.indexOf(tweetId);
+        if (idx < 0 && sortId !== tweetId) idx = order.indexOf(sortId);
+        if (idx < 0) {
+            // Map via sortmap: find order entry whose mapping equals tweetId/sortId.
+            const sm = readSortMap();
+            for (let i = 0; i < order.length; i++) {
+                const mapped = sm[order[i]];
+                if (mapped != null && (String(mapped) === tweetId || String(mapped) === sortId)) {
+                    idx = i;
+                    break;
+                }
+                if (String(order[i]) === tweetId || String(order[i]) === sortId) {
+                    idx = i;
+                    break;
+                }
+            }
+        }
+        if (idx < 0) {
+            jumpLog('positionMergedJump: target not in order', tweetId, sortId, 'N=', N);
+            return 'continue';
+        }
+
+        jumpLog('positionMergedJump start idx=', idx, '/', N, 'pages=', meta.pages);
+        updatePanel(`Positioning saved tweet (${idx + 1}/${N})…`);
+
+        const maxIters = 10;
+        for (let iter = 0; iter < maxIters && !ctrl.aborted; iter++) {
+            const landed = findTweetById(saved.tweetId);
+            if (landed) {
+                allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+                try {
+                    landed.scrollIntoView({ behavior: 'instant', block: 'start' });
+                } catch (_) {
+                    landed.scrollIntoView({ block: 'start' });
+                }
+                // Nudge so the tweet sits a bit below the sticky header.
+                try {
+                    const root = scrollRoot();
+                    root.scrollTop = Math.max(0, root.scrollTop - 12);
+                } catch (_) { /* ignore */ }
+                highlight(landed);
+                jumpLog('positionMergedJump landed iter=', iter);
+                return finishPanel(`Jumped to tweet from ${timeStr}`);
+            }
+
+            const root = scrollRoot();
+            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const mounted = [];
+            for (let a = 0; a < articles.length; a++) {
+                const id = extractTweetId(articles[a]);
+                if (!id) continue;
+                let oi = order.indexOf(id);
+                if (oi < 0) {
+                    const mapped = lookupSortId(id);
+                    if (mapped) oi = order.indexOf(String(mapped));
+                }
+                if (oi < 0) continue;
+                const rect = articles[a].getBoundingClientRect();
+                mounted.push({
+                    el: articles[a],
+                    id,
+                    i: oi,
+                    top: rect.top,
+                    height: rect.height || 1
+                });
+            }
+
+            let scrollTarget = null;
+            const scrollable = Math.max(0, (root.scrollHeight || 0) - (root.clientHeight || 0));
+
+            if (mounted.length >= 1) {
+                let sumH = 0;
+                for (let m = 0; m < mounted.length; m++) sumH += mounted[m].height;
+                const avgH = sumH / mounted.length;
+                // Prefer a mid mounted article as reference for proportional correction.
+                mounted.sort((x, y) => x.i - y.i);
+                const ref = mounted[Math.floor(mounted.length / 2)];
+                const refDocTop = (root.scrollTop || 0) + ref.top;
+                scrollTarget = refDocTop + (idx - ref.i) * avgH;
+                // Blend with fractional estimate when scrollHeight looks reserved.
+                if (scrollable > avgH * N * 0.25) {
+                    const fracY = (idx / Math.max(1, N - 1)) * scrollable;
+                    scrollTarget = 0.65 * scrollTarget + 0.35 * fracY;
+                }
+                jumpLog('position iter', iter, 'mounted=', mounted.length,
+                    'refI=', ref.i, 'avgH=', Math.round(avgH), 'targetY=', Math.round(scrollTarget));
+            } else if (scrollable > 0) {
+                scrollTarget = (idx / Math.max(1, N - 1)) * scrollable;
+                jumpLog('position iter', iter, 'no mounted; fracY=', Math.round(scrollTarget));
+            } else {
+                // Page still collapsing/reserving — wait.
+                jumpLog('position iter', iter, 'waiting for timeline height');
+                await sleep(200);
+                continue;
+            }
+
+            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+            try {
+                root.scrollTop = Math.max(0, scrollTarget);
+            } catch (_) { /* ignore */ }
+            try {
+                window.scrollTo(0, Math.max(0, scrollTarget));
+            } catch (_) { /* ignore */ }
+
+            const waitMs = 150 + Math.min(iter * 12, 100);
+            await sleep(waitMs);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            updatePanel(`Positioning saved tweet… (${iter + 1}/${maxIters})`);
+        }
+
+        if (ctrl.aborted) return finishPanel('Stopped');
+        const last = findTweetById(saved.tweetId);
+        if (last) {
+            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+            try { last.scrollIntoView({ behavior: 'instant', block: 'start' }); }
+            catch (_) { last.scrollIntoView({ block: 'start' }); }
+            highlight(last);
+            jumpLog('positionMergedJump landed after loop');
+            return finishPanel(`Jumped to tweet from ${timeStr}`);
+        }
+        jumpLog('positionMergedJump missed after', maxIters, 'iters — near search');
+        return 'continue';
+    }
+
     // After a cursor jump, search a limited number of steps toward the target.
     // Returns a finishPanel() result, or 'continue' to fall through to full search.
     async function searchNearJump(saved, ctrl, timeStr) {
@@ -1345,46 +2090,76 @@ function tpsInjectPageRealmScripts() {
 
             if (wantJump) {
                 updatePanel(`Jumping near tweet from ${timeStr}…`);
-                let used = jumpWasUsed() || await waitForJumpUsed(ctrl, 2500);
+                const jumpWaitMs = CONFIG.jumpMerge === false ? 2500 : 15000;
+                let used = jumpWasUsed() || await waitForJumpUsed(ctrl, jumpWaitMs);
                 if (ctrl.aborted) return finishPanel('Stopped');
 
                 // Timeline may have loaded before the hook was armed — try one
                 // tab switch away and back to force a fresh ListLatestTweetsTimeline.
                 if (!used) {
-                    log('Jump not consumed; trying tab-switch refetch');
+                    jumpLog('Jump not consumed; trying tab-switch refetch');
                     updatePanel(`Refreshing "${CONFIG.targetTab}" for jump…`);
                     armCursorJump(saved, 15000);
                     const refetched = await refetchTargetTabWithJump(saved, ctrl);
                     if (ctrl.aborted) return finishPanel('Stopped');
                     if (refetched) {
-                        used = jumpWasUsed() || await waitForJumpUsed(ctrl, 2500);
+                        used = jumpWasUsed() || await waitForJumpUsed(ctrl, jumpWaitMs);
                     }
                 }
 
                 if (used) {
-                    // Do NOT scroll to top — wait for the jumped page to render.
+                    // Merged path chains many pages — wait until hook clears busy.
+                    if (jumpIsBusy()) {
+                        updatePanel(`Loading timeline to tweet from ${timeStr}…`);
+                        jumpLog('Waiting for jump merge to finish…');
+                        await waitForJumpIdle(ctrl, 90000);
+                        if (ctrl.aborted) return finishPanel('Stopped');
+                    }
+                    const mergedHint = jumpWasMerged();
+                    updatePanel(mergedHint
+                        ? `Positioning tweet from ${timeStr}…`
+                        : `Jumping near tweet from ${timeStr}…`);
                     await waitForContentToSettle(ctrl);
                     if (ctrl.aborted) return finishPanel('Stopped');
-                    for (let i = 0; i < 20 && !findTweetById(saved.tweetId); i++) {
-                        if (ctrl.aborted) return finishPanel('Stopped');
-                        await sleep(100);
-                    }
-                    const landed = findTweetById(saved.tweetId);
-                    if (landed) {
-                        allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
-                        landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                        highlight(landed);
-                        log('Jumped to', saved.tweetId);
-                        return finishPanel(`Jumped near tweet from ${timeStr}`);
+
+                    // Give the hook a moment to publish order after merge.
+                    if (!mergedHint) {
+                        for (let i = 0; i < 30 && !jumpWasMerged(); i++) {
+                            if (ctrl.aborted) return finishPanel('Stopped');
+                            await sleep(100);
+                            if (jumpWasMerged()) break;
+                        }
+                    } else {
+                        await sleep(150);
                     }
 
-                    // Limited near-jump search: UP first if target sort is newer than
-                    // the newest mounted post, otherwise DOWN.
-                    jumpedNear = true;
-                    const nearResult = await searchNearJump(saved, ctrl, timeStr);
-                    if (nearResult !== 'continue') return nearResult;
+                    if (jumpWasMerged()) {
+                        jumpLog('Using merged-jump positioning');
+                        const mergedResult = await positionMergedJump(saved, ctrl, timeStr);
+                        if (mergedResult !== 'continue') return mergedResult;
+                        jumpedNear = true;
+                        const nearAfterMerge = await searchNearJump(saved, ctrl, timeStr);
+                        if (nearAfterMerge !== 'continue') return nearAfterMerge;
+                    } else {
+                        for (let i = 0; i < 20 && !findTweetById(saved.tweetId); i++) {
+                            if (ctrl.aborted) return finishPanel('Stopped');
+                            await sleep(100);
+                        }
+                        const landed = findTweetById(saved.tweetId);
+                        if (landed) {
+                            allowProgrammaticScroll(CONFIG.stepMaxWaitMs + 2000);
+                            landed.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                            highlight(landed);
+                            jumpLog('Jumped to', saved.tweetId);
+                            return finishPanel(`Jumped near tweet from ${timeStr}`);
+                        }
+
+                        jumpedNear = true;
+                        const nearResult = await searchNearJump(saved, ctrl, timeStr);
+                        if (nearResult !== 'continue') return nearResult;
+                    }
                 } else {
-                    log('Jump unused; falling back to scroll search from top');
+                    jumpLog('Jump unused; falling back to scroll search from top');
                 }
             }
 

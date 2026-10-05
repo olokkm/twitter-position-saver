@@ -343,6 +343,344 @@ assert(jumpB === sortId + (BigInt(60 * 60 * 1000) << 22n), 'B = sortId + jumpLea
 
 console.log('info: sortId jump B leads original by', Number((jumpB - wrongB) >> 22n), 'ms of snowflake time');
 
+// --- v3.29 merged jump helpers (mirrors page-hook pure functions) ---
+
+function extractPageParts(json) {
+  return extractSortMapFromListJsonExtended(json);
+}
+
+function unwrapTweetResult2(result) {
+  if (!result || typeof result !== 'object') return null;
+  if (result.__typename === 'TweetWithVisibilityResults' && result.tweet) return result.tweet;
+  return result;
+}
+
+function extractSortMapFromListJsonExtended(json) {
+  const sortIndexes = [];
+  const pairs = [];
+  const tweets = [];
+  let topCursor = null;
+  let bottomCursor = null;
+  const tl = json && json.data && json.data.list &&
+    json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+  const instructions = tl && tl.instructions;
+  if (!Array.isArray(instructions)) {
+    return { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds: [] };
+  }
+  function addFromTweetResult(result, sortIndex) {
+    const tweet = unwrapTweetResult2(result);
+    if (!tweet) return;
+    if (tweet.rest_id) pairs.push([String(tweet.rest_id), sortIndex]);
+    const rt = tweet.legacy && tweet.legacy.retweeted_status_result &&
+      tweet.legacy.retweeted_status_result.result;
+    if (rt) {
+      const inner = unwrapTweetResult2(rt);
+      if (inner && inner.rest_id) pairs.push([String(inner.rest_id), sortIndex]);
+    }
+  }
+  for (const inst of instructions) {
+    if (!inst || inst.type !== 'TimelineAddEntries' || !Array.isArray(inst.entries)) continue;
+    for (const ent of inst.entries) {
+      if (!ent) continue;
+      const eid = ent.entryId;
+      if (typeof eid === 'string' && eid.startsWith('cursor-top-')) { topCursor = ent; continue; }
+      if (typeof eid === 'string' && eid.startsWith('cursor-bottom-')) { bottomCursor = ent; continue; }
+      const ct = ent.content && ent.content.cursorType;
+      if (ct === 'Top') { topCursor = ent; continue; }
+      if (ct === 'Bottom') { bottomCursor = ent; continue; }
+      const sortIndex = ent.sortIndex != null ? String(ent.sortIndex) : null;
+      if (typeof eid !== 'string' || !eid.startsWith('tweet-') || !sortIndex) continue;
+      if (!/^\d+$/.test(sortIndex)) continue;
+      const result = ent.content && ent.content.itemContent &&
+        ent.content.itemContent.tweet_results &&
+        ent.content.itemContent.tweet_results.result;
+      const outer = unwrapTweetResult2(result);
+      const fromEntry = eid.slice(6);
+      const pos = outer && outer.rest_id && /^\d+$/.test(String(outer.rest_id))
+        ? String(outer.rest_id)
+        : (/^\d+$/.test(fromEntry) ? fromEntry : null);
+      if (!pos) continue;
+      sortIndexes.push(BigInt(pos));
+      pairs.push([pos, pos]);
+      if (/^\d+$/.test(fromEntry)) pairs.push([fromEntry, pos]);
+      addFromTweetResult(result, pos);
+      tweets.push(ent);
+    }
+  }
+  return {
+    sortIndexes,
+    pairs,
+    tweets,
+    topCursor,
+    bottomCursor,
+    positionIds: sortIndexes.map(String)
+  };
+}
+
+function pagePassesTarget(positionIds, targetPosId) {
+  if (!targetPosId || !positionIds || !positionIds.length) return false;
+  const target = BigInt(String(targetPosId));
+  for (const id of positionIds) {
+    if (BigInt(id) === target) return true;
+  }
+  const oldest = BigInt(positionIds[positionIds.length - 1]);
+  return oldest <= target;
+}
+
+function mergeTimelinePages(pageJsons) {
+  if (!pageJsons || !pageJsons.length) return null;
+  const base = JSON.parse(JSON.stringify(pageJsons[0]));
+  const tl = base.data.list.tweets_timeline.timeline;
+  let addInst = tl.instructions.find((i) => i && i.type === 'TimelineAddEntries');
+  if (!addInst) {
+    addInst = { type: 'TimelineAddEntries', entries: [] };
+    tl.instructions.push(addInst);
+  }
+  const seen = new Set();
+  const mergedTweets = [];
+  let topCursor = null;
+  let bottomCursor = null;
+  const order = [];
+  for (let p = 0; p < pageJsons.length; p++) {
+    const extracted = extractSortMapFromListJsonExtended(pageJsons[p]);
+    if (p === 0 && extracted.topCursor) topCursor = extracted.topCursor;
+    if (extracted.bottomCursor) bottomCursor = extracted.bottomCursor;
+    for (const ent of extracted.tweets) {
+      if (!ent.entryId || seen.has(ent.entryId)) continue;
+      seen.add(ent.entryId);
+      mergedTweets.push(ent);
+    }
+    for (const pid of extracted.positionIds) {
+      if (!order.includes(pid)) order.push(pid);
+    }
+  }
+  const entries = mergedTweets.slice();
+  if (topCursor) entries.push(topCursor);
+  if (bottomCursor) entries.push(bottomCursor);
+  addInst.entries = entries;
+  tl.instructions = tl.instructions.filter((inst) => !inst || inst.type !== 'TimelineAddEntries' || inst === addInst);
+  return { json: base, order, tweetCount: mergedTweets.length };
+}
+
+function mergeStopDecision(pagesFetched, reachedAt, maxPages, hasBottom) {
+  if (pagesFetched >= maxPages) return 'cap';
+  if (reachedAt >= 0 && pagesFetched > reachedAt + 1) return 'done';
+  if (!hasBottom) return reachedAt >= 0 ? 'done' : 'no-bottom';
+  return 'continue';
+}
+
+function makeTweetEntry(id, sortIndex) {
+  return {
+    entryId: `tweet-${id}`,
+    sortIndex: String(sortIndex),
+    content: {
+      itemContent: {
+        tweet_results: {
+          result: { __typename: 'Tweet', rest_id: String(id), legacy: {} }
+        }
+      }
+    }
+  };
+}
+
+function makePage(tweetIds, opts = {}) {
+  const entries = tweetIds.map((id, i) => makeTweetEntry(id, opts.sortBase ? opts.sortBase - i : id));
+  if (opts.top) {
+    entries.push({
+      entryId: `cursor-top-${opts.top}`,
+      sortIndex: '0',
+      content: { cursorType: 'Top', value: opts.top }
+    });
+  }
+  if (opts.bottom) {
+    entries.push({
+      entryId: `cursor-bottom-${opts.bottom}`,
+      sortIndex: '0',
+      content: { cursorType: 'Bottom', value: opts.bottom }
+    });
+  }
+  return {
+    data: {
+      list: {
+        tweets_timeline: {
+          timeline: {
+            instructions: [{ type: 'TimelineAddEntries', entries }]
+          }
+        }
+      }
+    }
+  };
+}
+
+// Page 1: ids 300,290,280 (newest→oldest); page 2: 270,260,250; page 3: 240,230,220
+const page1 = makePage(['300', '290', '280'], { top: 'TOP1', bottom: 'BOT1', sortBase: 1000 });
+const page2 = makePage(['270', '260', '250'], { top: 'TOP2', bottom: 'BOT2', sortBase: 997 });
+const page3 = makePage(['240', '230', '220'], { top: 'TOP3', bottom: 'BOT3', sortBase: 994 });
+// Overlap/dupe with page2
+const page2b = makePage(['260', '250', '240'], { top: 'TOP2b', bottom: 'BOT2b', sortBase: 996 });
+
+const p1ex = extractSortMapFromListJsonExtended(page1);
+assert(p1ex.positionIds.join(',') === '300,290,280', 'page1 positionIds newest→oldest');
+assert(p1ex.topCursor && p1ex.topCursor.content.value === 'TOP1', 'page1 top cursor');
+assert(p1ex.bottomCursor && p1ex.bottomCursor.content.value === 'BOT1', 'page1 bottom cursor');
+assert(pagePassesTarget(p1ex.positionIds, '280'), 'passes when target is oldest on page');
+assert(pagePassesTarget(p1ex.positionIds, '285'), 'passes when oldest <= target (285 between 290 and 280)');
+assert(!pagePassesTarget(p1ex.positionIds, '270'), 'does not pass when target older than page');
+assert(pagePassesTarget(p1ex.positionIds, '290'), 'passes when target contained');
+
+const merged = mergeTimelinePages([page1, page2, page3]);
+assert(!!merged, 'merge returns result');
+assert(merged.tweetCount === 9, 'merged 9 unique tweets');
+assert(merged.order.join(',') === '300,290,280,270,260,250,240,230,220', 'merged order newest first');
+const mergedEx = extractSortMapFromListJsonExtended(merged.json);
+assert(mergedEx.topCursor.content.value === 'TOP1', 'merged keeps first page top cursor');
+assert(mergedEx.bottomCursor.content.value === 'BOT3', 'merged keeps last page bottom cursor');
+assert(mergedEx.tweets[0].sortIndex === '1000', 'keeps server sortIndex from page1');
+assert(mergedEx.tweets[3].sortIndex === '997', 'keeps server sortIndex from page2');
+
+const mergedDup = mergeTimelinePages([page1, page2b]);
+// page1: 300,290,280; page2b: 260,250,240 → all unique = 6
+assert(mergedDup.tweetCount === 6, 'dedupe: 6 unique when no overlap of entryIds');
+const pageOverlap = makePage(['280', '270', '260'], { bottom: 'BOTx', sortBase: 990 });
+const mergedOv = mergeTimelinePages([page1, pageOverlap]);
+assert(mergedOv.tweetCount === 5, 'dedupe overlapping tweet-280');
+assert(mergedOv.order.filter((x) => x === '280').length === 1, 'order deduped');
+
+// Stop condition / cap
+assert(mergeStopDecision(1, -1, 12, true) === 'continue', 'continue before target');
+assert(mergeStopDecision(3, 2, 12, true) === 'continue', 'need +1 after reach');
+assert(mergeStopDecision(4, 2, 12, true) === 'done', 'done after +1 page');
+assert(mergeStopDecision(12, -1, 12, true) === 'cap', 'cap without target');
+assert(mergeStopDecision(5, 4, 12, false) === 'done', 'done when no bottom after reach');
+assert(mergeStopDecision(2, -1, 12, false) === 'no-bottom', 'no-bottom before reach');
+
+// Cap fallback scenario: 2 pages, target not reached, max 2 → cap
+{
+  const pages = [page1, page2];
+  let reachedAt = -1;
+  for (let i = 0; i < pages.length; i++) {
+    const ex = extractSortMapFromListJsonExtended(pages[i]);
+    if (reachedAt < 0 && pagePassesTarget(ex.positionIds, '100')) reachedAt = i;
+  }
+  assert(reachedAt < 0, 'target 100 not in sample pages');
+  assert(mergeStopDecision(pages.length, reachedAt, 2, true) === 'cap', 'cap triggers fallback path');
+}
+
+// Simulate stop when target on page2 (index 1): need pages 1,2,3
+{
+  let reachedAt = -1;
+  const seq = [page1, page2, page3];
+  const fetched = [];
+  for (let i = 0; i < seq.length; i++) {
+    fetched.push(seq[i]);
+    const ex = extractSortMapFromListJsonExtended(seq[i]);
+    if (reachedAt < 0 && pagePassesTarget(ex.positionIds, '255')) reachedAt = i;
+    const hasBottom = !!ex.bottomCursor;
+    const d = mergeStopDecision(fetched.length, reachedAt, 12, hasBottom);
+    if (d === 'done' || d === 'cap') break;
+  }
+  assert(reachedAt === 1, 'target 255 reached on page2');
+  assert(fetched.length === 3, 'fetched +1 page after reach');
+}
+
+// --- fake XHR complete ---
+function fakeXhrComplete(xhr, bodyText, responseURL) {
+  const rt = xhr.responseType || '';
+  let parsedJson = null;
+  const getJson = () => {
+    if (parsedJson == null) parsedJson = JSON.parse(bodyText);
+    return parsedJson;
+  };
+  Object.defineProperty(xhr, 'readyState', { configurable: true, get: () => 4 });
+  Object.defineProperty(xhr, 'status', { configurable: true, get: () => 200 });
+  Object.defineProperty(xhr, 'statusText', { configurable: true, get: () => 'OK' });
+  Object.defineProperty(xhr, 'responseURL', { configurable: true, get: () => responseURL || '' });
+  Object.defineProperty(xhr, 'responseText', { configurable: true, get: () => bodyText });
+  Object.defineProperty(xhr, 'response', {
+    configurable: true,
+    get: () => {
+      if (rt === 'json') return getJson();
+      return bodyText;
+    }
+  });
+  xhr.getResponseHeader = (name) =>
+    (name && String(name).toLowerCase() === 'content-type' ? 'application/json' : null);
+  xhr.getAllResponseHeaders = () => 'content-type: application/json\r\n';
+
+  const fire = () => {
+    if (typeof xhr.onreadystatechange === 'function') xhr.onreadystatechange();
+    xhr.dispatchEvent(new Event('readystatechange'));
+    if (typeof xhr.onload === 'function') xhr.onload();
+    xhr.dispatchEvent(new Event('load'));
+    xhr.dispatchEvent(new Event('loadend'));
+    if (typeof xhr.onloadend === 'function') xhr.onloadend();
+  };
+  setTimeout(fire, 0);
+}
+
+class MockXHR extends EventTarget {
+  constructor() {
+    super();
+    this.readyState = 1;
+    this.status = 0;
+    this.statusText = '';
+    this.responseText = '';
+    this.response = '';
+    this.responseURL = '';
+    this.responseType = '';
+    this.onreadystatechange = null;
+    this.onload = null;
+    this.onloadend = null;
+    this._events = [];
+  }
+}
+
+await new Promise((resolve, reject) => {
+  const xhr = new MockXHR();
+  const body = JSON.stringify({ ok: true, n: 1 });
+  xhr.onreadystatechange = () => xhr._events.push('onreadystatechange');
+  xhr.onload = () => xhr._events.push('onload');
+  xhr.onloadend = () => xhr._events.push('onloadend');
+  xhr.addEventListener('readystatechange', () => xhr._events.push('readystatechange'));
+  xhr.addEventListener('load', () => xhr._events.push('load'));
+  xhr.addEventListener('loadend', () => xhr._events.push('loadend'));
+  fakeXhrComplete(xhr, body, 'https://x.com/i/api/graphql/hash/ListLatestTweetsTimeline');
+  setTimeout(() => {
+    try {
+      assert(xhr.readyState === 4, 'fake xhr readyState 4');
+      assert(xhr.status === 200, 'fake xhr status 200');
+      assert(xhr.statusText === 'OK', 'fake xhr statusText OK');
+      assert(xhr.responseText === body, 'fake xhr responseText');
+      assert(xhr.responseURL.includes('ListLatestTweetsTimeline'), 'fake xhr responseURL');
+      assert(xhr.getResponseHeader('content-type') === 'application/json', 'fake xhr content-type');
+      const expected = [
+        'onreadystatechange', 'readystatechange',
+        'onload', 'load',
+        'loadend', 'onloadend'
+      ];
+      assert(
+        xhr._events.join(',') === expected.join(','),
+        `fake xhr event order: ${xhr._events.join(' > ')}`
+      );
+      xhr.responseType = 'json';
+      // redefine response getter path by re-faking
+      const xhr2 = new MockXHR();
+      xhr2.responseType = 'json';
+      fakeXhrComplete(xhr2, body, 'https://example/test');
+      setTimeout(() => {
+        try {
+          assert(xhr2.response && xhr2.response.ok === true, 'fake xhr responseType json parses');
+          resolve();
+        } catch (e) { reject(e); }
+      }, 5);
+    } catch (e) {
+      reject(e);
+    }
+  }, 5);
+});
+
+console.log('info: v3.29 merge/xhr tests done');
+
 if (failed) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);
