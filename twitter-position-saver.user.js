@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.40
+// @version      3.41
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.40';
+const TPS_VERSION = '3.41';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -1243,10 +1243,14 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                         setJumpResult('merge:ok p=' + collected.pages.length + ' n=' + merged.tweetCount);
                         jumpLog('merge ok pages=', collected.pages.length,
                             'tweets=', merged.tweetCount, 'order=', merged.order.length);
+                        const mergedText = JSON.stringify(merged.json);
+                        // v3.41: drop parsed pages before handing X the body (peak memory).
+                        collected.pages.length = 0;
+                        merged.json = null;
                         return {
                             ok: true,
                             merged: true,
-                            text: JSON.stringify(merged.json),
+                            text: mergedText,
                             url: headUrl
                         };
                     }
@@ -2886,23 +2890,24 @@ function tpsInjectPageRealmScripts() {
             if (ctrl.aborted) return finishPanel('Stopped');
             if (userControlAfterLand) return finishPanel('Stopped');
 
-            const root = scrollRoot();
-            const view = (window.innerHeight || 600) * 0.8;
+            // v3.41: one paced write via scrollByNudge. Before, this wrote
+            // root.scrollTop AND window.scrollBy on the same scroller (2x
+            // 0.8 screen every ~180ms ≈ 9 screens/s), faster than X can
+            // unmount old posts on iOS → tab killed on deep (multi-day) restores.
+            if (await holdForMountedCap(ctrl) === 'aborted') return finishPanel('Stopped');
+            if (mountedTweetCount() > (CONFIG.maxMountedTweets || 100)) {
+                return finishWithCode('Stopped — too many posts mounted', 'pos:capped');
+            }
+            const nudge = dirDown ? stepNudge() : -Math.round(stepNudge() * 0.8);
             tpsScrollWrite(dirDown ? 'near-down' : 'near-up', function () {
-                if (dirDown) {
-                    root.scrollTop = (root.scrollTop || 0) + view;
-                    window.scrollBy(0, view);
-                } else {
-                    root.scrollTop = Math.max(0, (root.scrollTop || 0) - view);
-                    window.scrollBy(0, -view);
-                }
+                scrollByNudge(nudge);
             });
 
             updatePanel(
                 (dirDown ? 'Searching down' : 'Searching up') +
                 ' after merge (step ' + step + '/' + maxSteps + ')…'
             );
-            await sleep(180);
+            await waitForStep(saved.tweetId, ctrl, currentTweetIds());
             await waitForVirtualizer(ctrl);
         }
         if (ctrl.aborted) return finishPanel('Stopped');
