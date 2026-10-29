@@ -1264,8 +1264,9 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
     env.attrs.set('data-tps-near-top', '0');
     let reqBefore = env.requests.length;
     const held = await clientGet(env, fx.listUrl(first.topVal, 40));
-    assert(held.ids.length === 0 && env.requests.length === reqBefore && held.topVal === first.topVal,
-      `v3.42 fill ${name}: poll while not near top → hold, same Top cursor, no fetch`);
+    const heldTopLeak = env.requests.slice(reqBefore).filter((u) => u === fx.listUrl(first.topVal, 40)).length;
+    assert(held.ids.length === 0 && heldTopLeak === 0 && held.topVal === first.topVal,
+      `v3.43 fill ${name}: poll while not near top → hold, same Top cursor, X's request not sent`);
     assert(env.attrs.get('data-tps-fill') === 'hold', `v3.42 fill ${name}: state hold`);
 
     // near top → contiguous fill responses until "now"
@@ -1285,6 +1286,11 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
     const c = contiguousFrom0(ds, [...loaded].filter((id) => idxOf(ds).get(id) <= idxOf(ds).get(first.ids[0])));
     const all = contiguousFrom0(ds, loaded);
     assert(env.attrs.get('data-tps-fill') === 'now', `v3.42 fill ${name}: reached now after ${responses} Top responses`);
+    // v3.43: X asks at most once a minute, so each answer must be a big
+    // chunk: ≤ ceil(newer posts / 400) + 1 responses to reach now.
+    const newerThanWindow = idxOf(ds).get(first.ids[0]);
+    assert(responses <= Math.ceil(newerThanWindow / 400) + 1,
+      `v3.43 fill ${name}: ${newerThanWindow} newer posts in ${responses} Top responses (big chunks)`);
     assert(c.ok && all.ok, `v3.42 fill ${name}: no gaps (${all.n} posts contiguous from newest)`);
     assert(topLeak === 0, `v3.42 fill ${name}: X's Top request never reached the backend while filling`);
     // after now: polling passes through unchanged
@@ -1296,7 +1302,7 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
 
   // 6) step cap: a very dense list stops filling after FILL_MAX_STEPS, without gaps
   {
-    const dense = fx.makeDataset({ nowMs: now, days: 4, posts: 9000, seed: 9 });
+    const dense = fx.makeDataset({ nowMs: now, days: 4, posts: 24000, seed: 9 });
     const env = makeHookEnv(dense);
     const t = dense[dense.length - 10];
     arm(env, t.id);
@@ -1314,8 +1320,8 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
     const idx = [...loaded].map((id) => ix.get(id)).sort((a, b) => a - b);
     let gaps = 0;
     for (let i = 1; i < idx.length; i++) if (idx[i] !== idx[i - 1] + 1) gaps++;
-    assert(env.attrs.get('data-tps-fill') === 'cap' && env.g.__tpsJumpSession().steps === 200,
-      `v3.42 fill cap: stops after 200 steps (${responses} responses, ${loaded.size} posts)`);
+    assert(env.attrs.get('data-tps-fill') === 'cap' && env.g.__tpsJumpSession().steps === 400,
+      `v3.43 fill cap: stops after 400 steps (${responses} responses, ${loaded.size} posts)`);
     assert(gaps === 0, 'v3.42 fill cap: what was loaded is contiguous');
   }
   console.log = origLog;

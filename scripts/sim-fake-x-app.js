@@ -1,14 +1,24 @@
 // Minimal fake x.com/home for scripts/sim-ios-jump.mjs (no real X, no login).
 // Mobile layout, For you / Following / Olo tabs (Olo selected), a virtualized
 // list timeline driven by ListLatestTweetsTimeline with X-like cursor use:
-// initial + Bottom requests count 20, Top requests count 40, Top skipped when
-// fresher than STALE_MS (X: 60 s; compressed for the sim), background poll,
-// manual scroll anchoring on prepend (overflow-anchor is off).
+// initial + Bottom requests count 20, Top requests count 40, manual scroll
+// anchoring on prepend (overflow-anchor is off).
+// Top fetches follow X's client (SCROLLER / AbsolutePower edge proximity):
+//  - near_top: onNearStart fires only when the viewport top ENTERS the zone
+//    (list top + 0.25 * viewport height) or the list length changes while
+//    inside; it is skipped when the last top/initial fetch is younger than
+//    staleIntervalMs (X: 60 s, lastTopFetchTimestamp).
+//  - foreground poll (only if SIM.pollMs > 0): fetchInitialOrTop({polling}),
+//    header x-twitter-polling: true, not stale-gated.
+//  - refreshOrGoTop (tap on the Home nav link while on /home): at newest
+//    (viewport top within 50 px of the list top) → refresh = Top fetch with
+//    no stale gate; otherwise scroll to top.
 (function () {
   'use strict';
   const SIM = window.__SIM || {};
-  const STALE_MS = SIM.staleMs || 2000;
-  const POLL_MS = SIM.pollMs || 3000;
+  const STALE_MS = SIM.staleMs != null ? SIM.staleMs : 60000;
+  const POLL_MS = SIM.pollMs || 0;
+  const NEAR_START_RATIO = 0.25;
   const OVERSCAN = 1.5;
   let cells = []; // newest first: {id, iso, text, h}
   const byId = new Map();
@@ -17,7 +27,8 @@
   let offsets = [];
   let tabSel = 'Olo';
   let tl, mounted = new Map();
-  const stats = window.__simStats = { topReq: 0, bottomReq: 0, headReq: 0, prepended: 0, appended: 0, maxMounted: 0 };
+  let nearStartInside = null, nearStartLen = -1;
+  const stats = window.__simStats = { staleSkips: 0, refreshes: 0, topReq: 0, bottomReq: 0, headReq: 0, prepended: 0, appended: 0, maxMounted: 0 };
 
   function hashH(id) { let h = 0; for (const c of id.slice(-6)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return 150 + (h % 5) * 30; }
   function url(cursor, count) {
@@ -39,8 +50,9 @@
     }
     return { tweets, top, bottom };
   }
-  async function get(u) {
-    const res = await fetch(u, { headers: { authorization: 'Bearer sim', 'x-csrf-token': 'sim', 'x-client-transaction-id': 'sim' }, credentials: 'include' });
+  async function get(u, extra) {
+    const headers = Object.assign({ authorization: 'Bearer sim', 'x-csrf-token': 'sim', 'x-client-transaction-id': 'sim' }, extra || {});
+    const res = await fetch(u, { headers, credentials: 'include' });
     return parse(await res.json());
   }
   function relayout() {
@@ -89,12 +101,16 @@
       // X keeps the reading position when it inserts above (manual anchoring).
       if (y > 0) window.scrollTo(0, y + addH);
       stats.prepended += fresh.length;
+      render();
+      checkNearStart();
+      return fresh.length;
     } else {
       cells = cells.concat(fresh);
       relayout();
       stats.appended += fresh.length;
     }
     render();
+    checkNearStart();
     return fresh.length;
   }
   async function loadHead() {
@@ -108,10 +124,11 @@
   }
   async function loadTop(reason) {
     if (busyTop || !topCursor || tabSel !== 'Olo') return;
-    if (Date.now() - lastTopAt < STALE_MS) return; // onlyIfStale
+    // near_top is onlyIfStale; polls and refresh are not.
+    if (reason === 'near-top' && Date.now() - lastTopAt < STALE_MS) { stats.staleSkips++; return; }
     busyTop = true; stats.topReq++;
     try {
-      const r = await get(url(topCursor, 40));
+      const r = await get(url(topCursor, 40), reason === 'poll' ? { 'x-twitter-polling': 'true' } : null);
       add(r.tweets, 'top');
       if (r.top) topCursor = r.top;
       lastTopAt = Date.now();
@@ -131,7 +148,23 @@
     const vh = window.innerHeight;
     const max = document.documentElement.scrollHeight - vh;
     if (window.scrollY > max - 2.5 * vh) loadBottom();
-    if (window.scrollY < vh) loadTop('near-top');
+    checkNearStart();
+  }
+  function listTopDoc() { return tl.getBoundingClientRect().top + window.scrollY; }
+  // X edge proximity: fire on OUTSIDE→INSIDE movement, or on a list length
+  // change while inside (LIST_UPDATE). Never repeatedly while just sitting.
+  function checkNearStart() {
+    if (!tl || !cells.length) return;
+    const inside = window.scrollY - listTopDoc() <= NEAR_START_RATIO * window.innerHeight;
+    const fire = inside && (nearStartInside === false || nearStartInside === null || nearStartLen !== cells.length);
+    nearStartInside = inside; nearStartLen = cells.length;
+    if (fire) loadTop('near-top');
+  }
+  function isAtNewest() { return window.scrollY - listTopDoc() <= 50; }
+  function refreshOrGoTop() {
+    if (!isAtNewest()) { window.scrollTo(0, 0); return; }
+    stats.refreshes++;
+    loadTop('refresh');
   }
   function selectTab(name) {
     tabSel = name;
@@ -162,9 +195,16 @@
     // land on a status link).
     document.addEventListener('click', (e) => { if (e.target.closest && e.target.closest('a')) e.preventDefault(); }, true);
     window.addEventListener('scroll', onScroll, { passive: true });
-    setInterval(() => loadTop('poll'), POLL_MS);
+    if (POLL_MS > 0) setInterval(() => loadTop('poll'), POLL_MS);
+    // Bottom nav Home link (mobile): tapping it on /home = onTabRefresh.
+    const nav = document.createElement('nav');
+    nav.setAttribute('role', 'navigation');
+    nav.innerHTML = '<a href="/home" data-testid="AppTabBar_Home_Link" aria-label="Home" role="link">Home</a>';
+    nav.style.cssText = 'position:fixed;bottom:0;left:0;right:0;height:50px;background:#000;border-top:1px solid #2f3336;z-index:6;text-align:center;line-height:50px';
+    document.body.appendChild(nav);
+    nav.querySelector('a').addEventListener('click', (e) => { e.preventDefault(); refreshOrGoTop(); });
     setTimeout(loadHead, SIM.headDelayMs || 400);
-    window.__simApp = { ids: () => cells.map((c) => c.id), topCursor: () => topCursor, stats };
+    window.__simApp = { ids: () => cells.map((c) => c.id), topCursor: () => topCursor, stats, lastTopAt: () => lastTopAt };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

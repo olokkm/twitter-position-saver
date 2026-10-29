@@ -28,7 +28,9 @@ const puppeteer = require('puppeteer-core');
 const TARGETS = opt('targets', '4d,1d,1h,crash').split(',');
 const VIDEO = opt('video', null);
 const SEED = Number(opt('seed', 7));
-const STALE_MS = 2000, POLL_MS = 3000;
+// X's real staleIntervalMs is 60 s; polls default off (list timelines).
+const STALE_MS = Number(opt('stale', 60000)), POLL_MS = Number(opt('poll', 0));
+const SCROLL_BUDGET_MS = Number(opt('budget', 200000));
 const AGO = { '4d': 4 * 864e5, '3d': 3 * 864e5, '1d': 864e5, '6h': 6 * 36e5, '1h': 36e5 };
 
 const hookSrc = readFileSync(join(root, 'gear-extension/page-hook.js'), 'utf8');
@@ -112,6 +114,7 @@ async function runTarget(browser, label) {
   page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
   const consoleErrors = [];
   page.on('pageerror', (e) => consoleErrors.push(String(e.message || e)));
+  if (process.env.SIM_LOG) page.on('console', (m) => { const t = m.text(); if (/TPS jump|fill|kick/.test(t)) console.error(((Date.now() - t0) / 1000).toFixed(1) + 's', t.slice(0, 200)); });
 
   if (VIDEO) await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 390, maxHeight: 844, everyNthFrame: 1 });
   const t0 = Date.now();
@@ -187,7 +190,7 @@ async function runTarget(browser, label) {
 
   // Idle away from the top: background polls must be held (no backend Top).
   const logBeforeIdle = fake.log.length;
-  await sleep(POLL_MS * 2 + 500);
+  await sleep(Math.max(POLL_MS * 2, 3000) + 500);
   const idleTop = fake.log.slice(logBeforeIdle).filter((e) => e.kind === 'top' || e.kind === 'head').length;
   const idleFill = await page.evaluate(() => document.documentElement.getAttribute('data-tps-fill'));
 
@@ -203,21 +206,29 @@ async function runTarget(browser, label) {
   const ds_index = new Map(ds.map((p, i) => [p.id, i]));
   let reachedNow = false, gestures = 0, gapEver = 0;
   const tScroll = Date.now();
-  while (Date.now() - tScroll < 240000) {
+  let atTopWaits = 0;
+  while (Date.now() - tScroll < SCROLL_BUDGET_MS) {
     // A touch tap first (counts as a gesture like a finger on the screen),
     // then a wheel-type scroll gesture: headless Chrome ignores synthesized
     // touch scrolls, so the swipe itself is a 'mouse' gesture.
     if (gestures === 0) await page.touchscreen.tap(195, 600);
-    await cdp.send('Input.synthesizeScrollGesture', { x: 195, y: 400, yDistance: 1600, speed: 3000, gestureSourceType: 'mouse' });
-    gestures++;
-    await sleep(250);
+    // A reader at the very top of the list stops swiping and waits for
+    // newer posts (as on the phone) instead of swiping forever.
+    const yNow = await page.evaluate(() => scrollY);
+    if (gestures > 0 && yNow < 5) { atTopWaits++; await sleep(1000); }
+    else {
+      await cdp.send('Input.synthesizeScrollGesture', { x: 195, y: 400, yDistance: 1600, speed: 3000, gestureSourceType: 'mouse' });
+      gestures++;
+      await sleep(250);
+    }
     const g = await checkGaps();
     contiguity.push(g);
     if (g.gaps) gapEver++;
     const y = await page.evaluate(() => scrollY);
     if (g.newest === 0 && y < 5) { reachedNow = true; break; }
   }
-  await sleep(STALE_MS + 1500);
+  const tReached = Date.now();
+  await sleep(1500);
   const end = await checkGaps();
   const endState = await page.evaluate(() => ({
     fill: document.documentElement.getAttribute('data-tps-fill'),
@@ -238,7 +249,8 @@ async function runTarget(browser, label) {
     fillEnd: endState.fill, maxMounted: Math.max(endState.maxMounted, endState.appMax), reloads,
     backend: { total: fake.log.length, top: fake.log.filter((e) => e.kind === 'top').length,
       bottom: fake.log.filter((e) => e.kind === 'bottom').length, head: fake.log.filter((e) => e.kind === 'head').length },
-    lastTopB: lastTop ? lastTop.B : null, pageErrors: consoleErrors.slice(0, 5)
+    lastTopB: lastTop ? lastTop.B : null, app: endState.stats, atTopWaitSec: atTopWaits, scrollSec: Math.round((tReached - tScroll) / 1000),
+    pageErrors: consoleErrors.slice(0, 5)
   };
   res.pass = res.landed && res.reachedNow && !res.gapEver && !res.endGaps && res.maxMounted <= 100 &&
     res.reloads === 0 && (res.mode !== 'window' || res.idleBackendTop === 0) && !res.pageErrors.length;

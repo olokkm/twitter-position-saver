@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.42
+// @version      3.43
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.42';
+const TPS_VERSION = '3.43';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -555,11 +555,18 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     const STEP_MAX_TRIES = 16;
     const STEP_MAX_WALK = 3;
     const WINDOW_FETCHES_PER_PAGE = 6;
-    // Fill-up: X asks for newer posts at most ~once a minute (onlyIfStale),
-    // so each answered Top request carries a few contiguous steps.
-    const FILL_STEPS_PER_RESPONSE = 8;
-    const FILL_POSTS_PER_RESPONSE = 80;
-    const FILL_MAX_STEPS = 200;
+    // Fill-up: X asks for newer posts at most once a minute (near-top fetch
+    // is onlyIfStale against the last initial/Top response, 60 s) and only
+    // when the viewport ENTERS the top zone. v3.43: contiguous pages above are
+    // prefetched in the background, and each answered Top request carries a
+    // big chunk so one or two requests reach "now".
+    const FILL_POSTS_PER_RESPONSE = 400;
+    const FILL_PREFETCH_POSTS = 400;
+    const FILL_PREFETCH_DELAY_MS = 1500;
+    const FILL_PREFETCH_GAP_MS = 120;
+    const FILL_RESPONSE_WAIT_MS = 8000;
+    const FILL_RESPONSE_MAX_WAIT_MS = 20000;
+    const FILL_MAX_STEPS = 400;
     const FILL_MAX_FAIL_STREAK = 3;
     const NEAR_TOP_RECHECK_MS = 300;
     const SF_PER_MS = 1n << 22n;
@@ -1170,8 +1177,15 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             sf: opts.sf || null,
             floor: opts.floor || null,  // { K, B }: no posts in (K, B) (carry to next step)
             lastTopEntry: opts.lastTopEntry || null,
-            skeleton: opts.skeleton || null
+            skeleton: opts.skeleton || null,
+            // v3.43 prefetch buffer: contiguous chunks of posts newer than
+            // `base` (X's current Top cursor), oldest chunk first.
+            buf: newFillBuffer(opts.topK != null ? opts.topK : null,
+                opts.floor && opts.topK != null && opts.floor.K === opts.topK ? opts.floor.B : null, !!opts.atNow),
+            fetcher: opts.fetcher || null,
+            pump: null
         };
+        markTopFetch();
         try {
             const el = g.document.documentElement;
             el.removeAttribute('data-tps-jump');
@@ -1417,6 +1431,80 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         return { ok: true, pages, K, sf, atNow, steps, p0, floorB };
     }
 
+    function newFillBuffer(base, floorB, atNow) {
+        return { base, K: base, floorB: floorB != null ? floorB : null, chunks: [], posts: 0,
+            atNow: !!atNow, dead: false, fails: 0, want: 0 };
+    }
+
+    // X's near-top fetch is skipped for 60 s after any initial/Top response;
+    // the content script uses this to know when a nudge can trigger it.
+    function markTopFetch() {
+        try { g.document.documentElement.setAttribute('data-tps-top-at', String(Date.now())); } catch (_) { /* ignore */ }
+    }
+
+    // One background pump per session: steps up from buf.K until `want`
+    // posts are buffered, "now" is reached, or it keeps failing.
+    function pumpFill(s) {
+        if (!s || s.pump || !s.fetcher || !s.buf || s.buf.base == null) return s && s.pump ? s.pump.done : null;
+        const buf = s.buf;
+        const token = {};
+        s.pump = token; // set before the body runs (it may finish synchronously)
+        const run = (async function () {
+            await null;
+            try {
+                while (s === jumpSession && s.fillUp && !s.fillDone && buf === s.buf && !buf.atNow &&
+                        !buf.dead && buf.posts < buf.want && s.steps < FILL_MAX_STEPS) {
+                    s.steps++;
+                    const r = await stepAbove(s.fetcher.fetchAtB, buf.K, s.sf || DEFAULT_SF_PER_POST,
+                        s.fetcher.pageSize, snowflakeFromMs(Date.now()), buf.floorB);
+                    if (buf !== s.buf) break;
+                    if (!r.ok) {
+                        buf.fails++;
+                        jumpLog('fill step failed', r.reason, 'streak', buf.fails);
+                        if (buf.fails >= FILL_MAX_FAIL_STREAK) { buf.dead = true; break; }
+                        await sleepMs(1000 * buf.fails);
+                        continue;
+                    }
+                    buf.fails = 0;
+                    buf.floorB = r.floorB;
+                    if (r.newIds.length) {
+                        const K = BigInt(r.newIds[0]);
+                        buf.chunks.push({ pages: r.pages.map((pg) => pg.json), K, n: r.newIds.length });
+                        buf.K = K;
+                        buf.posts += r.newIds.length;
+                        s.sf = estimateSfPerPost(r.pages[r.pages.length - 1].ids) || s.sf;
+                    }
+                    if (r.atNow) buf.atNow = true;
+                    try {
+                        g.document.documentElement.setAttribute('data-tps-fill-buf',
+                            String(buf.posts) + (buf.atNow ? '|now' : ''));
+                    } catch (_) { /* ignore */ }
+                    await sleepMs(FILL_PREFETCH_GAP_MS);
+                }
+            } catch (e) {
+                jumpLog('fill pump error', e && (e.message || e));
+                buf.fails++;
+                if (buf.fails >= FILL_MAX_FAIL_STREAK) buf.dead = true;
+            } finally {
+                if (s.pump === token) s.pump = null;
+                // More was asked for while this run was winding down.
+                const b = s.buf;
+                if (s === jumpSession && s.fillUp && !s.fillDone && b && !b.atNow && !b.dead &&
+                        b.posts < b.want && s.steps < FILL_MAX_STEPS) {
+                    g.setTimeout(() => pumpFill(s), 0);
+                }
+            }
+        })();
+        token.done = run;
+        return run;
+    }
+
+    function prefetchFill(s) {
+        if (!s || !s.buf || s.fillDone || !s.fillUp) return;
+        s.buf.want = Math.max(s.buf.want, s.buf.posts + FILL_PREFETCH_POSTS);
+        pumpFill(s);
+    }
+
     function holdResponseText() {
         const s = jumpSession;
         const base = JSON.parse(JSON.stringify((s && s.skeleton) || defaultSkeleton()));
@@ -1461,6 +1549,27 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         const decoded = topCursorOfUrl(url);
         if (!decoded || !sessionWantsFill()) return null;
         const s = jumpSession;
+        markTopFetch();
+        try {
+            return await answerTopRequest(s, url, headerObj, decoded);
+        } finally {
+            markTopFetch();
+        }
+    }
+
+    async function answerTopRequest(s, url, headerObj, decoded) {
+        // Use X's own Top request (40/page) for further steps.
+        s.fetcher = { fetchAtB: makeFetchAtB(url, headerObj, decoded.A), pageSize: listPageSize(url, 40) };
+        const K0 = decoded.B;
+        let buf = s.buf;
+        if (!buf || buf.base == null || K0 < buf.base || K0 > buf.K) {
+            // X's Top cursor is not inside our buffer: restart from it.
+            const floorB = (s.floor && s.floor.K === K0) ? s.floor.B : null;
+            buf = s.buf = newFillBuffer(K0, floorB, false);
+        } else if (K0 > buf.base) {
+            while (buf.chunks.length && buf.chunks[0].K <= K0) buf.posts -= buf.chunks.shift().n;
+            buf.base = K0;
+        }
         if (!userNearTop()) {
             await sleepMs(NEAR_TOP_RECHECK_MS);
             if (!userNearTop()) {
@@ -1469,69 +1578,70 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 s.holds++;
                 setFillState('hold');
                 jumpLog('fill hold (not near top)');
+                prefetchFill(s);
                 return holdResponseText();
             }
         }
         if (fillBusy) return holdResponseText();
         fillBusy = true;
         try {
-            const pageSize = listPageSize(url, 40);
-            const nowSf = snowflakeFromMs(Date.now());
-            const fetchAtB = makeFetchAtB(url, headerObj, decoded.A);
-            const K0 = decoded.B;
-            let K = K0;
-            let sf = s.sf || DEFAULT_SF_PER_POST;
-            const pages = [];
-            let atNow = false;
-            let failed = false;
-            let added = 0;
-            let floorB = (s.floor && s.floor.K === K0) ? s.floor.B : null;
-            // Up to FILL_POSTS_PER_RESPONSE newer posts (X asks again only
-            // when stale, ~1/min), FILL_STEPS_PER_RESPONSE steps at most.
-            for (let i = 0; i < FILL_STEPS_PER_RESPONSE && added < FILL_POSTS_PER_RESPONSE; i++) {
-                if (s.steps >= FILL_MAX_STEPS) break;
-                s.steps++;
-                const r = await stepAbove(fetchAtB, K, sf, pageSize, nowSf, floorB);
-                if (!r.ok) { failed = true; jumpLog('fill step failed', r.reason); break; }
-                floorB = r.floorB;
-                if (r.newIds.length) {
-                    pages.unshift.apply(pages, r.pages.map((pg) => pg.json));
-                    K = BigInt(r.newIds[0]);
-                    added += r.newIds.length;
-                    sf = estimateSfPerPost(r.pages[r.pages.length - 1].ids) || sf;
-                }
-                if (r.atNow) { atNow = true; break; }
+            buf.want = Math.max(buf.want, FILL_POSTS_PER_RESPONSE);
+            pumpFill(s);
+            const t0 = Date.now();
+            // X asks again only after a minute: wait for a big chunk (or
+            // "now"), but answer sooner rather than not at all.
+            for (;;) {
+                if (buf !== s.buf) break;
+                if (buf.atNow || buf.dead || buf.posts >= FILL_POSTS_PER_RESPONSE) break;
+                if (!s.pump) break;
+                const waited = Date.now() - t0;
+                if (waited >= FILL_RESPONSE_WAIT_MS && buf.posts > 0) break;
+                if (waited >= FILL_RESPONSE_MAX_WAIT_MS) break;
+                await sleepMs(100);
             }
-            s.sf = sf;
-            s.floor = floorB != null ? { K, B: floorB } : null;
+            const drained = [];
+            let added = 0;
+            while (buf.chunks.length && added < FILL_POSTS_PER_RESPONSE) {
+                const c = buf.chunks.shift();
+                drained.push(c);
+                added += c.n;
+            }
+            buf.posts -= added;
+            const pages = [];
+            for (let i = drained.length - 1; i >= 0; i--) pages.push.apply(pages, drained[i].pages);
+            const atNow = buf.atNow && !buf.chunks.length;
             const built = buildTimelineResponse(s.skeleton, pages, K0, decoded.A, s.lastTopEntry, null);
             if (built.topEntry) s.lastTopEntry = built.topEntry;
-            s.failStreak = failed && !built.tweetCount ? (s.failStreak || 0) + 1 : 0;
+            if (drained.length) buf.base = drained[drained.length - 1].K;
+            if (built.newest != null && built.newest > buf.base) buf.base = built.newest;
             if (atNow) {
                 s.fillDone = true;
                 setFillState('now');
-            } else if (s.failStreak >= FILL_MAX_FAIL_STREAK) {
+            } else if (buf.dead && !buf.chunks.length) {
                 // Cannot find the next contiguous page: stop holding X's
                 // requests so newer posts still arrive (may skip some).
                 s.fillDone = true;
                 setFillState('gave-up');
-                jumpLog('fill gave up after', s.failStreak, 'failed responses');
-                return null;
-            } else if (s.steps >= FILL_MAX_STEPS) {
+                jumpLog('fill gave up after', buf.fails, 'failed steps');
+                if (!built.tweetCount) return null;
+            } else if (s.steps >= FILL_MAX_STEPS && !buf.chunks.length && !s.pump) {
                 s.fillDone = true;
                 setFillState('cap');
             } else {
-                setFillState(failed ? 'error' : ('step ' + s.steps));
+                setFillState('step ' + s.steps);
+                // Get the next chunk ready for X's next Top request.
+                prefetchFill(s);
             }
-            if (!built.tweetCount && !atNow && failed) {
-                // Could not move: keep X's cursor (retry on next Top request).
+            if (!built.tweetCount && !atNow) {
+                // Nothing yet: keep X's cursor (retry on next Top request).
+                jumpLog('fill: nothing buffered yet, hold', 'steps=', s.steps);
                 return holdResponseText();
             }
             if (!built.topEntry && s.lastTopEntry) {
                 const tl = timelineOf(built.json);
                 tl.instructions[0].entries.push(s.lastTopEntry);
             }
-            jumpLog('fill +' + built.tweetCount, 'steps=', s.steps, atNow ? '(now)' : '');
+            jumpLog('fill +' + built.tweetCount, 'steps=', s.steps, 'buffered=', buf.posts, atNow ? '(now)' : '');
             const text = JSON.stringify(built.json);
             inspectResponseText(text);
             return text;
@@ -1704,8 +1814,14 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                         startJumpSession({
                             mode: 'window', fillUp: jump.fillUp, A: jump.A, sf: win.sf,
                             atNow: win.atNow, lastTopEntry: built.topEntry, skeleton,
-                            floor: win.floorB != null ? { K: win.K, B: win.floorB } : null
+                            floor: win.floorB != null ? { K: win.K, B: win.floorB } : null,
+                            topK: built.newest != null ? built.newest : win.K,
+                            fetcher: { fetchAtB: makeFetchAtB(headUrl, headerObj, jump.A), pageSize }
                         });
+                        // v3.43: start loading the posts above in the
+                        // background once X has rendered the window.
+                        const sess = jumpSession;
+                        g.setTimeout(() => prefetchFill(sess), FILL_PREFETCH_DELAY_MS);
                         applySortMapFromPages(win.pages, built.order, true, win.pages.length);
                         setJumpResult('window:ok p=' + win.pages.length + ' n=' + built.tweetCount +
                             ' (' + why + ')');
@@ -3294,6 +3410,91 @@ function tpsInjectPageRealmScripts() {
         try { document.documentElement.setAttribute('data-tps-near-top', v); } catch (_) { /* ignore */ }
     }
 
+    // v3.43 fill kick. X fetches newer posts only when the viewport ENTERS
+    // the top zone of the list (top 25% of a screen) and only if its last
+    // initial/"newer" response is older than 60 s. A user who scrolls up to
+    // the top of the restored window within that minute (or just sits there)
+    // never triggers another request: scrolling "blocks after a few posts".
+    // When the page hook still has newer posts to give, nudge the scroll out
+    // of that zone and back once X's minute is over, so X asks again.
+    const X_TOP_STALE_MS = 60000;
+    const FILL_KICK_MARGIN_MS = 1500;
+    const FILL_KICK_RETRY_MS = 8000;
+    const FILL_KICK_ZONE_RATIO = 0.2;
+    const FILL_WAIT_ID = 'tps-fill-wait';
+    let lastFillKickAt = 0;
+    let fillKickBusy = false;
+
+    function fillStillWanted() {
+        let st = null;
+        try { st = document.documentElement.getAttribute('data-tps-fill'); } catch (_) { return false; }
+        if (!st) return false;
+        return st === 'armed' || st === 'hold' || st === 'error' || st.indexOf('step') === 0;
+    }
+
+    function showFillWait(text) {
+        let el = document.getElementById(FILL_WAIT_ID);
+        if (!text) { if (el) el.remove(); return; }
+        if (!el) {
+            if (!document.body) return;
+            el = document.createElement('div');
+            el.id = FILL_WAIT_ID;
+            el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);' +
+                'z-index:2147483646;background:rgba(29,155,240,.92);color:#fff;font:13px/1.3 -apple-system,' +
+                'system-ui,sans-serif;padding:6px 12px;border-radius:14px;pointer-events:none;';
+            document.body.appendChild(el);
+        }
+        if (el.textContent !== text) el.textContent = text;
+    }
+
+    function fillKickTick() {
+        let due = 0;
+        try {
+            if (restoring || lastNearTopFlag !== '1' || !fillStillWanted()) { showFillWait(''); return; }
+            const vh = window.innerHeight || 800;
+            if (scrollTop() > FILL_KICK_ZONE_RATIO * vh) { showFillWait(''); return; }
+            const topAt = Number(document.documentElement.getAttribute('data-tps-top-at')) || 0;
+            due = topAt + X_TOP_STALE_MS + FILL_KICK_MARGIN_MS;
+            const now = Date.now();
+            if (now < due) {
+                showFillWait('Newer posts in ' + Math.ceil((due - now) / 1000) + ' s (X loads them once a minute)');
+                return;
+            }
+            showFillWait('Loading newer posts…');
+            if (fillKickBusy || touchActive || now - lastUserGestureAt < 700 ||
+                now - lastFillKickAt < FILL_KICK_RETRY_MS) return;
+            lastFillKickAt = now;
+            kickNearTop();
+        } catch (_) { /* ignore */ }
+    }
+
+    function nextFrames(n) {
+        return new Promise((resolve) => {
+            const step = () => (n-- <= 0 ? resolve() : requestAnimationFrame(step));
+            requestAnimationFrame(step);
+        });
+    }
+
+    async function kickNearTop() {
+        fillKickBusy = true;
+        try {
+            const y = scrollTop();
+            const out = y + Math.ceil(0.75 * (window.innerHeight || 800));
+            scrollLog('fill-kick', 'y=', Math.round(y));
+            tpsScrollWrite('fill-kick-out', function () { window.scrollTo(0, out); });
+            await new Promise((resolve) => {
+                const t = setTimeout(resolve, 200);
+                window.addEventListener('scroll', function once() { clearTimeout(t); resolve(); },
+                    { once: true, passive: true });
+            });
+            await nextFrames(2);
+            if (touchActive || Date.now() - lastUserGestureAt < 300) return; // user took over
+            tpsScrollWrite('fill-kick-back', function () { window.scrollTo(0, y); });
+        } finally {
+            fillKickBusy = false;
+        }
+    }
+
     // Human-readable jump result for the panel.
     let lastJumpSummary = '';
     function describeJumpResult(code) {
@@ -4625,6 +4826,7 @@ function tpsInjectPageRealmScripts() {
         ensureButton();
         watchFillState();
         setInterval(savePosition, CONFIG.saveIntervalMs);
+        setInterval(fillKickTick, 1000);
 
         await maybeAutoRestore();
     }
