@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.41
+// @version      3.42
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.41';
+const TPS_VERSION = '3.42';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -542,14 +542,37 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     } catch (_) { /* ignore */ }
 
     const TWITTER_EPOCH_MS = 1288834974657n;
-    const DEFAULT_FILL_DELTA = BigInt(3 * 60 * 60 * 1000) << 22n; // ~3 hours
-    const TARGET_PAGE_ENTRIES = 60n;
     const SORTMAP_MAX = 600;
-    const DEFAULT_MERGE_MAX_PAGES = 12;
+    // v3.42: merge-from-head is bounded by a POST budget, not a page count:
+    // X serves 20/page on initial+Bottom requests (40 on Top), so 120 posts
+    // = 6 pages at 20/page or 3 pages at 40/page.
+    const DEFAULT_MERGE_MAX_POSTS = 120;
+    const DEFAULT_WINDOW_PAGES_ABOVE = 2;
+    // Contiguous step: aim the next Bottom cursor ~75% of a page above the
+    // newest known post so the response overlaps what we already have.
+    const STEP_SPAN_NUM = 3n;
+    const STEP_SPAN_DEN = 4n;
+    const STEP_MAX_TRIES = 16;
+    const STEP_MAX_WALK = 3;
+    const WINDOW_FETCHES_PER_PAGE = 6;
+    // Fill-up: X asks for newer posts at most ~once a minute (onlyIfStale),
+    // so each answered Top request carries a few contiguous steps.
+    const FILL_STEPS_PER_RESPONSE = 8;
+    const FILL_POSTS_PER_RESPONSE = 80;
+    const FILL_MAX_STEPS = 200;
+    const FILL_MAX_FAIL_STREAK = 3;
+    const NEAR_TOP_RECHECK_MS = 300;
+    const SF_PER_MS = 1n << 22n;
+    const MIN_SF_PER_POST = 1000n * SF_PER_MS; // 1 s / post
+    const MAX_SF_PER_POST = 6n * 3600n * 1000n * SF_PER_MS; // 6 h / post
+    const DEFAULT_SF_PER_POST = 4n * 60n * 1000n * SF_PER_MS; // ~4 min / post
+    const NOW_MARGIN_SF = 60n * 1000n * SF_PER_MS; // clock skew
 
-    // Survives for the document lifetime once a jump cursor was applied.
-    // { fillUp, pageDelta, merged }
+    // Survives for the document lifetime once a jump response was served.
+    // { mode: 'merged'|'window'|'single', fillUp, fillDone, fillState, steps,
+    //   A, sf, lastTopEntry, skeleton }
     let jumpSession = null;
+    let fillBusy = false;
 
     // displayedTweetId → positionId (string). Keep max on collision.
     const sortMap = new Map();
@@ -831,17 +854,257 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         }
     }
 
-    function noteTimelineDensity(newestId, oldestId, entryCount) {
-        if (!jumpSession || entryCount < 2) return;
+    // ---- v3.42 pure planning helpers (exported for tests) ----
+
+    function clampSf(v) {
+        if (v == null) return null;
+        if (v < MIN_SF_PER_POST) return MIN_SF_PER_POST;
+        if (v > MAX_SF_PER_POST) return MAX_SF_PER_POST;
+        return v;
+    }
+
+    // Average snowflake distance between consecutive posts on a page.
+    function estimateSfPerPost(positionIds) {
         try {
-            const newest = BigInt(newestId);
-            const oldest = BigInt(oldestId);
-            if (newest <= oldest) return;
-            const span = newest - oldest;
-            const denom = BigInt(entryCount - 1);
-            jumpSession.pageDelta = (span * TARGET_PAGE_ENTRIES) / denom;
-            if (jumpSession.pageDelta <= 0n) jumpSession.pageDelta = null;
-        } catch (_) { /* ignore */ }
+            if (!positionIds || positionIds.length < 2) return null;
+            const newest = BigInt(positionIds[0]);
+            const oldest = BigInt(positionIds[positionIds.length - 1]);
+            if (newest <= oldest) return null;
+            return clampSf((newest - oldest) / BigInt(positionIds.length - 1));
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function listPageSize(urlStr, fallback) {
+        const vars = parseListVariables(urlStr);
+        const n = vars && Number(vars.count);
+        if (Number.isFinite(n) && n > 0) return Math.floor(n);
+        return fallback || 20;
+    }
+
+    function mergePageBudget(maxPosts, pageSize) {
+        const posts = Number(maxPosts) > 0 ? Number(maxPosts) : DEFAULT_MERGE_MAX_POSTS;
+        const size = Number(pageSize) > 0 ? Number(pageSize) : 20;
+        return Math.max(2, Math.floor(posts / size));
+    }
+
+    // Decide merge-from-head vs. bounded window around the target, from the
+    // head page alone (density-aware). Returns { mode, estPosts, estPages, maxPages }.
+    function planJumpStrategy(headIds, targetPos, pageSize, maxPosts, sfHint) {
+        const size = Number(pageSize) > 0 ? Number(pageSize) : 20;
+        const maxPages = mergePageBudget(maxPosts, size);
+        if (!targetPos) return { mode: 'single', estPosts: 0, estPages: 0, maxPages };
+        if (!headIds || !headIds.length) return { mode: 'window', estPosts: -1, estPages: -1, maxPages };
+        if (pagePassesTarget(headIds, targetPos)) {
+            return { mode: 'merge', estPosts: headIds.length, estPages: 2, maxPages };
+        }
+        const sf = estimateSfPerPost(headIds) || clampSf(sfHint) || DEFAULT_SF_PER_POST;
+        const oldest = BigInt(headIds[headIds.length - 1]);
+        const target = BigInt(String(targetPos));
+        const below = Number((oldest - target) / sf) + 1;
+        const estPosts = headIds.length + below;
+        // +1 page past the target (context below it).
+        const estPages = Math.ceil(estPosts / size) + 1;
+        return { mode: estPages <= maxPages ? 'merge' : 'window', estPosts, estPages, maxPages };
+    }
+
+    // Where to aim the next Bottom cursor above the newest known post K.
+    function nextStepCursorB(K, spanSf, nowSf) {
+        const cap = nowSf + NOW_MARGIN_SF;
+        let B = K + (spanSf > 0n ? spanSf : 1n);
+        if (B >= cap) return { B: cap, atNow: true };
+        return { B, atNow: false };
+    }
+
+    // A Bottom page fetched at B is contiguous with K iff it reaches down to K.
+    function classifyStep(positionIds, K) {
+        if (!positionIds || !positionIds.length) return 'empty';
+        let newer = 0;
+        for (let i = 0; i < positionIds.length; i++) {
+            if (BigInt(positionIds[i]) > K) newer++;
+        }
+        const oldest = BigInt(positionIds[positionIds.length - 1]);
+        if (oldest <= K) return newer ? 'contiguous' : 'empty';
+        return 'gap';
+    }
+
+    // One contiguous step above K. fetchAtB(B) → { json, ids } | null.
+    // Returns { ok, pages (newest first), newIds (newest first), atNow, tries,
+    // floorB, reason }.
+    // Find Bottom cursors whose pages (the newest `pageSize` posts older than
+    // B) join up with K:
+    //  - "empty" proves (K, B) has no posts → raise the floor `lo`;
+    //  - "gap" returns a full page ending at a post O newer than K. Walk down
+    //    from it (cursor O+1 returns O and the page below, so the pages chain
+    //    without holes) until a page reaches K — every walked page is used.
+    //    After STEP_MAX_WALK pages, search between lo and the lowest O
+    //    instead (half a page below O at the local density, doubling, never
+    //    below the midpoint); after an "empty" there, probe O+1 again.
+    // `floorB` (optional): a cursor known to have no posts in (K, floorB) —
+    // the previous step's result — so the next step starts above it.
+    async function stepAbove(fetchAtB, K, sfPerPost, pageSize, nowSf, floorB) {
+        const size = BigInt(Math.max(1, Number(pageSize) || 20));
+        let span = ((clampSf(sfPerPost) || DEFAULT_SF_PER_POST) * size * STEP_SPAN_NUM) / STEP_SPAN_DEN;
+        let lo = K;        // no posts in (K, lo)
+        if (typeof floorB === 'bigint' && floorB > K) lo = floorB;
+        let oMin = null;   // lowest post above K that a gap page ended at
+        let chain = [];    // gap pages newest-first, contiguous down to oMin
+        let walks = 0;
+        let gaps = 0;      // consecutive gaps in search mode
+        let localSf = null;
+        for (let tries = 1; tries <= STEP_MAX_TRIES; tries++) {
+            let aim;
+            let walking = false;
+            if (oMin == null) {
+                aim = nextStepCursorB(lo, span, nowSf);
+            } else if (lo >= oMin || gaps === 0 || (chain.length && walks < STEP_MAX_WALK)) {
+                // The cursor just above oMin returns oMin itself: contiguous
+                // with K, or one more chained page.
+                aim = { B: oMin + 1n, atNow: false };
+                walking = true;
+            } else {
+                const mid = lo + (oMin - lo) / 2n;
+                let cand = mid;
+                if (gaps > 0 && localSf) {
+                    const d = (localSf * size / 2n) * (1n << BigInt(Math.min(gaps - 1, 30)));
+                    const c2 = oMin - d;
+                    if (c2 > mid) cand = c2;
+                }
+                aim = cand > lo ? { B: cand, atNow: false } : { B: oMin + 1n, atNow: false };
+                walking = aim.B === oMin + 1n;
+            }
+            const page = await fetchAtB(aim.B);
+            if (!page) return { ok: false, reason: 'fetch', tries };
+            const c = classifyStep(page.ids, K);
+            if (c === 'contiguous') {
+                // This page holds every post in (K, B); joined with the chain
+                // it holds every post in (K, chain[0].B).
+                const pages = (walking && chain.length) ? chain.concat([page]) : [page];
+                const seen = new Set();
+                const newIds = [];
+                for (let p = 0; p < pages.length; p++) {
+                    for (let i = 0; i < pages[p].ids.length; i++) {
+                        const id = pages[p].ids[i];
+                        if (BigInt(id) > K && !seen.has(String(id))) { seen.add(String(id)); newIds.push(id); }
+                    }
+                }
+                newIds.sort((a, b) => (BigInt(b) > BigInt(a) ? 1 : BigInt(b) < BigInt(a) ? -1 : 0));
+                const top = pages.length > 1 ? chain[0].B : aim.B;
+                return { ok: true, pages, page: pages[0], newIds, atNow: pages.length > 1 ? chain[0].atNow : aim.atNow,
+                    tries, floorB: top };
+            }
+            if (c === 'empty') {
+                if (aim.atNow) return { ok: true, pages: [page], page, newIds: [], atNow: true, tries, floorB: aim.B };
+                if (aim.B > lo) lo = aim.B;
+                if (oMin == null) span *= 2n;
+                gaps = 0;
+                continue;
+            }
+            const O = BigInt(page.ids[page.ids.length - 1]);
+            page.B = aim.B;
+            page.atNow = aim.atNow;
+            if (walking && chain.length) {
+                chain.push(page);
+                walks++;
+            } else {
+                chain = [page];   // a new root page (search result)
+                gaps++;
+            }
+            if (chain.length > STEP_MAX_WALK + 1) chain = [];
+            if (oMin == null || O < oMin) oMin = O;
+            localSf = clampSf(estimateSfPerPost(page.ids)) || localSf || clampSf(sfPerPost) || DEFAULT_SF_PER_POST;
+        }
+        return { ok: false, reason: 'tries', tries: STEP_MAX_TRIES };
+    }
+
+    function timelineOf(json) {
+        return json && json.data && json.data.list &&
+            json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+    }
+
+    // Empty response shaped like a real one (keeps metadata etc.).
+    function skeletonFrom(json) {
+        try {
+            const base = JSON.parse(JSON.stringify(json));
+            const tl = timelineOf(base);
+            if (!tl) return null;
+            tl.instructions = [{ type: 'TimelineAddEntries', entries: [] }];
+            return base;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function defaultSkeleton() {
+        return {
+            data: { list: { tweets_timeline: { timeline: {
+                instructions: [{ type: 'TimelineAddEntries', entries: [] }],
+                metadata: {}
+            } } } }
+        };
+    }
+
+    function makeTopCursorEntry(template, value, newestPos) {
+        const sortIndex = String(BigInt(newestPos) + 1n);
+        let ent = null;
+        try {
+            if (template) ent = JSON.parse(JSON.stringify(template));
+        } catch (_) { ent = null; }
+        if (!ent || !ent.content) {
+            ent = {
+                entryId: '',
+                sortIndex: '',
+                content: {
+                    entryType: 'TimelineTimelineCursor',
+                    __typename: 'TimelineTimelineCursor',
+                    value: '',
+                    cursorType: 'Top'
+                }
+            };
+        }
+        ent.entryId = 'cursor-top-' + sortIndex;
+        ent.sortIndex = sortIndex;
+        if (ent.content.itemContent && typeof ent.content.itemContent.value === 'string') {
+            ent.content.itemContent.value = value;
+        } else {
+            ent.content.value = value;
+        }
+        ent.content.cursorType = 'Top';
+        return ent;
+    }
+
+    // Build a response: tweets newer than minExclusive from pages (newest
+    // first), plus a synthetic Top cursor at newest. No Bottom cursor unless
+    // keepBottom is given (the window keeps P0's real bottom cursor).
+    function buildTimelineResponse(skeleton, pages, minExclusive, A, topTemplate, keepBottom) {
+        const base = JSON.parse(JSON.stringify(skeleton || defaultSkeleton()));
+        const tl = timelineOf(base);
+        const seen = new Set();
+        const tweets = [];
+        const order = [];
+        let newest = null;
+        for (let p = 0; p < pages.length; p++) {
+            const ex = extractSortMapFromListJson(pages[p]);
+            for (let t = 0; t < ex.tweets.length; t++) {
+                const pos = BigInt(ex.positionIds[t]);
+                if (minExclusive != null && pos <= minExclusive) continue;
+                const ent = ex.tweets[t];
+                if (!ent || !ent.entryId || seen.has(ent.entryId)) continue;
+                seen.add(ent.entryId);
+                tweets.push(ent);
+                if (order.indexOf(ex.positionIds[t]) === -1) order.push(ex.positionIds[t]);
+                if (newest == null || pos > newest) newest = pos;
+            }
+        }
+        const top = newest != null
+            ? makeTopCursorEntry(topTemplate, encodeListCursor(A, newest, 1), newest)
+            : null;
+        const entries = tweets.slice();
+        if (top) entries.push(top);
+        if (keepBottom) entries.push(keepBottom);
+        tl.instructions = [{ type: 'TimelineAddEntries', entries }];
+        return { json: base, order, tweetCount: tweets.length, newest, topEntry: top };
     }
 
     function inspectResponseText(text) {
@@ -853,11 +1116,6 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 recordSortMapping(extracted.pairs[i][0], extracted.pairs[i][1]);
             }
             if (extracted.pairs.length || lastJumpMeta) publishSortMap();
-
-            if (jumpSession && extracted.sortIndexes.length >= 2) {
-                const arr = extracted.sortIndexes;
-                noteTimelineDensity(arr[0], arr[arr.length - 1], arr.length);
-            }
         } catch (_) { /* ignore */ }
     }
 
@@ -875,45 +1133,57 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             const fillUp = parts.length < 4 ? true : parts[3] !== '0';
             let targetPos = null;
             if (parts.length >= 5 && /^\d+$/.test(parts[4])) targetPos = parts[4];
-            let maxPages = DEFAULT_MERGE_MAX_PAGES;
+            // v3.42: field 6 is a post budget for merge-from-head.
+            let maxPosts = DEFAULT_MERGE_MAX_POSTS;
             if (parts.length >= 6) {
                 const n = Number(parts[5]);
-                if (Number.isFinite(n) && n > 0) maxPages = Math.floor(n);
+                if (Number.isFinite(n) && n > 0) maxPosts = Math.floor(n);
             }
-            // Prefer merge when we have a target position id.
-            const preferMerge = !!targetPos;
-            return { A, B, fillUp, targetPos, maxPages, preferMerge };
+            let windowAbove = DEFAULT_WINDOW_PAGES_ABOVE;
+            if (parts.length >= 7) {
+                const n = Number(parts[6]);
+                if (Number.isFinite(n) && n >= 0) windowAbove = Math.min(4, Math.floor(n));
+            }
+            return { A, B, fillUp, targetPos, maxPosts, windowAbove };
         } catch (_) {
             return null;
         }
     }
 
-    function startJumpSession(fillUp, merged) {
+    function setFillState(state) {
+        if (jumpSession) jumpSession.fillState = state;
+        try { g.document.documentElement.setAttribute('data-tps-fill', String(state)); } catch (_) { /* ignore */ }
+    }
+
+    function startJumpSession(opts) {
+        const mode = opts.mode;
+        const positioned = mode === 'merged' || mode === 'window';
         jumpSession = {
-            fillUp: merged ? false : (fillUp !== false),
-            pageDelta: null,
-            merged: !!merged
+            mode,
+            // Merge-from-head is already contiguous up to "now": no fill.
+            fillUp: mode !== 'merged' && opts.fillUp !== false,
+            fillDone: !!opts.atNow,
+            fillState: null,
+            steps: 0,
+            holds: 0,
+            A: opts.A,
+            sf: opts.sf || null,
+            floor: opts.floor || null,  // { K, B }: no posts in (K, B) (carry to next step)
+            lastTopEntry: opts.lastTopEntry || null,
+            skeleton: opts.skeleton || null
         };
         try {
             const el = g.document.documentElement;
             el.removeAttribute('data-tps-jump');
             el.setAttribute('data-tps-jump-used', String(Date.now()));
-            el.setAttribute('data-tps-jump-session', merged ? 'merged' : '1');
-            if (merged) el.setAttribute('data-tps-jump-merged', '1');
+            el.setAttribute('data-tps-jump-session', positioned ? 'merged' : '1');
+            el.setAttribute('data-tps-jump-mode', mode);
+            if (positioned) el.setAttribute('data-tps-jump-merged', '1');
             else el.removeAttribute('data-tps-jump-merged');
             el.removeAttribute('data-tps-jump-busy');
         } catch (_) { /* ignore */ }
-    }
-
-    function rewriteTopCursorToFillUp(decoded, pageDelta, nowMs) {
-        if (!decoded || decoded.type !== 1) return null;
-        const delta = pageDelta && pageDelta > 0n ? pageDelta : DEFAULT_FILL_DELTA;
-        const nowSf = snowflakeFromMs(nowMs == null ? Date.now() : nowMs);
-        const Btop = decoded.B;
-        if (Btop >= nowSf) return null;
-        let Bp = Btop + delta;
-        if (Bp >= nowSf) return null;
-        return encodeListCursor(decoded.A, Bp, 2);
+        if (!jumpSession.fillUp) setFillState('off');
+        else setFillState(jumpSession.fillDone ? 'now' : 'armed');
     }
 
     function urlWithCursor(urlStr, cursor) {
@@ -953,35 +1223,6 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             }
         } catch (_) { /* ignore */ }
         return null;
-    }
-
-    // Only rewrite Top→Bottom fill-up. Initial jump is handled in send()/fetch.
-    function maybeRewriteFillUpUrl(urlStr) {
-        try {
-            if (!urlStr || typeof urlStr !== 'string') return null;
-            if (urlStr.indexOf('/ListLatestTweetsTimeline') === -1) return null;
-            const u = new URL(urlStr, g.location.href);
-            if (u.pathname.indexOf('/ListLatestTweetsTimeline') === -1) return null;
-            const varsRaw = u.searchParams.get('variables');
-            if (!varsRaw) return null;
-            const vars = JSON.parse(varsRaw);
-            if (vars.cursor == null || vars.cursor === '') return null;
-            if (!jumpSession || !jumpSession.fillUp || jumpSession.merged) return null;
-            let decoded;
-            try {
-                decoded = decodeListCursor(String(vars.cursor));
-            } catch (_) {
-                return null;
-            }
-            const nextCursor = rewriteTopCursorToFillUp(decoded, jumpSession.pageDelta, Date.now());
-            if (!nextCursor) return null;
-            vars.cursor = nextCursor;
-            u.searchParams.set('variables', JSON.stringify(vars));
-            jumpLog('fill-up rewrite Top→Bottom');
-            return u.toString();
-        } catch (_) {
-            return null;
-        }
     }
 
     function isListTimelineUrl(url) {
@@ -1066,25 +1307,29 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         return 'continue';
     }
 
-    async function collectMergedPages(headUrl, headerObj, targetPos, maxPages) {
+    async function collectMergedPages(headUrl, headerObj, targetPos, maxPages, firstJson) {
         const pages = [];
         let reachedAt = -1;
         let url = headUrl;
         let lastStatus = 0;
 
         while (pages.length < maxPages) {
-            jumpLog('fetching page', pages.length + 1, '/', maxPages, reachedAt >= 0 ? '(past target, +1)' : '');
-            const result = await fetchListPage(url, headerObj);
-            lastStatus = result.status;
-            if (!result.ok) {
-                jumpLog('page fetch failed', result.status);
-                return { pages, reachedAt, error: 'status-' + result.status, lastStatus };
-            }
             let json;
-            try {
-                json = JSON.parse(result.text);
-            } catch (e) {
-                return { pages, reachedAt, error: 'bad-json', lastStatus };
+            if (firstJson && !pages.length) {
+                json = firstJson; // v3.42: head page already fetched for planning
+            } else {
+                jumpLog('fetching page', pages.length + 1, '/', maxPages, reachedAt >= 0 ? '(past target, +1)' : '');
+                const result = await fetchListPage(url, headerObj);
+                lastStatus = result.status;
+                if (!result.ok) {
+                    jumpLog('page fetch failed', result.status);
+                    return { pages, reachedAt, error: 'status-' + result.status, lastStatus };
+                }
+                try {
+                    json = JSON.parse(result.text);
+                } catch (e) {
+                    return { pages, reachedAt, error: 'bad-json', lastStatus };
+                }
             }
             pages.push(json);
             const extracted = extractSortMapFromListJson(json);
@@ -1112,6 +1357,187 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         }
 
         return { pages, reachedAt, error: null, lastStatus };
+    }
+
+    async function fetchPageJson(url, headerObj) {
+        const result = await fetchListPage(url, headerObj);
+        if (!result.ok) return { ok: false, status: result.status };
+        try {
+            const json = JSON.parse(result.text);
+            const ex = extractSortMapFromListJson(json);
+            return { ok: true, json, ids: ex.positionIds, extracted: ex, status: result.status };
+        } catch (_) {
+            return { ok: false, status: 'bad-json' };
+        }
+    }
+
+    function makeFetchAtB(baseUrl, headerObj, A) {
+        return async function (B) {
+            const url = urlWithCursor(baseUrl, encodeListCursor(A, B, 2));
+            if (!url) return null;
+            const page = await fetchPageJson(url, headerObj);
+            return page.ok ? page : null;
+        };
+    }
+
+    // v3.42 deep target: Bottom page at the target + N contiguous pages above.
+    async function collectWindowPages(headUrl, headerObj, targetPos, A, above, sfHint) {
+        const pageSize = listPageSize(headUrl, 20);
+        const nowSf = snowflakeFromMs(Date.now());
+        const fetchAtB = makeFetchAtB(headUrl, headerObj, A);
+        const p0 = await fetchAtB(BigInt(String(targetPos)) + 1n);
+        if (!p0) return { ok: false, error: 'p0-fetch' };
+        if (!p0.ids.length) return { ok: false, error: 'p0-empty' };
+        const pages = [p0.json];
+        let K = BigInt(p0.ids[0]);
+        let sf = estimateSfPerPost(p0.ids) || clampSf(sfHint) || DEFAULT_SF_PER_POST;
+        let atNow = false;
+        let steps = 0;
+        // `above` pages of context: aim for above×pageSize/2 newer posts
+        // (steps are often small in bursty lists), within a fetch budget.
+        const wantNewer = Math.ceil(above * pageSize / 2);
+        const maxFetches = WINDOW_FETCHES_PER_PAGE * Math.max(1, above);
+        let newer = 0;
+        let floorB = null;
+        let fetches = 0;
+        while (newer < wantNewer && fetches < maxFetches && !atNow) {
+            const r = await stepAbove(fetchAtB, K, sf, pageSize, nowSf, floorB);
+            steps++;
+            fetches += r.tries || 1;
+            if (!r.ok) { jumpLog('window step failed', r.reason); break; }
+            floorB = r.floorB;
+            if (r.newIds.length) {
+                pages.unshift.apply(pages, r.pages.map((pg) => pg.json));
+                K = BigInt(r.newIds[0]);
+                newer += r.newIds.length;
+                sf = estimateSfPerPost(r.pages[r.pages.length - 1].ids) || sf;
+            }
+            atNow = r.atNow;
+        }
+        return { ok: true, pages, K, sf, atNow, steps, p0, floorB };
+    }
+
+    function holdResponseText() {
+        const s = jumpSession;
+        const base = JSON.parse(JSON.stringify((s && s.skeleton) || defaultSkeleton()));
+        const tl = timelineOf(base);
+        tl.instructions = [{ type: 'TimelineAddEntries', entries: s && s.lastTopEntry ? [s.lastTopEntry] : [] }];
+        return JSON.stringify(base);
+    }
+
+    function userNearTop() {
+        try {
+            return g.document.documentElement.getAttribute('data-tps-near-top') === '1';
+        } catch (_) {
+            return false;
+        }
+    }
+
+    function sessionWantsFill() {
+        return !!(jumpSession && jumpSession.fillUp && !jumpSession.fillDone);
+    }
+
+    function topCursorOfUrl(urlStr) {
+        const vars = parseListVariables(urlStr);
+        if (!vars || vars.cursor == null || vars.cursor === '') return null;
+        try {
+            const d = decodeListCursor(String(vars.cursor));
+            return d.type === 1 ? d : null;
+        } catch (_) {
+            return null;
+        }
+    }
+
+    function sleepMs(ms) {
+        return new Promise((resolve) => {
+            try { g.setTimeout(resolve, ms); } catch (_) { setTimeout(resolve, ms); }
+        });
+    }
+
+    // v3.42 fill-up: answer X's Top request (newer posts) with contiguous
+    // pages above its own Top cursor. Never touches the request URL. Returns
+    // response text, or null to let the original request through.
+    async function handleTopRequest(url, headerObj) {
+        const decoded = topCursorOfUrl(url);
+        if (!decoded || !sessionWantsFill()) return null;
+        const s = jumpSession;
+        if (!userNearTop()) {
+            await sleepMs(NEAR_TOP_RECHECK_MS);
+            if (!userNearTop()) {
+                // Poll / prefetch while the user is not at the top: answer
+                // "nothing new", keep X's Top cursor where it is (no gap).
+                s.holds++;
+                setFillState('hold');
+                jumpLog('fill hold (not near top)');
+                return holdResponseText();
+            }
+        }
+        if (fillBusy) return holdResponseText();
+        fillBusy = true;
+        try {
+            const pageSize = listPageSize(url, 40);
+            const nowSf = snowflakeFromMs(Date.now());
+            const fetchAtB = makeFetchAtB(url, headerObj, decoded.A);
+            const K0 = decoded.B;
+            let K = K0;
+            let sf = s.sf || DEFAULT_SF_PER_POST;
+            const pages = [];
+            let atNow = false;
+            let failed = false;
+            let added = 0;
+            let floorB = (s.floor && s.floor.K === K0) ? s.floor.B : null;
+            // Up to FILL_POSTS_PER_RESPONSE newer posts (X asks again only
+            // when stale, ~1/min), FILL_STEPS_PER_RESPONSE steps at most.
+            for (let i = 0; i < FILL_STEPS_PER_RESPONSE && added < FILL_POSTS_PER_RESPONSE; i++) {
+                if (s.steps >= FILL_MAX_STEPS) break;
+                s.steps++;
+                const r = await stepAbove(fetchAtB, K, sf, pageSize, nowSf, floorB);
+                if (!r.ok) { failed = true; jumpLog('fill step failed', r.reason); break; }
+                floorB = r.floorB;
+                if (r.newIds.length) {
+                    pages.unshift.apply(pages, r.pages.map((pg) => pg.json));
+                    K = BigInt(r.newIds[0]);
+                    added += r.newIds.length;
+                    sf = estimateSfPerPost(r.pages[r.pages.length - 1].ids) || sf;
+                }
+                if (r.atNow) { atNow = true; break; }
+            }
+            s.sf = sf;
+            s.floor = floorB != null ? { K, B: floorB } : null;
+            const built = buildTimelineResponse(s.skeleton, pages, K0, decoded.A, s.lastTopEntry, null);
+            if (built.topEntry) s.lastTopEntry = built.topEntry;
+            s.failStreak = failed && !built.tweetCount ? (s.failStreak || 0) + 1 : 0;
+            if (atNow) {
+                s.fillDone = true;
+                setFillState('now');
+            } else if (s.failStreak >= FILL_MAX_FAIL_STREAK) {
+                // Cannot find the next contiguous page: stop holding X's
+                // requests so newer posts still arrive (may skip some).
+                s.fillDone = true;
+                setFillState('gave-up');
+                jumpLog('fill gave up after', s.failStreak, 'failed responses');
+                return null;
+            } else if (s.steps >= FILL_MAX_STEPS) {
+                s.fillDone = true;
+                setFillState('cap');
+            } else {
+                setFillState(failed ? 'error' : ('step ' + s.steps));
+            }
+            if (!built.tweetCount && !atNow && failed) {
+                // Could not move: keep X's cursor (retry on next Top request).
+                return holdResponseText();
+            }
+            if (!built.topEntry && s.lastTopEntry) {
+                const tl = timelineOf(built.json);
+                tl.instructions[0].entries.push(s.lastTopEntry);
+            }
+            jumpLog('fill +' + built.tweetCount, 'steps=', s.steps, atNow ? '(now)' : '');
+            const text = JSON.stringify(built.json);
+            inspectResponseText(text);
+            return text;
+        } finally {
+            fillBusy = false;
+        }
     }
 
     function applySortMapFromPages(pages, order, merged, pageCount) {
@@ -1226,49 +1652,75 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     }
 
     async function performJumpForUrl(headUrl, headerObj, jump) {
-        const maxPages = jump.maxPages || DEFAULT_MERGE_MAX_PAGES;
         const targetPos = jump.targetPos;
+        const pageSize = listPageSize(headUrl, 20);
         beginJumpHandling();
+        let why = 'no-target';
 
-        if (jump.preferMerge && targetPos) {
+        if (targetPos) {
             try {
-                jumpLog('merge start target=', targetPos, 'maxPages=', maxPages);
-                const collected = await collectMergedPages(headUrl, headerObj, targetPos, maxPages);
-                if (collected.reachedAt >= 0 && collected.pages.length) {
-                    // Ensure we have the +1 page when possible (collectMergedPages handles it).
-                    const merged = mergeTimelinePages(collected.pages);
-                    if (merged && merged.json) {
-                        startJumpSession(false, true);
-                        applySortMapFromPages(collected.pages, merged.order, true, collected.pages.length);
-                        setJumpResult('merge:ok p=' + collected.pages.length + ' n=' + merged.tweetCount);
-                        jumpLog('merge ok pages=', collected.pages.length,
-                            'tweets=', merged.tweetCount, 'order=', merged.order.length);
-                        const mergedText = JSON.stringify(merged.json);
-                        // v3.41: drop parsed pages before handing X the body (peak memory).
-                        collected.pages.length = 0;
-                        merged.json = null;
-                        return {
-                            ok: true,
-                            merged: true,
-                            text: mergedText,
-                            url: headUrl
-                        };
-                    }
-                    jumpLog('merge synthesize failed — falling back');
-                    setJumpResult('merge:fallback(synth)');
+                // 1) Head page → density → merge-from-head only when close.
+                const head = await fetchPageJson(headUrl, headerObj);
+                if (!head.ok) {
+                    why = 'status-' + head.status;
                 } else {
-                    const why = collected.error || 'not-reached';
-                    jumpLog('merge cap/miss — fallback to single Bottom jump',
-                        'pages=', collected.pages.length, 'err=', why);
-                    setJumpResult('merge:fallback(' + why + ')');
+                    const plan = planJumpStrategy(head.ids, targetPos, pageSize, jump.maxPosts);
+                    jumpLog('plan', plan.mode, 'estPosts=', plan.estPosts, 'estPages=', plan.estPages,
+                        'maxPages=', plan.maxPages);
+                    if (plan.mode === 'merge') {
+                        const collected = await collectMergedPages(headUrl, headerObj, targetPos,
+                            plan.maxPages, head.json);
+                        if (collected.reachedAt >= 0 && collected.pages.length) {
+                            const merged = mergeTimelinePages(collected.pages);
+                            if (merged && merged.json) {
+                                startJumpSession({
+                                    mode: 'merged', fillUp: false, A: jump.A,
+                                    skeleton: skeletonFrom(head.json)
+                                });
+                                applySortMapFromPages(collected.pages, merged.order, true, collected.pages.length);
+                                setJumpResult('merge:ok p=' + collected.pages.length + ' n=' + merged.tweetCount);
+                                const mergedText = JSON.stringify(merged.json);
+                                collected.pages.length = 0;
+                                merged.json = null;
+                                return { ok: true, merged: true, text: mergedText, url: headUrl };
+                            }
+                            why = 'synth';
+                        } else {
+                            why = collected.error || 'not-reached';
+                        }
+                    } else {
+                        why = 'deep~' + plan.estPosts;
+                    }
+                    // 2) Bounded window around the target (never from the head).
+                    const sfHint = estimateSfPerPost(head.ids);
+                    head.json = null;
+                    const win = await collectWindowPages(headUrl, headerObj, targetPos, jump.A,
+                        jump.windowAbove == null ? DEFAULT_WINDOW_PAGES_ABOVE : jump.windowAbove, sfHint);
+                    if (win.ok) {
+                        const bottom = win.p0.extracted.bottomCursor;
+                        const topTpl = win.p0.extracted.topCursor;
+                        const skeleton = skeletonFrom(win.p0.json);
+                        const built = buildTimelineResponse(skeleton, win.pages, null, jump.A, topTpl, bottom);
+                        startJumpSession({
+                            mode: 'window', fillUp: jump.fillUp, A: jump.A, sf: win.sf,
+                            atNow: win.atNow, lastTopEntry: built.topEntry, skeleton,
+                            floor: win.floorB != null ? { K: win.K, B: win.floorB } : null
+                        });
+                        applySortMapFromPages(win.pages, built.order, true, win.pages.length);
+                        setJumpResult('window:ok p=' + win.pages.length + ' n=' + built.tweetCount +
+                            ' (' + why + ')');
+                        const text = JSON.stringify(built.json);
+                        win.pages.length = 0;
+                        return { ok: true, merged: true, text, url: headUrl };
+                    }
+                    why += '+window-' + win.error;
                 }
             } catch (e) {
-                jumpLog('merge error — fallback', e && (e.message || e));
-                setJumpResult('merge:fallback(error)');
+                jumpLog('jump error — fallback', e && (e.message || e));
+                why = 'error';
             }
-        } else {
-            setJumpResult('merge:fallback(no-target)');
         }
+        setJumpResult('merge:fallback(' + why + ')');
 
         // v3.28 fallback: single Bottom-cursor page near target (B/A from arm).
         try {
@@ -1282,21 +1734,20 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 setJumpResult('merge:fallback(status-' + result.status + ')');
                 return { ok: false, status: result.status };
             }
-            startJumpSession(jump.fillUp, false);
+            let ex = null;
+            let json = null;
             try {
-                const json = JSON.parse(result.text);
-                const extracted = extractSortMapFromListJson(json);
-                applySortMapFromPages([json], extracted.positionIds, false, 1);
-            } catch (_) {
-                inspectResponseText(result.text);
-            }
-            // Keep prior merge:fallback(...) if set; else mark single jump.
-            try {
-                const prev = g.document.documentElement.getAttribute('data-tps-jump-result') || '';
-                if (!prev || prev === 'merge:busy') {
-                    setJumpResult('merge:fallback(single)');
-                }
+                json = JSON.parse(result.text);
+                ex = extractSortMapFromListJson(json);
             } catch (_) { /* ignore */ }
+            startJumpSession({
+                mode: 'single', fillUp: jump.fillUp, A: jump.A,
+                sf: ex ? estimateSfPerPost(ex.positionIds) : null,
+                lastTopEntry: ex ? ex.topCursor : null,
+                skeleton: json ? skeletonFrom(json) : null
+            });
+            if (ex) applySortMapFromPages([json], ex.positionIds, false, 1);
+            else inspectResponseText(result.text);
             return { ok: true, merged: false, text: result.text, url: result.url || jumpUrl };
         } catch (e) {
             jumpLog('fallback error', e && (e.message || e));
@@ -1348,23 +1799,40 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 }
             } catch (_) { /* fall through */ }
 
+            // v3.42 fill-up: answer Top requests (newer posts) ourselves while a
+            // jump session is filling; the request URL is never rewritten.
             try {
-                if (url) {
-                    const rewritten = maybeRewriteFillUpUrl(url);
-                    if (rewritten) {
-                        url = rewritten;
-                        if (typeof input === 'string') {
-                            input = rewritten;
-                        } else if (typeof Request !== 'undefined' && input instanceof Request) {
-                            input = new Request(rewritten, input);
-                        } else {
-                            input = rewritten;
+                if (url && isListTimelineUrl(url) && sessionWantsFill() && topCursorOfUrl(url)) {
+                    const headerObj = {};
+                    try {
+                        const h = init && init.headers;
+                        if (h && typeof h.forEach === 'function') {
+                            h.forEach((v, k) => { headerObj[k] = v; });
+                        } else if (h && typeof h === 'object') {
+                            Object.keys(h).forEach((k) => { headerObj[k] = h[k]; });
                         }
-                    }
+                    } catch (_) { /* ignore */ }
+                    const self = this;
+                    return handleTopRequest(url, headerObj).then((text) => {
+                        if (text == null) return passthroughFetch(self, input, init, url);
+                        return new Response(text, {
+                            status: 200,
+                            statusText: 'OK',
+                            headers: { 'content-type': 'application/json' }
+                        });
+                    }).catch((e) => {
+                        jumpLog('fill path error', e && (e.message || e));
+                        return passthroughFetch(self, input, init, url);
+                    });
                 }
-            } catch (_) { /* ignore */ }
+            } catch (_) { /* fall through */ }
 
-            const result = origFetch.call(this, input, init);
+            return passthroughFetch(this, input, init, url);
+        };
+    }
+
+    function passthroughFetch(self, input, init, url) {
+            const result = origFetch.call(self, input, init);
             if (isListTimelineUrl(url)) {
                 try {
                     return Promise.resolve(result).then((res) => {
@@ -1377,7 +1845,6 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 } catch (_) { /* fall through */ }
             }
             return result;
-        };
     }
 
     const XHR = g.XMLHttpRequest;
@@ -1392,13 +1859,6 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 this.__tpsMethod = method;
                 this.__tpsHeaders = [];
                 this.__tpsJumpHandled = false;
-                if (typeof url === 'string') {
-                    const rewritten = maybeRewriteFillUpUrl(url);
-                    if (rewritten) {
-                        arguments[1] = rewritten;
-                        this.__tpsListUrl = rewritten;
-                    }
-                }
             } catch (_) { /* ignore */ }
             return origOpen.apply(this, arguments);
         };
@@ -1449,6 +1909,34 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 jumpLog('XHR send jump detect error', e && (e.message || e));
             }
 
+            // v3.42 fill-up (see fetch patch).
+            try {
+                if (isListTimelineUrl(xhr.__tpsListUrl) && sessionWantsFill() && topCursorOfUrl(xhr.__tpsListUrl)) {
+                    const headerObj = headersToObject(xhr.__tpsHeaders);
+                    const topUrl = xhr.__tpsListUrl;
+                    const sendOrig = function () {
+                        try {
+                            const onLoad = function () {
+                                try { xhr.removeEventListener('load', onLoad); } catch (_) { /* ignore */ }
+                                try { inspectResponseText(xhr.responseText); } catch (_) { /* ignore */ }
+                            };
+                            xhr.addEventListener('load', onLoad);
+                        } catch (_) { /* ignore */ }
+                        return origSend.apply(xhr, args);
+                    };
+                    handleTopRequest(topUrl, headerObj).then((text) => {
+                        if (text == null) return sendOrig();
+                        fakeXhrComplete(xhr, text, topUrl);
+                    }).catch((e) => {
+                        jumpLog('XHR fill path error', e && (e.message || e));
+                        try { sendOrig(); } catch (_) { /* ignore */ }
+                    });
+                    return;
+                }
+            } catch (e) {
+                jumpLog('XHR fill detect error', e && (e.message || e));
+            }
+
             try {
                 if (isListTimelineUrl(this.__tpsListUrl)) {
                     const onLoad = function () {
@@ -1462,7 +1950,14 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         };
     }
 
-    g.__tpsRewriteTopCursorToFillUp = rewriteTopCursorToFillUp;
+    g.__tpsPlanJumpStrategy = planJumpStrategy;
+    g.__tpsMergePageBudget = mergePageBudget;
+    g.__tpsEstimateSfPerPost = estimateSfPerPost;
+    g.__tpsClassifyStep = classifyStep;
+    g.__tpsStepAbove = stepAbove;
+    g.__tpsNextStepCursorB = nextStepCursorB;
+    g.__tpsBuildTimelineResponse = buildTimelineResponse;
+    g.__tpsJumpSession = function () { return jumpSession; };
     g.__tpsDecodeListCursor = decodeListCursor;
     g.__tpsEncodeListCursor = encodeListCursor;
     g.__tpsExtractSortMapFromListJson = extractSortMapFromListJson;
@@ -1815,10 +2310,17 @@ function tpsInjectPageRealmScripts() {
         cursorJump: true,
         jumpLeadMs: 60 * 60 * 1000, // fallback single-jump: ~1h of newer tweets above the pin
         jumpAnchor: 'now',         // 'now' = snowflakeFromMs(Date.now()); 'b' = use B
-        jumpFillUp: true,          // Top→Bottom fill-up after a non-merged (fallback) jump
+        // Fill-up: after a window/fallback jump, answer X's "newer posts" request
+        // (scroll to top) with contiguous pages above the jump; stops at "now".
+        jumpFillUp: true,
         // Merged jump: chain head→Bottom pages until saved pos (+1 page), deliver one response.
         jumpMerge: true,
-        jumpMergeMaxPages: 12,     // ~1200 posts; if target not reached → v3.28 fallback
+        // v3.42: merge from the head only when the target is within this many
+        // POSTS of the newest one (X serves 20 posts/page → 6 pages, 40/page →
+        // 3 pages). Deeper targets get a bounded window instead: the page at the
+        // target plus jumpWindowPagesAbove contiguous pages above it.
+        jumpMergeMaxPosts: 120,
+        jumpWindowPagesAbove: 2,
     };
 
     const DEBUG = false;
@@ -1970,6 +2472,9 @@ function tpsInjectPageRealmScripts() {
     const KEY_PATH = 'path';
     const KEY_RESTORE_ACTIVE = 'restore_active';
     const KEY_RESTORE_CRASHES = 'restore_crashes';
+    // v3.42: saved tweet id whose restore reloaded the tab once; never auto-jump
+    // to it again (cleared as soon as a different position is saved).
+    const KEY_JUMP_BLOCKED = 'jump_blocked_id';
 
     // ============ LIST CURSOR / SNOWFLAKE HELPERS ============
 
@@ -2071,6 +2576,8 @@ function tpsInjectPageRealmScripts() {
         try { document.documentElement.removeAttribute('data-tps-jump-merged'); } catch (_) { /* ignore */ }
         try { document.documentElement.removeAttribute('data-tps-jump-busy'); } catch (_) { /* ignore */ }
         try { document.documentElement.removeAttribute('data-tps-jump-result'); } catch (_) { /* ignore */ }
+        try { document.documentElement.removeAttribute('data-tps-jump-mode'); } catch (_) { /* ignore */ }
+        try { document.documentElement.removeAttribute('data-tps-fill'); } catch (_) { /* ignore */ }
     }
 
     function jumpIsBusy() {
@@ -2109,7 +2616,7 @@ function tpsInjectPageRealmScripts() {
         try { log(...args); } catch (_) { /* ignore */ }
     }
 
-    // Arm: B|A|expires|fillUp|targetPos|maxPages on <html data-tps-jump>.
+    // Arm: B|A|expires|fillUp|targetPos|maxPosts|windowAbove on <html data-tps-jump>.
     // B/A used for v3.28 single-jump fallback; targetPos drives the merged path.
     function armCursorJump(saved, expiresMs) {
         if (!CONFIG.cursorJump || !saved || !saved.tweetId) return false;
@@ -2129,15 +2636,16 @@ function tpsInjectPageRealmScripts() {
             clearJumpUsed();
             try { document.documentElement.removeAttribute('data-tps-jump-session'); } catch (_) { /* ignore */ }
             const fillUp = CONFIG.jumpFillUp === false ? '0' : '1';
-            const maxPages = CONFIG.jumpMergeMaxPages == null ? 12 : CONFIG.jumpMergeMaxPages;
+            const maxPosts = CONFIG.jumpMergeMaxPosts == null ? 120 : CONFIG.jumpMergeMaxPosts;
+            const above = CONFIG.jumpWindowPagesAbove == null ? 2 : CONFIG.jumpWindowPagesAbove;
             const preferMerge = CONFIG.jumpMerge !== false;
             const payload = preferMerge
                 ? (B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp +
-                    '|' + sortId.toString(10) + '|' + String(maxPages))
+                    '|' + sortId.toString(10) + '|' + String(maxPosts) + '|' + String(above))
                 : (B.toString(10) + '|' + A.toString(10) + '|' + String(expires) + '|' + fillUp);
             document.documentElement.setAttribute('data-tps-jump', payload);
             jumpLog('Armed cursor jump target=', sortId.toString(), 'B=', B.toString(),
-                'merge=', preferMerge, 'maxPages=', maxPages);
+                'merge=', preferMerge, 'maxPosts=', maxPosts, 'above=', above);
             return true;
         } catch (e) {
             jumpLog('armCursorJump failed', e);
@@ -2486,6 +2994,7 @@ function tpsInjectPageRealmScripts() {
             userControlAfterLand = true;
             cancelLandSettle('user-gesture');
             scrollLog('userControlAfterLand — no more settle/yank-undo writes');
+            updateNearTopFlag();
         }
     }
 
@@ -2643,6 +3152,7 @@ function tpsInjectPageRealmScripts() {
         const y = scrollTop();
         const prev = lastStableScrollY;
         noteScrollForIdleDebug();
+        updateNearTopFlag();
 
         // Debug: large jumps not from our recent write and not from a gesture.
         if (TPS_DEBUG_SCROLL) {
@@ -2694,6 +3204,8 @@ function tpsInjectPageRealmScripts() {
         gmSet(KEY_SORT_ID, sortId);
         gmSet(KEY_TIMESTAMP, Date.now());
         gmSet(KEY_PATH, currentPath());
+        const blocked = gmGet(KEY_JUMP_BLOCKED);
+        if (blocked && String(blocked) !== String(top.id)) gmSet(KEY_JUMP_BLOCKED, '');
         log('Saved', top.id, top.time, 'sort', sortId);
         if (TPS_DEBUG_SCROLL) {
             scrollLog('idle: savePosition', top.id, 'y=', Math.round(y0), '→', Math.round(scrollTop()));
@@ -2719,7 +3231,10 @@ function tpsInjectPageRealmScripts() {
     try {
         if (CONFIG.autoRestore && CONFIG.cursorJump) {
             const earlySaved = readSavedPosition();
-            if (earlySaved && isHomeTimelinePath(earlySaved.path || currentPath())) {
+            // v3.42: after a reload mid-restore, do not arm again (restore()
+            // shows "position too old" instead).
+            if (earlySaved && isHomeTimelinePath(earlySaved.path || currentPath()) &&
+                !restoreWasInterrupted() && !jumpBlockedFor(earlySaved)) {
                 armCursorJump(earlySaved, 20000);
             }
         }
@@ -2754,6 +3269,51 @@ function tpsInjectPageRealmScripts() {
         const startedAt = Number(gmGet(KEY_RESTORE_ACTIVE) || 0);
         if (!startedAt || Date.now() - startedAt > 3 * 60 * 1000) return false;
         return navigationType() === 'reload';
+    }
+
+    function jumpBlockedFor(saved) {
+        const blocked = gmGet(KEY_JUMP_BLOCKED);
+        return !!(blocked && saved && String(blocked) === String(saved.tweetId));
+    }
+
+    // v3.42: the page hook only answers X's "newer posts" request with fill-up
+    // pages while the user is reading near the top (not during our search,
+    // not for background polls).
+    let lastNearTopFlag = null;
+    function updateNearTopFlag() {
+        let near = false;
+        try {
+            if (!restoring && (userControlAfterLand || !landedAwaitingUser) &&
+                isTimelinePage() && isOnTargetTab()) {
+                near = scrollTop() < 3 * (window.innerHeight || 800);
+            }
+        } catch (_) { near = false; }
+        const v = near ? '1' : '0';
+        if (v === lastNearTopFlag) return;
+        lastNearTopFlag = v;
+        try { document.documentElement.setAttribute('data-tps-near-top', v); } catch (_) { /* ignore */ }
+    }
+
+    // Human-readable jump result for the panel.
+    let lastJumpSummary = '';
+    function describeJumpResult(code) {
+        if (!code) return '';
+        let m = /^merge:ok p=(\d+) n=(\d+)/.exec(code);
+        if (m) return 'merged from the top: ' + m[1] + ' pages, ' + m[2] + ' posts';
+        m = /^window:ok p=(\d+) n=(\d+)(?: \((.*)\))?/.exec(code);
+        if (m) {
+            const why = m[3] || '';
+            let extra = '';
+            const deep = /^deep~(\d+)/.exec(why);
+            if (deep) extra = ' (~' + deep[1] + ' posts below the top)';
+            else if (/^not-reached/.test(why)) extra = ' (merge from the top did not reach it)';
+            else if (why) extra = ' (' + why + ')';
+            return 'window around the post: ' + m[1] + ' pages, ' + m[2] + ' posts' + extra;
+        }
+        m = /^merge:fallback\((.*)\)$/.exec(code);
+        if (m) return 'fallback: one page near the post (' + m[1] + ')';
+        if (code === 'merge:busy') return 'loading…';
+        return code;
     }
 
     // Resolve target index in merged order (newest-first position ids).
@@ -2828,7 +3388,8 @@ function tpsInjectPageRealmScripts() {
 
     function finishWithCode(text, code) {
         const suffix = code ? ' [' + code + ']' : '';
-        return finishPanel(text + suffix);
+        const summary = lastJumpSummary ? ' · ' + lastJumpSummary : '';
+        return finishPanel(text + suffix + summary);
     }
 
 
@@ -2950,7 +3511,8 @@ function tpsInjectPageRealmScripts() {
         const approxTag = resolved.approx ? 'approx:' + resolved.how : resolved.how;
         jumpLog('positionMergedJump start idx=', idx, '/', N, 'how=', resolved.how,
             'pages=', meta.pages);
-        updatePanel('Positioning (' + (idx + 1) + '/' + N + ', ' + approxTag + ')… [merge:ok]');
+        updatePanel('Positioning (' + (idx + 1) + '/' + N + ', ' + approxTag + ')… [' +
+            (readJumpResultCode() || 'merge:ok') + ']');
 
         const maxIters = 10;
         for (let iter = 0; iter < maxIters && !ctrl.aborted; iter++) {
@@ -3010,15 +3572,24 @@ function tpsInjectPageRealmScripts() {
                 continue;
             }
 
+            // v3.42: paced like the searches (min step gap, mounted cap,
+            // wait for X to render) instead of back-to-back 150ms writes.
+            await paceStep(ctrl);
+            if (ctrl.aborted) return finishPanel('Stopped');
+            if (userControlAfterLand) return finishPanel('Stopped');
+            const hold = await holdForMountedCap(ctrl);
+            if (hold === 'aborted') return finishPanel('Stopped');
+            if (hold === 'capped') return finishWithCode('Stopped — too many posts mounted', 'pos:capped');
+            const knownIds = currentTweetIds();
             tpsScrollWrite('pos-estimate', function () {
                 try { root.scrollTop = Math.max(0, scrollTarget); } catch (_) { /* ignore */ }
                 try { window.scrollTo(0, Math.max(0, scrollTarget)); } catch (_) { /* ignore */ }
             });
 
-            const waitMs = 150 + Math.min(iter * 12, 100);
-            await sleep(waitMs);
+            await waitForStep(saved.tweetId, ctrl, knownIds);
             if (ctrl.aborted) return finishPanel('Stopped');
-            updatePanel('Positioning… (' + (iter + 1) + '/' + maxIters + ') [merge:ok]');
+            updatePanel('Positioning… (' + (iter + 1) + '/' + maxIters + ')' +
+                (lastJumpSummary ? ' · ' + lastJumpSummary : ''));
         }
 
         if (ctrl.aborted) return finishPanel('Stopped');
@@ -3093,14 +3664,24 @@ function tpsInjectPageRealmScripts() {
         const crashes = interrupted ? Number(gmGet(KEY_RESTORE_CRASHES) || 0) + 1 : 0;
         gmSet(KEY_RESTORE_CRASHES, crashes);
         gentleRestore = crashes > 0;
-        gmSet(KEY_RESTORE_ACTIVE, Date.now());
+        lastJumpSummary = '';
 
-        if (crashes >= 3) {
+        // v3.42: one reload during a restore is enough — the saved post is too
+        // deep for this device. Do not re-arm the jump (that was the reload
+        // loop); keep the user on the timeline with a clear message.
+        if (crashes >= 1 || jumpBlockedFor(saved)) {
             gmSet(KEY_RESTORE_ACTIVE, 0);
             gmSet(KEY_RESTORE_CRASHES, 0);
-            showPanel("Search reloaded the page again — stopped so it does not loop");
-            return;
+            gmSet(KEY_JUMP_BLOCKED, String(saved.tweetId));
+            try { document.documentElement.removeAttribute('data-tps-jump'); } catch (_) { /* ignore */ }
+            updateNearTopFlag();
+            return finishWithCode(
+                'Pozycja za stara / position too old (' + formatTweetTime(saved.tweetTime) +
+                ') — the tab reloaded while restoring it. Not jumping again; scroll manually.',
+                'crash:skip'
+            );
         }
+        gmSet(KEY_RESTORE_ACTIVE, Date.now());
 
         abortRestore();
         const ctrl = { aborted: false };
@@ -3109,6 +3690,7 @@ function tpsInjectPageRealmScripts() {
         userControlAfterLand = false;
         landedAwaitingUser = false;
         cancelLandSettle('restore-start');
+        updateNearTopFlag();
 
         const timeStr = formatTweetTime(saved.tweetTime);
         const wantJump = CONFIG.cursorJump && isHomeTimelinePath(saved.path || currentPath());
@@ -3181,7 +3763,8 @@ function tpsInjectPageRealmScripts() {
                         if (ctrl.aborted) return finishPanel('Stopped');
                     }
                     const resultCode = readJumpResultCode();
-                    const mergedHint = jumpWasMerged() || /^merge:ok\b/.test(resultCode);
+                    lastJumpSummary = describeJumpResult(resultCode);
+                    const mergedHint = jumpWasMerged() || /^(merge|window):ok\b/.test(resultCode);
                     updatePanel(
                         (mergedHint ? 'Positioning tweet from ' : 'Jumping near tweet from ') +
                         timeStr + '…' +
@@ -3201,7 +3784,7 @@ function tpsInjectPageRealmScripts() {
                         await sleep(150);
                     }
 
-                    if (jumpWasMerged() || /^merge:ok\b/.test(readJumpResultCode())) {
+                    if (jumpWasMerged() || /^(merge|window):ok\b/.test(readJumpResultCode())) {
                         mergeSucceeded = true;
                         jumpedNear = true;
                         jumpLog('Using merged-jump positioning');
@@ -3222,6 +3805,7 @@ function tpsInjectPageRealmScripts() {
                         markLanded(landed);
                         jumpLog('Jumped to', saved.tweetId);
                         const fb = readJumpResultCode() || 'merge:fallback(single)';
+                        lastJumpSummary = describeJumpResult(fb);
                         return finishWithCode('Jumped near tweet from ' + timeStr, fb);
                     }
 
@@ -3357,6 +3941,7 @@ function tpsInjectPageRealmScripts() {
             gmSet(KEY_RESTORE_ACTIVE, 0);
             gmSet(KEY_RESTORE_CRASHES, 0);
             if (currentAbort === ctrl) currentAbort = null;
+            updateNearTopFlag();
         }
     }
 
@@ -4009,6 +4594,27 @@ function tpsInjectPageRealmScripts() {
         }
     }
 
+    // v3.42: tell the user how loading newer posts above a deep jump ended.
+    function watchFillState() {
+        let last = null;
+        const check = () => {
+            let st = null;
+            try { st = document.documentElement.getAttribute('data-tps-fill'); } catch (_) { return; }
+            if (st === last) return;
+            last = st;
+            if (restoring) return;
+            if (st === 'now') finishPanel('Caught up: newer posts loaded without gaps [fill:now]');
+            else if (st === 'cap' || st === 'gave-up') {
+                finishPanel('Stopped filling newer posts [fill:' + st + '] — X may skip some; ' +
+                    'tap the "' + CONFIG.targetTab + '" tab to reload from the top.');
+            }
+        };
+        try {
+            new MutationObserver(check).observe(document.documentElement,
+                { attributes: true, attributeFilter: ['data-tps-fill'] });
+        } catch (_) { /* ignore */ }
+    }
+
     async function start() {
         if (started) return;
         started = true;
@@ -4017,6 +4623,7 @@ function tpsInjectPageRealmScripts() {
         lastSeenPath = currentPath();
         setupListeners();
         ensureButton();
+        watchFillState();
         setInterval(savePosition, CONFIG.saveIntervalMs);
 
         await maybeAutoRestore();

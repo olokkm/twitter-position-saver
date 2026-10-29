@@ -1103,6 +1103,225 @@ assert(true, 'seedHeights removed');
 console.log('info: v3.40 noanchor/debug-gate tests done');
 
 
+// --- v3.42: bounded window jump + contiguous fill-up (fake list backend) ---
+{
+  const fx = await import('./fake-x-list.mjs');
+  const hookStart = userscriptSrc.indexOf('function tpsInstallPageJumpHook(');
+  const hookEnd = userscriptSrc.indexOf('/* TPS_JUMP_HOOK_END */');
+  const installHook = new Function(userscriptSrc.slice(hookStart, hookEnd) + '\nreturn tpsInstallPageJumpHook;')();
+  const origLog = console.log;
+  console.log = function (...a) { if (a[0] === '[TPS jump]') return; origLog.apply(console, a); };
+
+  function makeHookEnv(dataset) {
+    const attrs = new Map();
+    const fake = fx.createFakeList(dataset);
+    const requests = [];
+    const g = {
+      document: { documentElement: {
+        getAttribute: (k) => (attrs.has(k) ? attrs.get(k) : null),
+        setAttribute: (k, v) => attrs.set(k, String(v)),
+        removeAttribute: (k) => attrs.delete(k)
+      } },
+      location: { href: 'https://x.com/home' },
+      setTimeout: (fn, ms) => setTimeout(fn, Math.min(ms, 5)),
+      postMessage() {}, addEventListener() {},
+      fetch: async (url) => {
+        requests.push(String(url));
+        return new Response(JSON.stringify(fake.respond(String(url))), {
+          status: 200, headers: { 'content-type': 'application/json' }
+        });
+      }
+    };
+    installHook(g, 'main', '3.42-test');
+    return { g, attrs, fake, requests };
+  }
+  async function clientGet(env, url) {
+    const res = await env.g.fetch(url, { headers: { authorization: 'Bearer test' } });
+    const json = await res.json();
+    const ex = env.g.__tpsExtractSortMapFromListJson(json);
+    const topVal = ex.topCursor && ex.topCursor.content && ex.topCursor.content.value;
+    return { json, ids: ex.positionIds, topVal };
+  }
+  function arm(env, target, extra) {
+    const t = BigInt(target);
+    const B = t + (3600000n << 22n);
+    const A = fx.snowflakeFromMs(Date.now());
+    env.attrs.set('data-tps-jump', [B, A, Date.now() + 20000, '1', t, extra && extra.maxPosts || 120,
+      extra && extra.above != null ? extra.above : 2].join('|'));
+  }
+  const idxOf = (ds) => new Map(ds.map((p) => [p.id, p.idx]));
+  function contiguousFrom0(ds, loaded) {
+    const ix = idxOf(ds);
+    const idx = [...loaded].map((id) => ix.get(id)).sort((a, b) => a - b);
+    for (let i = 0; i < idx.length; i++) if (idx[i] !== i) return { ok: false, at: i, got: idx[i] };
+    return { ok: true, n: idx.length };
+  }
+  function contiguousRange(ds, ids) {
+    const ix = idxOf(ds);
+    const idx = ids.map((id) => ix.get(id)).sort((a, b) => a - b);
+    for (let i = 1; i < idx.length; i++) if (idx[i] !== idx[i - 1] + 1) return false;
+    return true;
+  }
+  const now = Date.now();
+  const ds = fx.makeDataset({ nowMs: now, days: 4.5, posts: 1700, seed: 7 });
+  const pick = (agoMs) => ds.find((p) => p.ms <= now - agoMs);
+  const targets = { '1h': pick(3600000), '1d': pick(86400000), '4d': pick(4 * 86400000) };
+
+  // 1) page budget from a post budget (20/page initial+Bottom, 40/page Top)
+  const probe = makeHookEnv(ds).g;
+  assert(probe.__tpsMergePageBudget(120, 20) === 6, 'v3.42 budget: 120 posts @20/page = 6 pages');
+  assert(probe.__tpsMergePageBudget(120, 40) === 3, 'v3.42 budget: 120 posts @40/page = 3 pages');
+  assert(probe.__tpsMergePageBudget(10, 40) === 2, 'v3.42 budget: floor 2 pages');
+  assert(probe.__tpsMergePageBudget(undefined, 20) === 6, 'v3.42 budget: default 120 posts');
+
+  // 2) density-aware plan at 20 and 40 per page
+  for (const size of [20, 40]) {
+    const head = ds.slice(0, size).map((p) => p.id);
+    const p1h = probe.__tpsPlanJumpStrategy(head, targets['1h'].id, size, 120);
+    const p1d = probe.__tpsPlanJumpStrategy(head, targets['1d'].id, size, 120);
+    const p4d = probe.__tpsPlanJumpStrategy(head, targets['4d'].id, size, 120);
+    assert(p1h.mode === 'merge', `v3.42 plan @${size}: 1h (idx ${targets['1h'].idx}) → merge (est ${p1h.estPosts})`);
+    assert(p1d.mode === 'window', `v3.42 plan @${size}: 1d (idx ${targets['1d'].idx}) → window (est ${p1d.estPosts})`);
+    assert(p4d.mode === 'window', `v3.42 plan @${size}: 4d (idx ${targets['4d'].idx}) → window (est ${p4d.estPosts})`);
+    assert(p1h.maxPages === (size === 20 ? 6 : 3), `v3.42 plan @${size}: maxPages`);
+    // a target 3 pages deep at 20/page is within budget, 10 pages is not
+    const t60 = ds[60].id, t200 = ds[200].id;
+    const head20 = ds.slice(0, 20).map((p) => p.id);
+    if (size === 20) {
+      const a = probe.__tpsPlanJumpStrategy(head20, t60, 20, 120);
+      const b = probe.__tpsPlanJumpStrategy(head20, t200, 20, 120);
+      console.log(`info: v3.42 plan idx60 → ${a.mode} est=${a.estPosts}/${a.estPages}p; idx200 → ${b.mode} est=${b.estPosts}/${b.estPages}p`);
+      assert(b.mode === 'window', 'v3.42 plan: 200 posts deep → window, never a 10+ page merge');
+    }
+  }
+
+  // 3) classifyStep
+  assert(probe.__tpsClassifyStep([], 5n) === 'empty', 'v3.42 classify: empty');
+  assert(probe.__tpsClassifyStep(['9', '7', '5', '3'], 5n) === 'contiguous', 'v3.42 classify: overlap → contiguous');
+  assert(probe.__tpsClassifyStep(['9', '7', '6'], 5n) === 'gap', 'v3.42 classify: oldest > K → gap');
+  assert(probe.__tpsClassifyStep(['5', '3'], 5n) === 'empty', 'v3.42 classify: nothing newer → empty');
+
+  // 4) stepAbove: union of steps == every post in (K, now], at 20 and 40/page
+  const fake = fx.createFakeList(ds);
+  for (const size of [20, 40]) {
+    for (const [name, t] of Object.entries(targets)) {
+      const fetchAtB = async (B) => {
+        const json = fake.respond(fx.listUrl(fx.encodeCursor(1n, B, 2), size));
+        const ids = probe.__tpsExtractSortMapFromListJson(json).positionIds;
+        return { ok: true, json, ids };
+      };
+      let K = BigInt(t.id);
+      let sf = null;
+      const got = new Set([t.id]);
+      let steps = 0, tries = 0, atNow = false, floorB = null;
+      const nowSf = fx.snowflakeFromMs(Date.now());
+      while (!atNow && steps < 400) {
+        const r = await probe.__tpsStepAbove(fetchAtB, K, sf, size, nowSf, floorB);
+        steps++; tries += r.tries;
+        if (!r.ok) break;
+        floorB = r.floorB;
+        for (const id of r.newIds) got.add(id);
+        if (r.newIds.length) { K = BigInt(r.newIds[0]); sf = probe.__tpsEstimateSfPerPost(r.page.ids) || sf; }
+        atNow = r.atNow;
+      }
+      const c = contiguousFrom0(ds, got);
+      assert(atNow && c.ok && c.n === t.idx + 1,
+        `v3.42 stepAbove @${size} from ${name}: contiguous to now (${c.n}/${t.idx + 1} posts, ${steps} steps, ${tries} fetches)`);
+    }
+  }
+
+  // 5) full jump through the fetch patch + fill-up via X's own Top requests
+  const summary = [];
+  for (const [name, t] of Object.entries(targets)) {
+    const env = makeHookEnv(ds);
+    arm(env, t.id);
+    const first = await clientGet(env, fx.listUrl(null, 20));
+    const code = env.attrs.get('data-tps-jump-result') || '';
+    const jumpFetches = env.requests.length;
+    assert(first.ids.includes(t.id), `v3.42 jump ${name}: response contains the target (${code})`);
+    assert(contiguousRange(ds, first.ids), `v3.42 jump ${name}: jump response is contiguous`);
+    assert(first.ids.length <= 140, `v3.42 jump ${name}: bounded response (${first.ids.length} posts, ${jumpFetches} fetches)`);
+    assert(jumpFetches <= 16, `v3.42 jump ${name}: ≤16 backend fetches (${jumpFetches})`);
+    if (name === '1h') {
+      assert(/^merge:ok\b/.test(code), `v3.42 jump 1h: merge (${code})`);
+      assert(env.attrs.get('data-tps-fill') === 'off', 'v3.42 merged: fill off');
+      // merged → Top requests pass through untouched
+      const before = env.fake.log.length;
+      const topUrl = fx.listUrl(first.topVal, 40);
+      await clientGet(env, topUrl);
+      assert(env.requests[env.requests.length - 1] === topUrl && env.fake.log[before].kind === 'top',
+        'v3.42 merged: Top/poll request passes through with the same URL');
+      summary.push(`${name}: ${code}, ${first.ids.length} posts, ${jumpFetches} fetches, fill off`);
+      continue;
+    }
+    assert(/^window:ok\b/.test(code), `v3.42 jump ${name}: window (${code})`);
+    const tIdx = first.ids.indexOf(t.id);
+    assert(tIdx >= 20, `v3.42 jump ${name}: ≥20 newer posts above the target in the window (${tIdx})`);
+    const headIdx0 = Math.min(...first.ids.map((id) => idxOf(ds).get(id)));
+    assert(headIdx0 > 0, `v3.42 jump ${name}: did not merge from the head`);
+
+    // not near top → hold (no backend fetch, no gap, URL untouched)
+    env.attrs.set('data-tps-near-top', '0');
+    let reqBefore = env.requests.length;
+    const held = await clientGet(env, fx.listUrl(first.topVal, 40));
+    assert(held.ids.length === 0 && env.requests.length === reqBefore && held.topVal === first.topVal,
+      `v3.42 fill ${name}: poll while not near top → hold, same Top cursor, no fetch`);
+    assert(env.attrs.get('data-tps-fill') === 'hold', `v3.42 fill ${name}: state hold`);
+
+    // near top → contiguous fill responses until "now"
+    env.attrs.set('data-tps-near-top', '1');
+    const loaded = new Set(first.ids);
+    let topVal = first.topVal;
+    let responses = 0;
+    let topLeak = 0;
+    while (env.attrs.get('data-tps-fill') !== 'now' && responses < 200) {
+      const lb = env.fake.log.length;
+      const r = await clientGet(env, fx.listUrl(topVal, 40));
+      responses++;
+      topLeak += env.fake.log.slice(lb).filter((e) => e.kind === 'top').length;
+      for (const id of r.ids) loaded.add(id);
+      if (r.topVal) topVal = r.topVal;
+    }
+    const c = contiguousFrom0(ds, [...loaded].filter((id) => idxOf(ds).get(id) <= idxOf(ds).get(first.ids[0])));
+    const all = contiguousFrom0(ds, loaded);
+    assert(env.attrs.get('data-tps-fill') === 'now', `v3.42 fill ${name}: reached now after ${responses} Top responses`);
+    assert(c.ok && all.ok, `v3.42 fill ${name}: no gaps (${all.n} posts contiguous from newest)`);
+    assert(topLeak === 0, `v3.42 fill ${name}: X's Top request never reached the backend while filling`);
+    // after now: polling passes through unchanged
+    const pollUrl = fx.listUrl(topVal, 40);
+    await clientGet(env, pollUrl);
+    assert(env.requests[env.requests.length - 1] === pollUrl, `v3.42 fill ${name}: after now, polls pass through unchanged`);
+    summary.push(`${name}: ${code}, ${first.ids.length} posts, ${jumpFetches} fetches, fill ${responses} responses/${env.g.__tpsJumpSession().steps} steps → ${all.n} posts`);
+  }
+
+  // 6) step cap: a very dense list stops filling after FILL_MAX_STEPS, without gaps
+  {
+    const dense = fx.makeDataset({ nowMs: now, days: 4, posts: 9000, seed: 9 });
+    const env = makeHookEnv(dense);
+    const t = dense[dense.length - 10];
+    arm(env, t.id);
+    const first = await clientGet(env, fx.listUrl(null, 20));
+    env.attrs.set('data-tps-near-top', '1');
+    const loaded = new Set(first.ids);
+    let topVal = first.topVal, responses = 0;
+    while (!/^(now|cap)$/.test(env.attrs.get('data-tps-fill')) && responses < 400) {
+      const r = await clientGet(env, fx.listUrl(topVal, 40));
+      responses++;
+      for (const id of r.ids) loaded.add(id);
+      if (r.topVal) topVal = r.topVal;
+    }
+    const ix = idxOf(dense);
+    const idx = [...loaded].map((id) => ix.get(id)).sort((a, b) => a - b);
+    let gaps = 0;
+    for (let i = 1; i < idx.length; i++) if (idx[i] !== idx[i - 1] + 1) gaps++;
+    assert(env.attrs.get('data-tps-fill') === 'cap' && env.g.__tpsJumpSession().steps === 200,
+      `v3.42 fill cap: stops after 200 steps (${responses} responses, ${loaded.size} posts)`);
+    assert(gaps === 0, 'v3.42 fill cap: what was loaded is contiguous');
+  }
+  console.log = origLog;
+  for (const s of summary) console.log('info: v3.42 ' + s);
+}
+
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);
