@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.43
+// @version      3.44
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.43';
+const TPS_VERSION = '3.44';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -568,6 +568,9 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     const FILL_RESPONSE_MAX_WAIT_MS = 20000;
     const FILL_MAX_STEPS = 400;
     const FILL_MAX_FAIL_STREAK = 3;
+    // v3.44: one background page fetch may not hang the pump forever.
+    const FILL_FETCH_TIMEOUT_MS = 15000;
+    const FILL_LOG_MAX = 16;
     const NEAR_TOP_RECHECK_MS = 300;
     const SF_PER_MS = 1n << 22n;
     const MIN_SF_PER_POST = 1000n * SF_PER_MS; // 1 s / post
@@ -1157,8 +1160,21 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         }
     }
 
+    // v3.44: short log of fill events for the on-phone debug view (the
+    // content script shows it on a long-press of the fill pill).
+    const fillLogRing = [];
+    function fillEvent(msg) {
+        try {
+            fillLogRing.push(Date.now() + '|' + String(msg).slice(0, 120));
+            while (fillLogRing.length > FILL_LOG_MAX) fillLogRing.shift();
+            g.document.documentElement.setAttribute('data-tps-fill-log', JSON.stringify(fillLogRing));
+        } catch (_) { /* ignore */ }
+    }
+
     function setFillState(state) {
+        const prev = jumpSession ? jumpSession.fillState : null;
         if (jumpSession) jumpSession.fillState = state;
+        if (String(state) !== String(prev)) fillEvent('fill state ' + state);
         try { g.document.documentElement.setAttribute('data-tps-fill', String(state)); } catch (_) { /* ignore */ }
     }
 
@@ -1455,12 +1471,18 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 while (s === jumpSession && s.fillUp && !s.fillDone && buf === s.buf && !buf.atNow &&
                         !buf.dead && buf.posts < buf.want && s.steps < FILL_MAX_STEPS) {
                     s.steps++;
-                    const r = await stepAbove(s.fetcher.fetchAtB, buf.K, s.sf || DEFAULT_SF_PER_POST,
+                    const fetchAtB = s.fetcher.fetchAtB;
+                    const timedFetch = (B) => withTimeout(fetchAtB(B), FILL_FETCH_TIMEOUT_MS, () => {
+                        fillEvent('page fetch timed out (' + (FILL_FETCH_TIMEOUT_MS / 1000) + ' s)');
+                        return null;
+                    });
+                    const r = await stepAbove(timedFetch, buf.K, s.sf || DEFAULT_SF_PER_POST,
                         s.fetcher.pageSize, snowflakeFromMs(Date.now()), buf.floorB);
                     if (buf !== s.buf) break;
                     if (!r.ok) {
                         buf.fails++;
                         jumpLog('fill step failed', r.reason, 'streak', buf.fails);
+                        fillEvent('background step failed (' + r.reason + ') ' + buf.fails + '/' + FILL_MAX_FAIL_STREAK);
                         if (buf.fails >= FILL_MAX_FAIL_STREAK) { buf.dead = true; break; }
                         await sleepMs(1000 * buf.fails);
                         continue;
@@ -1483,6 +1505,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 }
             } catch (e) {
                 jumpLog('fill pump error', e && (e.message || e));
+                fillEvent('background error ' + (e && (e.message || e)));
                 buf.fails++;
                 if (buf.fails >= FILL_MAX_FAIL_STREAK) buf.dead = true;
             } finally {
@@ -1497,6 +1520,24 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         })();
         token.done = run;
         return run;
+    }
+
+    function withTimeout(promise, ms, onTimeout) {
+        return new Promise((resolve, reject) => {
+            let done = false;
+            const t = g.setTimeout(() => {
+                if (done) return;
+                done = true;
+                try { resolve(onTimeout()); } catch (e) { reject(e); }
+            }, ms);
+            Promise.resolve(promise).then((v) => {
+                if (done) return;
+                done = true; try { (g.clearTimeout || clearTimeout)(t); } catch (_) {}; resolve(v);
+            }, (e) => {
+                if (done) return;
+                done = true; try { (g.clearTimeout || clearTimeout)(t); } catch (_) {}; reject(e);
+            });
+        });
     }
 
     function prefetchFill(s) {
@@ -1550,10 +1591,23 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         if (!decoded || !sessionWantsFill()) return null;
         const s = jumpSession;
         markTopFetch();
+        const t0 = Date.now();
+        const el = g.document.documentElement;
+        try { el.setAttribute('data-tps-fill-busy', String(t0)); } catch (_) { /* ignore */ }
+        fillEvent('X asked for newer posts (near top: ' + (userNearTop() ? 'yes' : 'no') + ')');
+        let out = null;
         try {
-            return await answerTopRequest(s, url, headerObj, decoded);
+            out = await answerTopRequest(s, url, headerObj, decoded);
+            return out;
+        } catch (e) {
+            fillEvent('answer error ' + (e && (e.message || e)) + ' → X loads it itself');
+            throw e;
         } finally {
             markTopFetch();
+            try { el.removeAttribute('data-tps-fill-busy'); } catch (_) { /* ignore */ }
+            const ms = Date.now() - t0;
+            fillEvent('answered in ' + (ms / 1000).toFixed(1) + ' s: ' + (s.lastAnswer || (out == null ? 'pass-through' : 'ok')));
+            s.lastAnswer = '';
         }
     }
 
@@ -1578,11 +1632,12 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 s.holds++;
                 setFillState('hold');
                 jumpLog('fill hold (not near top)');
+                s.lastAnswer = 'held (not at the top)';
                 prefetchFill(s);
                 return holdResponseText();
             }
         }
-        if (fillBusy) return holdResponseText();
+        if (fillBusy) { s.lastAnswer = 'held (already answering one)'; return holdResponseText(); }
         fillBusy = true;
         try {
             buf.want = Math.max(buf.want, FILL_POSTS_PER_RESPONSE);
@@ -1623,6 +1678,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 s.fillDone = true;
                 setFillState('gave-up');
                 jumpLog('fill gave up after', buf.fails, 'failed steps');
+                s.lastAnswer = 'gave up after ' + buf.fails + ' failed steps (+' + built.tweetCount + ')';
                 if (!built.tweetCount) return null;
             } else if (s.steps >= FILL_MAX_STEPS && !buf.chunks.length && !s.pump) {
                 s.fillDone = true;
@@ -1635,6 +1691,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             if (!built.tweetCount && !atNow) {
                 // Nothing yet: keep X's cursor (retry on next Top request).
                 jumpLog('fill: nothing buffered yet, hold', 'steps=', s.steps);
+                s.lastAnswer = 'nothing ready yet (step ' + s.steps + ', fails ' + buf.fails + ')';
                 return holdResponseText();
             }
             if (!built.topEntry && s.lastTopEntry) {
@@ -1642,6 +1699,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 tl.instructions[0].entries.push(s.lastTopEntry);
             }
             jumpLog('fill +' + built.tweetCount, 'steps=', s.steps, 'buffered=', buf.posts, atNow ? '(now)' : '');
+            if (!s.lastAnswer) s.lastAnswer = '+' + built.tweetCount + ' posts' + (atNow ? ', reached now' : ', ' + buf.posts + ' more ready');
             const text = JSON.stringify(built.json);
             inspectResponseText(text);
             return text;
@@ -3410,26 +3468,76 @@ function tpsInjectPageRealmScripts() {
         try { document.documentElement.setAttribute('data-tps-near-top', v); } catch (_) { /* ignore */ }
     }
 
-    // v3.43 fill kick. X fetches newer posts only when the viewport ENTERS
+    // v3.44 fill nudge. X fetches newer posts only when the viewport ENTERS
     // the top zone of the list (top 25% of a screen) and only if its last
-    // initial/"newer" response is older than 60 s. A user who scrolls up to
-    // the top of the restored window within that minute (or just sits there)
-    // never triggers another request: scrolling "blocks after a few posts".
-    // When the page hook still has newer posts to give, nudge the scroll out
-    // of that zone and back once X's minute is over, so X asks again.
+    // initial/"newer" response is older than 60 s (onlyIfStale); list
+    // timelines do not poll. A reader who reaches the top of the restored
+    // window within that minute (or just sits there) never triggers another
+    // request: scrolling "blocks after a few posts". While the page hook
+    // still has newer posts to give, nudge X:
+    //  1. Home tap (AppTabBar_Home_Link). X's refreshOrGoTop: at the newest
+    //     post it runs a refresh = Top fetch that is NOT stale-gated, so no
+    //     60 s wait; otherwise it scrolls to the top (next tap refreshes).
+    //  2. Fallback: scroll out of the top zone and back once X's 60 s are
+    //     over (v3.43 kick; stale-gated near-top fetch).
+    // v3.43 showed "Loading newer posts…" forever when its kick did not make
+    // X ask. Now every nudge must be followed by a Top request reaching the
+    // page hook within FILL_NUDGE_TIMEOUT_MS, else it is a miss and the other
+    // method is tried; after FILL_NUDGE_MAX_MISSES misses in a row the pill
+    // says so and retries every 30 s. Tap/long-press the pill: debug log.
     const X_TOP_STALE_MS = 60000;
     const FILL_KICK_MARGIN_MS = 1500;
-    const FILL_KICK_RETRY_MS = 8000;
-    const FILL_KICK_ZONE_RATIO = 0.2;
+    const FILL_ZONE_RATIO = 0.25;           // X nearStartProximityRatio
+    const FILL_DWELL_MS = 400;
+    const FILL_NUDGE_TIMEOUT_MS = 5000;
+    const FILL_AFTER_ANSWER_MS = 1500;
+    const FILL_HOME_MISSES_TO_SWITCH = 2;
+    const FILL_NUDGE_MAX_MISSES = 6;
+    const FILL_STUCK_RETRY_MS = 30000;
+    const FILL_BUSY_SLOW_MS = 25000;
+    const FILL_TICK_MS = 300;
     const FILL_WAIT_ID = 'tps-fill-wait';
+    const FILL_LOG_ID = 'tps-fill-log';
+    const FILL_UI_LOG_MAX = 30;
+    const fillNudge = {
+        pending: null,      // { method, n, at }
+        method: 'home',     // next method to try
+        misses: 0, homeMisses: 0, count: 0,
+        homeOff: '',        // reason Home taps are disabled
+        topSince: 0, lastAt: 0, stuckLogged: false, slowLogged: false,
+        log: []
+    };
     let lastFillKickAt = 0;
     let fillKickBusy = false;
+
+    function fillUiLog(msg) {
+        fillNudge.log.push(Date.now() + '|' + msg);
+        while (fillNudge.log.length > FILL_UI_LOG_MAX) fillNudge.log.shift();
+        try { log('fill: ' + msg); } catch (_) { /* ignore */ }
+        renderFillLog();
+    }
 
     function fillStillWanted() {
         let st = null;
         try { st = document.documentElement.getAttribute('data-tps-fill'); } catch (_) { return false; }
         if (!st) return false;
         return st === 'armed' || st === 'hold' || st === 'error' || st.indexOf('step') === 0;
+    }
+
+    function fillAttrNum(name) {
+        try { return Number(document.documentElement.getAttribute(name)) || 0; } catch (_) { return 0; }
+    }
+
+    function fillBufText() {
+        let b = '';
+        try { b = document.documentElement.getAttribute('data-tps-fill-buf') || ''; } catch (_) { /* ignore */ }
+        if (!b) return '';
+        const parts = b.split('|');
+        return parts[0] + ' ready' + (parts[1] === 'now' ? ', up to now' : '');
+    }
+
+    function homeLink() {
+        try { return document.querySelector('a[data-testid="AppTabBar_Home_Link"]'); } catch (_) { return null; }
     }
 
     function showFillWait(text) {
@@ -3439,33 +3547,249 @@ function tpsInjectPageRealmScripts() {
             if (!document.body) return;
             el = document.createElement('div');
             el.id = FILL_WAIT_ID;
-            el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);' +
+            el.setAttribute('role', 'button');
+            el.style.cssText = 'position:fixed;top:8px;left:50%;transform:translateX(-50%);max-width:92vw;' +
                 'z-index:2147483646;background:rgba(29,155,240,.92);color:#fff;font:13px/1.3 -apple-system,' +
-                'system-ui,sans-serif;padding:6px 12px;border-radius:14px;pointer-events:none;';
+                'system-ui,sans-serif;padding:6px 12px;border-radius:14px;pointer-events:auto;cursor:pointer;' +
+                'text-align:center;-webkit-user-select:none;user-select:none;-webkit-touch-callout:none;';
+            // Tap or long-press: show what the fill is waiting on.
+            let pressTimer = 0;
+            let pressed = false;
+            el.addEventListener('touchstart', function () {
+                pressed = false;
+                clearTimeout(pressTimer);
+                pressTimer = setTimeout(function () { pressed = true; toggleFillLog(true); }, 500);
+            }, { passive: true });
+            const cancelPress = function () { clearTimeout(pressTimer); };
+            el.addEventListener('touchend', cancelPress, { passive: true });
+            el.addEventListener('touchcancel', cancelPress, { passive: true });
+            el.addEventListener('click', function (e) {
+                e.preventDefault();
+                e.stopPropagation();
+                if (pressed) { pressed = false; return; }
+                toggleFillLog();
+            });
+            el.addEventListener('contextmenu', function (e) { e.preventDefault(); });
             document.body.appendChild(el);
         }
         if (el.textContent !== text) el.textContent = text;
     }
 
+    function fmtClock(ms) {
+        const d = new Date(ms);
+        const p = (n) => String(n).padStart(2, '0');
+        return p(d.getHours()) + ':' + p(d.getMinutes()) + ':' + p(d.getSeconds());
+    }
+
+    function fillLogLines() {
+        const de = document.documentElement;
+        const now = Date.now();
+        const lines = [];
+        let hook = [];
+        try { hook = JSON.parse(de.getAttribute('data-tps-fill-log') || '[]') || []; } catch (_) { hook = []; }
+        const all = [];
+        for (const e of hook) { const i = e.indexOf('|'); all.push([Number(e.slice(0, i)), 'hook', e.slice(i + 1)]); }
+        for (const e of fillNudge.log) { const i = e.indexOf('|'); all.push([Number(e.slice(0, i)), 'saver', e.slice(i + 1)]); }
+        all.sort((a, b) => a[0] - b[0]);
+        const topAt = fillAttrNum('data-tps-top-at');
+        const busyAt = fillAttrNum('data-tps-fill-busy');
+        lines.push('Timeline Saver ' + TPS_VERSION + ' · newer posts');
+        lines.push('fill=' + (de.getAttribute('data-tps-fill') || '-') +
+            ' · buffer=' + (de.getAttribute('data-tps-fill-buf') || '0') +
+            ' · near-top=' + (de.getAttribute('data-tps-near-top') || '-'));
+        lines.push('last X request ' + (topAt ? Math.round((now - topAt) / 1000) + ' s ago' : 'never') +
+            (busyAt ? ' · answering for ' + Math.round((now - busyAt) / 1000) + ' s' : '') +
+            ' · y=' + Math.round(scrollTop()));
+        lines.push('nudges=' + fillNudge.count + ' · misses in a row=' + fillNudge.misses +
+            ' · next=' + (fillNudge.homeOff ? 'scroll (Home off: ' + fillNudge.homeOff + ')' : fillNudge.method) +
+            (fillNudge.pending ? ' · waiting on ' + fillNudge.pending.method + ' #' + fillNudge.pending.n : ''));
+        lines.push('—');
+        for (const a of all.slice(-24)) lines.push(fmtClock(a[0]) + ' ' + (a[1] === 'hook' ? '· ' : '» ') + a[2]);
+        return lines;
+    }
+
+    function renderFillLog() {
+        const box = document.getElementById(FILL_LOG_ID);
+        if (!box) return;
+        const pre = box.querySelector('pre');
+        if (pre) pre.textContent = fillLogLines().join('\n');
+    }
+
+    function toggleFillLog(forceOpen) {
+        let box = document.getElementById(FILL_LOG_ID);
+        if (box && !forceOpen) { clearInterval(box.__tpsTimer); box.remove(); return; }
+        if (box) { renderFillLog(); return; }
+        if (!document.body) return;
+        box = document.createElement('div');
+        box.id = FILL_LOG_ID;
+        box.style.cssText = 'position:fixed;top:44px;left:6px;right:6px;max-height:62vh;overflow:auto;' +
+            'z-index:2147483647;background:rgba(0,0,0,.94);color:#e7e9ea;border:1px solid #1d9bf0;' +
+            'border-radius:10px;padding:8px;font:11px/1.35 ui-monospace,Menlo,monospace;' +
+            '-webkit-overflow-scrolling:touch;';
+        const bar = document.createElement('div');
+        bar.style.cssText = 'display:flex;gap:8px;margin-bottom:6px;';
+        const mk = (label, fn) => {
+            const b = document.createElement('button');
+            b.textContent = label;
+            b.style.cssText = 'flex:1;font:13px -apple-system,system-ui,sans-serif;padding:6px;border-radius:8px;' +
+                'border:0;background:#1d9bf0;color:#fff;';
+            b.addEventListener('click', (e) => { e.preventDefault(); e.stopPropagation(); fn(); });
+            bar.appendChild(b);
+            return b;
+        };
+        mk('Retry now', () => { resetFillNudge('retry button'); renderFillLog(); });
+        const copyBtn = mk('Copy', () => {
+            const t = fillLogLines().join('\n');
+            try {
+                navigator.clipboard.writeText(t).then(() => { copyBtn.textContent = 'Copied'; },
+                    () => { copyBtn.textContent = 'Copy failed'; });
+            } catch (_) { copyBtn.textContent = 'Copy failed'; }
+        });
+        mk('Close', () => toggleFillLog());
+        const pre = document.createElement('pre');
+        pre.style.cssText = 'margin:0;white-space:pre-wrap;word-break:break-word;';
+        box.appendChild(bar);
+        box.appendChild(pre);
+        box.addEventListener('click', (e) => e.stopPropagation());
+        document.body.appendChild(box);
+        renderFillLog();
+        box.__tpsTimer = setInterval(() => {
+            if (!document.getElementById(FILL_LOG_ID)) { clearInterval(box.__tpsTimer); return; }
+            renderFillLog();
+        }, 1000);
+    }
+
+    function resetFillNudge(why) {
+        fillNudge.pending = null;
+        fillNudge.misses = 0;
+        fillNudge.homeMisses = 0;
+        fillNudge.homeOff = '';
+        fillNudge.method = 'home';
+        fillNudge.lastAt = 0;
+        fillNudge.stuckLogged = false;
+        fillUiLog('reset (' + why + ')');
+    }
+
+    function fillNudgeMiss(p) {
+        fillNudge.misses++;
+        let next = p.method;
+        if (p.method === 'home') {
+            fillNudge.homeMisses++;
+            if (fillNudge.homeMisses >= FILL_HOME_MISSES_TO_SWITCH) { next = 'scroll'; fillNudge.homeMisses = 0; }
+        } else {
+            next = 'home';
+        }
+        fillNudge.method = next;
+        fillUiLog(p.method + ' #' + p.n + ': X did not ask within ' + (FILL_NUDGE_TIMEOUT_MS / 1000) +
+            ' s (miss ' + fillNudge.misses + '/' + FILL_NUDGE_MAX_MISSES + '), next: ' +
+            (fillNudge.homeOff ? 'scroll' : next));
+    }
+
+    function sendFillNudge(method, now) {
+        fillNudge.count++;
+        fillNudge.lastAt = now;
+        const p = { method, n: fillNudge.count, at: now };
+        fillNudge.pending = p;
+        updateNearTopFlag();
+        if (method === 'home') {
+            const a = homeLink();
+            fillUiLog('home #' + p.n + ': tap Home (X refresh, no 60 s wait) y=' + Math.round(scrollTop()));
+            const tab0 = isOnTargetTab();
+            try { a.click(); } catch (e) { fillUiLog('home tap error ' + (e && e.message)); }
+            setTimeout(() => {
+                // The tap must keep us on /home and the same tab.
+                if (currentPath() !== '/home' || (tab0 && !isOnTargetTab())) {
+                    fillNudge.homeOff = 'tap left the tab';
+                    fillUiLog('Home tap changed page/tab — Home taps off for this page');
+                }
+            }, 800);
+        } else {
+            lastFillKickAt = now;
+            fillUiLog('scroll #' + p.n + ': scroll out of the top zone and back (X near-top fetch)');
+            kickNearTop();
+        }
+    }
+
     function fillKickTick() {
-        let due = 0;
-        try {
-            if (restoring || lastNearTopFlag !== '1' || !fillStillWanted()) { showFillWait(''); return; }
-            const vh = window.innerHeight || 800;
-            if (scrollTop() > FILL_KICK_ZONE_RATIO * vh) { showFillWait(''); return; }
-            const topAt = Number(document.documentElement.getAttribute('data-tps-top-at')) || 0;
-            due = topAt + X_TOP_STALE_MS + FILL_KICK_MARGIN_MS;
-            const now = Date.now();
+        try { fillTickInner(); } catch (e) { try { log('fill tick error', e && e.message); } catch (_) { /* */ } }
+    }
+
+    function fillTickInner() {
+        const now = Date.now();
+        const topAt = fillAttrNum('data-tps-top-at');
+        const busyAt = fillAttrNum('data-tps-fill-busy');
+        const p = fillNudge.pending;
+        if (p) {
+            if (busyAt >= p.at || topAt >= p.at) {
+                fillUiLog(p.method + ' #' + p.n + ': X asked after ' + ((Math.max(busyAt, topAt) - p.at) / 1000).toFixed(1) + ' s');
+                fillNudge.pending = null;
+                fillNudge.misses = 0;
+                fillNudge.stuckLogged = false;
+                if (p.method === 'home') fillNudge.homeMisses = 0;
+            } else if (now - p.at > FILL_NUDGE_TIMEOUT_MS) {
+                fillNudge.pending = null;
+                fillNudgeMiss(p);
+            }
+        }
+        if (restoring || lastNearTopFlag !== '1' || !fillStillWanted()) {
+            fillNudge.topSince = 0;
+            showFillWait('');
+            return;
+        }
+        const vh = window.innerHeight || 800;
+        if (scrollTop() > FILL_ZONE_RATIO * vh) { fillNudge.topSince = 0; showFillWait(''); return; }
+        if (!fillNudge.topSince) fillNudge.topSince = now;
+        const buf = fillBufText();
+        if (busyAt) {
+            const w = now - busyAt;
+            if (w > FILL_BUSY_SLOW_MS) {
+                if (!fillNudge.slowLogged) { fillNudge.slowLogged = true; fillUiLog('answer slow: ' + Math.round(w / 1000) + ' s'); }
+                showFillWait('Still loading newer posts (' + Math.round(w / 1000) + ' s, slow network)… tap for details');
+            } else {
+                showFillWait('Loading newer posts… (X asked' + (buf ? ', ' + buf : '') + ')');
+            }
+            return;
+        }
+        fillNudge.slowLogged = false;
+        if (fillNudge.pending) {
+            const q = fillNudge.pending;
+            showFillWait('Asking X for newer posts (' + (q.method === 'home' ? 'Home tap' : 'scroll nudge') +
+                ' #' + q.n + ', ' + Math.max(0, Math.ceil((q.at + FILL_NUDGE_TIMEOUT_MS - now) / 1000)) + ' s)…');
+            return;
+        }
+        const stuck = fillNudge.misses >= FILL_NUDGE_MAX_MISSES;
+        if (stuck) {
+            if (!fillNudge.stuckLogged) {
+                fillNudge.stuckLogged = true;
+                fillUiLog('stuck: ' + fillNudge.misses + ' nudges in a row got no request from X; retry every ' +
+                    (FILL_STUCK_RETRY_MS / 1000) + ' s');
+            }
+            const left = Math.ceil((fillNudge.lastAt + FILL_STUCK_RETRY_MS - now) / 1000);
+            showFillWait('X is not loading newer posts (retry in ' + Math.max(0, left) + ' s). Tap for details / retry');
+            if (now - fillNudge.lastAt < FILL_STUCK_RETRY_MS) return;
+        }
+        if (now - fillNudge.topSince < FILL_DWELL_MS) return;
+        if (topAt && now - topAt < FILL_AFTER_ANSWER_MS) {
+            if (!stuck) showFillWait('Loading newer posts…' + (buf ? ' (' + buf + ')' : ''));
+            return;
+        }
+        if (fillKickBusy || touchActive || now - lastUserGestureAt < 700) {
+            if (!stuck) showFillWait('Newer posts load when you stop scrolling');
+            return;
+        }
+        let method = fillNudge.method;
+        if (fillNudge.homeOff || !homeLink() || currentPath() !== '/home') method = 'scroll';
+        if (method === 'scroll') {
+            const due = topAt + X_TOP_STALE_MS + FILL_KICK_MARGIN_MS;
             if (now < due) {
-                showFillWait('Newer posts in ' + Math.ceil((due - now) / 1000) + ' s (X loads them once a minute)');
+                if (!stuck) {
+                    showFillWait('Newer posts in ' + Math.ceil((due - now) / 1000) +
+                        ' s (X allows one request a minute)' + (buf ? ' · ' + buf : ''));
+                }
                 return;
             }
-            showFillWait('Loading newer posts…');
-            if (fillKickBusy || touchActive || now - lastUserGestureAt < 700 ||
-                now - lastFillKickAt < FILL_KICK_RETRY_MS) return;
-            lastFillKickAt = now;
-            kickNearTop();
-        } catch (_) { /* ignore */ }
+        }
+        sendFillNudge(method, now);
     }
 
     function nextFrames(n) {
@@ -4826,7 +5150,7 @@ function tpsInjectPageRealmScripts() {
         ensureButton();
         watchFillState();
         setInterval(savePosition, CONFIG.saveIntervalMs);
-        setInterval(fillKickTick, 1000);
+        setInterval(fillKickTick, FILL_TICK_MS);
 
         await maybeAutoRestore();
     }

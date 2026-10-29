@@ -30,6 +30,7 @@ const VIDEO = opt('video', null);
 const SEED = Number(opt('seed', 7));
 // X's real staleIntervalMs is 60 s; polls default off (list timelines).
 const STALE_MS = Number(opt('stale', 60000)), POLL_MS = Number(opt('poll', 0));
+const FAULT = opt('fault', '');
 const SCROLL_BUDGET_MS = Number(opt('budget', 200000));
 const AGO = { '4d': 4 * 864e5, '3d': 3 * 864e5, '1d': 864e5, '6h': 6 * 36e5, '1h': 36e5 };
 
@@ -45,7 +46,7 @@ if (VIDEO) { rmSync(frameDir, { recursive: true, force: true }); mkdirSync(frame
 
 function monitorScript() {
   // Runs in every document before page scripts.
-  window.__simMon = { maxMounted: 0, panel: [] };
+  window.__simMon = { maxMounted: 0, panel: [], pill: [] };
   setInterval(() => {
     const n = document.querySelectorAll('article[data-testid="tweet"]').length;
     if (n > window.__simMon.maxMounted) window.__simMon.maxMounted = n;
@@ -53,6 +54,12 @@ function monitorScript() {
     const t = p ? p.textContent.trim() : '';
     const arr = window.__simMon.panel;
     if (t && arr[arr.length - 1] !== t) arr.push(t);
+    // Fill pill ("Newer posts in N s" / "Loading newer posts…"): keep the
+    // distinct texts (countdown digits folded) to see what it waited on.
+    const w = document.getElementById('tps-fill-wait');
+    const wt = w ? w.textContent.trim().replace(/\d+/g, '#') : '';
+    const pa = window.__simMon.pill;
+    if (wt && pa[pa.length - 1] !== wt) { pa.push(wt); if (pa.length > 40) pa.shift(); }
   }, 50);
 }
 
@@ -80,7 +87,7 @@ async function runTarget(browser, label) {
   }
   await page.setRequestInterception(true);
   const appHtml = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home / X (sim)</title></head><body>' +
-    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS }) + ';</script><script>' + appSrc + '</script></body></html>';
+    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS, fault: FAULT }) + ';</script><script>' + appSrc + '</script></body></html>';
   page.on('request', async (req) => {
     const u = req.url();
     try {
@@ -233,8 +240,17 @@ async function runTarget(browser, label) {
   const endState = await page.evaluate(() => ({
     fill: document.documentElement.getAttribute('data-tps-fill'),
     maxMounted: window.__simMon.maxMounted, appMax: window.__simApp.stats.maxMounted, stats: window.__simApp.stats,
-    panel: window.__simMon.panel.slice(-6)
+    panel: window.__simMon.panel.slice(-6), pill: window.__simMon.pill.slice(-12)
   }));
+  // Debug log: if the fill pill is still up, tap it and read the panel.
+  const debugLog = await page.evaluate(async () => {
+    const pill = document.getElementById('tps-fill-wait');
+    if (!pill || pill.style.display === 'none' || !pill.textContent) return null;
+    pill.click();
+    await new Promise((r) => setTimeout(r, 300));
+    const box = document.getElementById('tps-fill-log');
+    return box ? box.innerText.split('\n').slice(0, 14) : 'no panel';
+  });
   // After "now": X's next poll must pass straight through (no rewrite).
   const lastTop = fake.log.filter((e) => e.kind === 'top').slice(-1)[0];
   if (VIDEO) { try { await cdp.send('Page.stopScreencast'); } catch (_) { /* */ } }
@@ -250,6 +266,7 @@ async function runTarget(browser, label) {
     backend: { total: fake.log.length, top: fake.log.filter((e) => e.kind === 'top').length,
       bottom: fake.log.filter((e) => e.kind === 'bottom').length, head: fake.log.filter((e) => e.kind === 'head').length },
     lastTopB: lastTop ? lastTop.B : null, app: endState.stats, atTopWaitSec: atTopWaits, scrollSec: Math.round((tReached - tScroll) / 1000),
+    fault: FAULT || undefined, pill: endState.pill, debugLog: debugLog || undefined,
     pageErrors: consoleErrors.slice(0, 5)
   };
   res.pass = res.landed && res.reachedNow && !res.gapEver && !res.endGaps && res.maxMounted <= 100 &&

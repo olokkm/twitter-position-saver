@@ -13,12 +13,19 @@
 //  - refreshOrGoTop (tap on the Home nav link while on /home): at newest
 //    (viewport top within 50 px of the list top) → refresh = Top fetch with
 //    no stale gate; otherwise scroll to top.
+// Fault injection (SIM.fault, sim-ios-jump.mjs --fault): 'edge-dead' = the
+// near-top edge never fires on scroll movement (only on list updates), so
+// scroll nudges cannot make X ask; 'home-dead' = the Home link does nothing;
+// 'both-dead' = both. Used to check that the fill never hangs silently.
 (function () {
   'use strict';
   const SIM = window.__SIM || {};
   const STALE_MS = SIM.staleMs != null ? SIM.staleMs : 60000;
   const POLL_MS = SIM.pollMs || 0;
   const NEAR_START_RATIO = 0.25;
+  const FAULT = String(SIM.fault || '');
+  const EDGE_DEAD = FAULT === 'edge-dead' || FAULT === 'both-dead';
+  const HOME_DEAD = FAULT === 'home-dead' || FAULT === 'both-dead';
   const OVERSCAN = 1.5;
   let cells = []; // newest first: {id, iso, text, h}
   const byId = new Map();
@@ -28,7 +35,7 @@
   let tabSel = 'Olo';
   let tl, mounted = new Map();
   let nearStartInside = null, nearStartLen = -1;
-  const stats = window.__simStats = { staleSkips: 0, refreshes: 0, topReq: 0, bottomReq: 0, headReq: 0, prepended: 0, appended: 0, maxMounted: 0 };
+  const stats = window.__simStats = { staleSkips: 0, refreshes: 0, homeTaps: 0, topReq: 0, bottomReq: 0, headReq: 0, prepended: 0, appended: 0, maxMounted: 0 };
 
   function hashH(id) { let h = 0; for (const c of id.slice(-6)) h = (h * 31 + c.charCodeAt(0)) >>> 0; return 150 + (h % 5) * 30; }
   function url(cursor, count) {
@@ -156,12 +163,14 @@
   function checkNearStart() {
     if (!tl || !cells.length) return;
     const inside = window.scrollY - listTopDoc() <= NEAR_START_RATIO * window.innerHeight;
-    const fire = inside && (nearStartInside === false || nearStartInside === null || nearStartLen !== cells.length);
+    const moved = nearStartInside === false || nearStartInside === null;
+    const fire = inside && ((moved && !(EDGE_DEAD && nearStartInside === false)) || nearStartLen !== cells.length);
     nearStartInside = inside; nearStartLen = cells.length;
     if (fire) loadTop('near-top');
   }
   function isAtNewest() { return window.scrollY - listTopDoc() <= 50; }
   function refreshOrGoTop() {
+    if (HOME_DEAD) { stats.homeTapsIgnored = (stats.homeTapsIgnored || 0) + 1; return; }
     if (!isAtNewest()) { window.scrollTo(0, 0); return; }
     stats.refreshes++;
     loadTop('refresh');
@@ -202,7 +211,7 @@
     nav.innerHTML = '<a href="/home" data-testid="AppTabBar_Home_Link" aria-label="Home" role="link">Home</a>';
     nav.style.cssText = 'position:fixed;bottom:0;left:0;right:0;height:50px;background:#000;border-top:1px solid #2f3336;z-index:6;text-align:center;line-height:50px';
     document.body.appendChild(nav);
-    nav.querySelector('a').addEventListener('click', (e) => { e.preventDefault(); refreshOrGoTop(); });
+    nav.querySelector('a').addEventListener('click', (e) => { e.preventDefault(); stats.homeTaps++; refreshOrGoTop(); });
     setTimeout(loadHead, SIM.headDelayMs || 400);
     window.__simApp = { ids: () => cells.map((c) => c.id), topCursor: () => topCursor, stats, lastTopAt: () => lastTopAt };
   }
