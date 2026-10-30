@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.45
+// @version      3.46
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.45';
+const TPS_VERSION = '3.46';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -1804,6 +1804,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 const tl = timelineOf(built.json);
                 tl.instructions[0].entries.push(s.lastTopEntry);
             }
+            if (built.tweetCount) noteFillServed(pages, built);
             jumpLog('fill +' + built.tweetCount, 'steps=', s.steps, 'buffered=', buf.posts, atNow ? '(now)' : '');
             if (!s.lastAnswer) s.lastAnswer = '+' + built.tweetCount + ' posts' + (atNow ? ', reached now' : ', ' + buf.posts + ' more ready');
             const text = JSON.stringify(built.json);
@@ -1812,6 +1813,29 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         } finally {
             fillBusy = false;
         }
+    }
+
+    // v3.46: X parks Top responses for a pinned list in its "new posts" bar
+    // and scrolls to the newest post when the bar is applied. Tell the
+    // content script which posts we just served (before X sees them) and
+    // keep the order list (newest first) complete so it can find its way
+    // back to the post the user was reading.
+    const FILL_SERVED_IDS = 12;
+    function noteFillServed(pages, built) {
+        const add = (built.order || []).map(String);
+        const prev = (lastJumpMeta && Array.isArray(lastJumpMeta.order)) ? lastJumpMeta.order : [];
+        const seen = new Set(add);
+        const order = add.concat(prev.filter((id) => !seen.has(String(id))));
+        try {
+            applySortMapFromPages(pages, order, !!(lastJumpMeta && lastJumpMeta.jumpMerged),
+                lastJumpMeta && lastJumpMeta.pages != null ? lastJumpMeta.pages : null);
+        } catch (_) { /* ignore */ }
+        const ids = add.length <= 2 * FILL_SERVED_IDS ? add
+            : add.slice(0, FILL_SERVED_IDS).concat(add.slice(-FILL_SERVED_IDS));
+        try {
+            g.document.documentElement.setAttribute('data-tps-fill-served',
+                Date.now() + '|' + built.tweetCount + '|' + ids.join(','));
+        } catch (_) { /* ignore */ }
     }
 
     function applySortMapFromPages(pages, order, merged, pageCount) {
@@ -3476,6 +3500,8 @@ function tpsInjectPageRealmScripts() {
 
     function savePosition() {
         if (restoring || suppressSaves) return;
+        // v3.46: never save the newest post X jumped to before we go back.
+        if (fillBar.reanchoring || fillBar.applying || (fillBar.pending && fillBar.pending.parked)) return;
         if (!isTimelinePage() || !isOnTargetTab()) return;
 
         const y0 = TPS_DEBUG_SCROLL ? scrollTop() : 0;
@@ -3870,6 +3896,7 @@ function tpsInjectPageRealmScripts() {
     }
 
     function fillKickTick() {
+        try { barGuardTick(Date.now()); } catch (e) { try { log('bar guard error', e && e.message); } catch (_) { /* */ } }
         try { fillTickInner(); } catch (e) { try { log('fill tick error', e && e.message); } catch (_) { /* */ } }
     }
 
@@ -3889,6 +3916,12 @@ function tpsInjectPageRealmScripts() {
                 fillNudge.pending = null;
                 fillNudgeMiss(p);
             }
+        }
+        if (fillBarBusy()) {
+            // v3.46: an answer is on its way into the list; no new nudges
+            // (a Home tap now would show X's bar at the newest post).
+            fillNudge.topSince = 0;
+            return;
         }
         if (restoring || lastNearTopFlag !== '1' || !fillStillWanted()) {
             fillNudge.topSince = 0;
@@ -3922,7 +3955,9 @@ function tpsInjectPageRealmScripts() {
                 fillNudge.stuckLogged = true;
                 fillUiLog('stuck: ' + fillNudge.misses + ' nudges in a row got no request from X; retry every ' +
                     (FILL_STUCK_RETRY_MS / 1000) + ' s');
-                if (!fillNudge.reloadDone && CONFIG.fillReloadWhenStuck !== false) {
+                // v3.46: off by default (it could not guarantee to come back
+                // to the saved post); the "Reload here" button stays.
+                if (!fillNudge.reloadDone && CONFIG.fillReloadWhenStuck === true) {
                     // v3.45: do not depend on X's Top request any more:
                     // reload the list at the post on screen (tab away and
                     // back, X's own first request gets our window).
@@ -3960,27 +3995,328 @@ function tpsInjectPageRealmScripts() {
 
     async function reloadListHere(why) {
         if (restoring) { fillUiLog('reload skipped: restore running'); return; }
-        const top = getTopTweet();
-        if (!top || !isOnTargetTab() || !isHomeTimelinePath(currentPath())) {
-            fillUiLog('reload skipped: no post / not on the ' + CONFIG.targetTab + ' tab');
+        if (!isOnTargetTab() || !isHomeTimelinePath(currentPath())) {
+            fillUiLog('reload skipped: not on the ' + CONFIG.targetTab + ' tab');
             return;
         }
+        // v3.46: reopen at the post you were reading (the one we are taking
+        // you back to, else the saved position), never at whatever X shows
+        // at the top of the screen (that may be the newest post).
+        let saved = null;
+        let src = '';
+        const a = fillBar.anchor;
+        if (a && fillBarBusy()) {
+            saved = { tweetId: a.id, tweetTime: a.time, sortId: a.sortId, timestamp: Date.now(), path: currentPath() };
+            src = 'reading';
+        }
+        if (!saved) {
+            const sp = readSavedPosition();
+            if (sp && sp.tweetId) { saved = Object.assign({}, sp, { path: currentPath() }); src = 'saved'; }
+        }
+        if (!saved) {
+            const top = getTopTweet();
+            if (!top) { fillUiLog('reload skipped: no saved post'); return; }
+            saved = {
+                tweetId: top.id, tweetTime: top.time,
+                sortId: resolveSortIdForArticle(top.article, top.id),
+                timestamp: Date.now(), path: currentPath()
+            };
+            src = 'on screen';
+        }
         fillNudge.reloadDone = true;
-        const saved = {
-            tweetId: top.id, tweetTime: top.time,
-            sortId: resolveSortIdForArticle(top.article, top.id),
-            timestamp: Date.now(), path: currentPath()
-        };
-        fillUiLog('reload (' + why + '): reopening the list at post ' + saved.tweetId + ' (X-independent)');
+        fillBar.pending = null;
+        fillBar.anchor = null;
+        fillUiLog('reload (' + why + '): reopening the list at the ' + src + ' post ' + saved.tweetId + ' (X-independent)');
         showFillWait('');
         try {
             await restore(saved, { refetch: true });
         } catch (e) {
             fillUiLog('reload error ' + (e && (e.message || e)));
         }
+        const back = findTweetById(saved.tweetId);
+        if (back) fillUiLog('reload: back at post ' + saved.tweetId);
+        else {
+            fillUiLog('reload: post ' + saved.tweetId + ' is NOT on screen after the reload');
+            showFillWait('Could not reopen at your post — tap the saver\'s jump button');
+        }
         const keep = fillNudge.reloadDone;
         resetFillNudge('after reload: ' + (readJumpResultCode() || '-'));
         fillNudge.reloadDone = keep;
+    }
+
+    // v3.46: X's "new posts" bar. On a pinned list tab X does not put the
+    // newer posts we answer into the list: it parks them behind a "Show N
+    // posts" pill, and applying that (pill tap, Home tap while not at the
+    // newest post) scrolls to the NEWEST post, skipping everything between.
+    // X also pins to the newest post when new posts arrive while the view
+    // is within 50 px of the list top. So after every answer we remember
+    // the post the user is reading, get the posts into the list (applying
+    // X's bar ourselves when they are parked) and scroll back to that post,
+    // with all newer posts above it.
+    const BAR_PARK_CHECK_MS = 1500;
+    const BAR_APPLY_RETRY_MS = 3500;
+    const BAR_APPLY_MAX_TRIES = 4;
+    const fillBar = {
+        key: '', pending: null, anchor: null, applying: false, reanchoring: false,
+        nowPending: false, applied: 0, reanchored: 0, lastResult: ''
+    };
+
+    function readFillServed() {
+        let v = '';
+        try { v = document.documentElement.getAttribute('data-tps-fill-served') || ''; } catch (_) { return null; }
+        if (!v) return null;
+        const parts = v.split('|');
+        return { key: v, n: Number(parts[1]) || 0, ids: (parts[2] || '').split(',').filter(Boolean) };
+    }
+
+    function fillBarBusy() {
+        return !!(fillBar.pending || fillBar.reanchoring || fillBar.applying);
+    }
+
+    function captureReadingAnchor() {
+        const t = getTopTweet();
+        if (!t) return null;
+        let offset = 0;
+        try { offset = t.article.getBoundingClientRect().top; } catch (_) { /* ignore */ }
+        return { id: String(t.id), sortId: String(resolveSortIdForArticle(t.article, t.id) || t.id),
+            time: t.time, offset, at: Date.now() };
+    }
+
+    function servedMounted(ids) {
+        for (let i = 0; i < ids.length; i++) if (findTweetById(ids[i])) return true;
+        return false;
+    }
+
+    function anchorDisplaced(a) {
+        const el = a && findTweetById(a.id);
+        if (!el) return true;
+        const r = el.getBoundingClientRect();
+        return Math.abs(r.top - a.offset) > 0.5 * (window.innerHeight || 800);
+    }
+
+    // Runs as a microtask right after the hook marks an answer, i.e. before
+    // X has the response: the view is still where the user reads.
+    function onFillServed() {
+        const sv = readFillServed();
+        if (!sv || sv.key === fillBar.key) return;
+        fillBar.key = sv.key;
+        if (!isOnTargetTab() || !isHomeTimelinePath(currentPath())) return;
+        const p = fillBar.pending;
+        if (p) {
+            for (const id of sv.ids) p.ids.push(id);
+            p.n += sv.n;
+            p.at = Date.now();
+        } else {
+            fillBar.pending = { ids: sv.ids.slice(), n: sv.n, at: Date.now(), parked: false, tries: 0, triedAt: 0 };
+            if (!fillBar.reanchoring) fillBar.anchor = captureReadingAnchor() || fillBar.anchor;
+        }
+        fillUiLog('answered +' + sv.n + ' newer posts; reading post ' + (fillBar.anchor ? fillBar.anchor.id : '-'));
+    }
+
+    function watchFillServed() {
+        try {
+            new MutationObserver(onFillServed).observe(document.documentElement,
+                { attributes: true, attributeFilter: ['data-tps-fill-served'] });
+        } catch (_) { /* ignore */ }
+    }
+
+    function barGuardTick(now) {
+        const p = fillBar.pending;
+        if (!p || fillBar.reanchoring || fillBar.applying) return;
+        if (restoring) return;
+        if (servedMounted(p.ids)) {
+            // The posts are in X's list now (merged in place, or the bar was
+            // applied by us, by X or by the user).
+            fillBar.pending = null;
+            const a = fillBar.anchor;
+            if (a && anchorDisplaced(a)) {
+                reanchorTo(a, p.parked ? 'X showed its new posts' : 'X moved to the newest post');
+            } else {
+                fillBar.lastResult = 'in place';
+                if (p.parked) fillUiLog('newer posts are in the list, still at post ' + (a ? a.id : '-'));
+                fillBarSettled();
+            }
+            return;
+        }
+        if (!p.parked) {
+            if (now - p.at < BAR_PARK_CHECK_MS) return;
+            p.parked = true;
+            fillUiLog('X parked ' + p.n + ' newer posts behind its "new posts" pill (not in the list yet)');
+        }
+        // While parked the user may keep reading: follow the reading post.
+        if (!touchActive && now - lastUserGestureAt > 300) {
+            const c = captureReadingAnchor();
+            if (c) fillBar.anchor = c;
+        }
+        if (touchActive || now - lastUserGestureAt < 700) return;
+        if (p.tries && now - p.triedAt < BAR_APPLY_RETRY_MS) return;
+        if (p.tries >= BAR_APPLY_MAX_TRIES) {
+            if (!p.gaveUp) {
+                p.gaveUp = true;
+                fillUiLog('could not show the parked posts myself; tap X\'s "new posts" pill — I will bring you back');
+            }
+            showFillWait(p.n + ' newer posts ready: tap X\'s "Show posts" pill (Timeline Saver keeps your place)');
+            return;
+        }
+        applyXBar(p);
+    }
+
+    function listTopDoc() {
+        const cell = document.querySelector('[data-testid="cellInnerDiv"]');
+        const box = cell && cell.parentElement;
+        if (!box) return 0;
+        return box.getBoundingClientRect().top + scrollTop();
+    }
+
+    function findXNewPostsButton() {
+        const roots = [document.querySelector('[data-testid="primaryColumn"]'), document.body];
+        const re = /^\s*(show|pokaż|wyświetl)\s+\d[\d.,\s]*\s*\S*\s*$/i;
+        for (const r of roots) {
+            if (!r) continue;
+            const els = r.querySelectorAll('[data-testid="cellInnerDiv"] [role="button"], [data-testid="cellInnerDiv"] button, [aria-label][role="button"]');
+            for (const el of els) {
+                const t = (el.textContent || '').trim();
+                if (re.test(t) || /new posts are available/i.test(el.getAttribute('aria-label') || '')) return el;
+            }
+        }
+        return null;
+    }
+
+    async function applyXBar(p) {
+        fillBar.applying = true;
+        p.tries++;
+        p.triedAt = Date.now();
+        try {
+            const a = captureReadingAnchor();
+            if (a) fillBar.anchor = a;
+            showFillWait('Adding ' + p.n + ' newer posts above…');
+            const home = homeLink();
+            // Try 1: Home tap. Later tries: X's own "Show posts" button if we
+            // can find it (Home taps may be ignored), else Home again.
+            const btn0 = p.tries > 1 ? findXNewPostsButton() : null;
+            if (!btn0 && home && currentPath() === '/home' && !fillNudge.homeOff) {
+                // X applies the bar on a Home tap only when it is not at the
+                // newest post (viewport top > list top + 50 px).
+                const need = listTopDoc() + 120;
+                if (scrollTop() < need) {
+                    tpsScrollWrite('fill-bar-prep', function () { window.scrollTo(0, need); });
+                    await nextFrames(2);
+                }
+                fillUiLog('showing parked posts: Home tap (try ' + p.tries + '/' + BAR_APPLY_MAX_TRIES + ')');
+                try { home.click(); } catch (_) { /* ignore */ }
+            } else {
+                const btn = btn0 || findXNewPostsButton();
+                if (btn) {
+                    fillUiLog('showing parked posts: tap X\'s "Show posts" (try ' + p.tries + ')');
+                    try { btn.click(); } catch (_) { /* ignore */ }
+                } else {
+                    p.tries = BAR_APPLY_MAX_TRIES;
+                    fillUiLog('no Home link / "Show posts" button to show the parked posts');
+                }
+            }
+            await sleep(250);
+        } finally {
+            fillBar.applying = false;
+        }
+    }
+
+    function setScrollY(y) {
+        const root = scrollRoot();
+        const v = Math.max(0, y);
+        tpsScrollWrite('fill-reanchor', function () {
+            try { root.scrollTop = v; } catch (_) { /* ignore */ }
+            try { window.scrollTo(0, v); } catch (_) { /* ignore */ }
+        });
+    }
+
+    function compareIdsNewer(a, b) {
+        try { return BigInt(String(a)) > BigInt(String(b)); } catch (_) { return false; }
+    }
+
+    // Scroll back to the reading post after X moved to the newest one.
+    async function reanchorTo(a, why) {
+        if (fillBar.reanchoring) return false;
+        fillBar.reanchoring = true;
+        const t0 = Date.now();
+        let ok = false;
+        try {
+            fillUiLog(why + ' — going back to post ' + a.id);
+            showFillWait('Keeping your place…');
+            // Let X finish its own scroll first.
+            let y = scrollTop();
+            for (let i = 0; i < 12; i++) {
+                await sleep(100);
+                const y2 = scrollTop();
+                if (Math.abs(y2 - y) < 2) break;
+                y = y2;
+            }
+            const vh = window.innerHeight || 800;
+            for (let iter = 0; iter < 40; iter++) {
+                if (restoring) break;
+                const el = findTweetById(a.id);
+                if (el) {
+                    const dy = el.getBoundingClientRect().top - a.offset;
+                    if (Math.abs(dy) > 2) setScrollY(scrollTop() + dy);
+                    await nextFrames(2);
+                    await sleep(80);
+                    const el2 = findTweetById(a.id);
+                    if (el2 && Math.abs(el2.getBoundingClientRect().top - a.offset) < 12) { ok = true; break; }
+                    continue;
+                }
+                const order = (readJumpSortMeta().order) || [];
+                let idx = order.indexOf(a.sortId);
+                if (idx < 0) idx = order.indexOf(a.id);
+                const arts = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+                const mounted = [];
+                for (const art of arts) {
+                    const id = extractTweetId(art);
+                    if (!id) continue;
+                    let oi = order.indexOf(id);
+                    if (oi < 0) { const m = lookupSortId(id); if (m) oi = order.indexOf(String(m)); }
+                    const r = art.getBoundingClientRect();
+                    mounted.push({ id, i: oi, top: r.top, h: r.height || 1 });
+                }
+                let target;
+                const known = mounted.filter((m) => m.i >= 0);
+                if (idx >= 0 && known.length) {
+                    let sumH = 0;
+                    for (const m of known) sumH += m.h;
+                    const avgH = sumH / known.length;
+                    known.sort((x, z) => x.i - z.i);
+                    const ref = known[Math.floor(known.length / 2)];
+                    target = scrollTop() + ref.top + (idx - ref.i) * avgH - a.offset;
+                } else {
+                    // No order: compare snowflakes (bigger = newer).
+                    mounted.sort((x, z) => x.top - z.top);
+                    const mid = mounted[Math.floor(mounted.length / 2)];
+                    const down = !mid || compareIdsNewer(mid.id, a.id);
+                    target = scrollTop() + (down ? 1.5 : -1.5) * vh;
+                }
+                setScrollY(target);
+                await nextFrames(2);
+                await sleep(120);
+            }
+        } finally {
+            fillBar.reanchoring = false;
+        }
+        fillBar.lastResult = ok ? 'back at post' : 'lost the post';
+        if (ok) {
+            fillBar.reanchored++;
+            fillUiLog('back at post ' + a.id + ' in ' + ((Date.now() - t0) / 1000).toFixed(1) + ' s; newer posts are above');
+        } else {
+            fillUiLog('could not find post ' + a.id + ' again (' + ((Date.now() - t0) / 1000).toFixed(1) + ' s)');
+        }
+        showFillWait('');
+        fillBarSettled();
+        return ok;
+    }
+
+    function fillBarSettled() {
+        fillBar.anchor = null;
+        if (fillBar.nowPending && !fillBarBusy()) {
+            fillBar.nowPending = false;
+            if (!restoring) finishPanel('Caught up: newer posts loaded without gaps [fill:now]');
+        }
     }
 
     function nextFrames(n) {
@@ -5321,7 +5657,10 @@ function tpsInjectPageRealmScripts() {
             if (st === last) return;
             last = st;
             if (restoring) return;
-            if (st === 'now') finishPanel('Caught up: newer posts loaded without gaps [fill:now]');
+            if (st === 'now') {
+                if (fillBarBusy()) fillBar.nowPending = true;
+                else finishPanel('Caught up: newer posts loaded without gaps [fill:now]');
+            }
             else if (st === 'cap' || st === 'gave-up') {
                 finishPanel('Stopped filling newer posts [fill:' + st + '] — X may skip some; ' +
                     'tap the "' + CONFIG.targetTab + '" tab to reload from the top.');
@@ -5343,6 +5682,7 @@ function tpsInjectPageRealmScripts() {
         ensureButton();
         watchFillState();
         setInterval(savePosition, CONFIG.saveIntervalMs);
+        watchFillServed();
         setInterval(fillKickTick, FILL_TICK_MS);
 
         await maybeAutoRestore();

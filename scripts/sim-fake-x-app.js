@@ -20,6 +20,14 @@
 // X's fetchTop rule (v3.45, main.js eT / IN): the Top cursor is used only
 // while it is entries[0] after sorting by sortIndex descending; otherwise X
 // silently sends nothing (stats.topNoop). SIM.xrule === false disables it.
+// New-posts bar (v3.46, main.js ew/T()/er + TimelineRenderer.scrollToTop):
+// on a pinned list tab (isUserRefreshable) with autoPollNewTweets off, a
+// Top fetch sourced from entries[0] does NOT merge its posts: only the Top /
+// Bottom cursors are merged, the posts wait in newTweetsBar, a "Show N
+// posts" cell (newEntriesItem) sits on top of the list plus a floating pill.
+// Applying the bar (pill / cell tap, or Home tap while not at newest) merges
+// the posts and then scrolls to the newest post (scrollAndFocusNewest).
+// SIM.bar === false disables the model (posts merge in place as before).
 (function () {
   'use strict';
   const SIM = window.__SIM || {};
@@ -34,6 +42,10 @@
   const byId = new Map();
   let topCursor = null, bottomCursor = null;
   const XRULE = SIM.xrule !== false;
+  const BAR = SIM.bar !== false;
+  let bar = []; // newest first, waiting in newTweetsBar
+  let barEl = null, pillEl = null;
+  const BAR_H = 52;
   let topSort = null, maxEntrySort = null;
   const big = (v) => { try { return v == null ? null : BigInt(String(v)); } catch (_) { return null; } };
   const bmax = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));
@@ -72,7 +84,7 @@
   }
   function relayout() {
     offsets = new Array(cells.length);
-    let y = 0;
+    let y = bar.length ? BAR_H : 0;
     for (let i = 0; i < cells.length; i++) { offsets[i] = y; y += cells[i].h; }
     tl.style.height = y + 'px';
   }
@@ -104,6 +116,48 @@
     const n = document.querySelectorAll('article[data-testid="tweet"]').length;
     if (n > stats.maxMounted) stats.maxMounted = n;
   }
+  function showBar() {
+    const had = !!(barEl && barEl.isConnected);
+    if (!barEl) {
+      barEl = document.createElement('div');
+      barEl.setAttribute('data-testid', 'cellInnerDiv');
+      barEl.id = 'sim-new-entries';
+      barEl.style.cssText = 'top:0;height:' + BAR_H + 'px;color:#1d9bf0;text-align:center';
+      barEl.addEventListener('click', () => { stats.barTaps = (stats.barTaps || 0) + 1; applyBar('cell'); });
+      pillEl = document.createElement('div');
+      pillEl.setAttribute('role', 'button');
+      pillEl.setAttribute('aria-label', 'New posts are available');
+      pillEl.id = 'sim-new-pill';
+      pillEl.style.cssText = 'position:fixed;top:70px;left:50%;transform:translateX(-50%);z-index:7;background:#1d9bf0;color:#fff;border-radius:16px;padding:6px 12px';
+      pillEl.addEventListener('click', () => { stats.barTaps = (stats.barTaps || 0) + 1; applyBar('pill'); });
+    }
+    barEl.innerHTML = '<span>Show ' + bar.length + ' posts</span>';
+    pillEl.textContent = bar.length + ' new posts';
+    if (!had) {
+      const y = window.scrollY;
+      tl.appendChild(barEl); document.body.appendChild(pillEl);
+      relayout();
+      if (y > 0) window.scrollTo(0, y + BAR_H);
+      render();
+    }
+  }
+  function applyBar(why) {
+    if (!bar.length) return false;
+    const posts = bar; bar = [];
+    stats.barApplied = (stats.barApplied || 0) + 1;
+    stats.barAppliedPosts = (stats.barAppliedPosts || 0) + posts.length;
+    stats.barApplyLog = (stats.barApplyLog || []).concat([why + ':' + posts.length]).slice(-20);
+    if (barEl) barEl.remove();
+    if (pillEl) pillEl.remove();
+    const y = window.scrollY;
+    relayout();
+    if (y > 0) window.scrollTo(0, Math.max(0, y - BAR_H));
+    add(posts, 'top');
+    // SCROLLER componentDidUpdate: bar count >0 → 0 ⇒ scrollAndFocusNewest.
+    window.scrollTo(0, 0);
+    render();
+    return true;
+  }
   function add(tweets, where) {
     const fresh = tweets.filter((t) => !byId.has(t.id));
     for (const t of fresh) byId.set(t.id, t);
@@ -132,6 +186,7 @@
     stats.headReq++;
     const r = await get(url(null, 20));
     cells = []; byId.clear();
+    bar = []; if (barEl) barEl.remove(); if (pillEl) pillEl.remove();
     for (const el of mounted.values()) el.remove();
     mounted.clear();
     add(r.tweets, 'bottom');
@@ -147,7 +202,14 @@
     busyTop = true; stats.topReq++;
     try {
       const r = await get(url(topCursor, 40), reason === 'poll' ? { 'x-twitter-polling': 'true' } : null);
-      add(r.tweets, 'top');
+      // The fetch is sourced from entries[0] (that is what the XRULE check
+      // above enforces), so on a pinned list it goes to the new-posts bar.
+      const fresh = r.tweets.filter((t) => !byId.has(t.id) && !bar.some((b) => b.id === t.id));
+      if (BAR && fresh.length) {
+        bar = fresh.concat(bar);
+        stats.barSaved = (stats.barSaved || 0) + fresh.length;
+        showBar();
+      } else if (!BAR) add(r.tweets, 'top');
       maxEntrySort = bmax(maxEntrySort, r.eMax);
       // X keeps both Top cursors; entries[0] (highest sortIndex) wins.
       if (r.top && (r.tSort == null || topSort == null || r.tSort > topSort)) { topCursor = r.top; topSort = r.tSort; }
@@ -185,7 +247,9 @@
   function isAtNewest() { return window.scrollY - listTopDoc() <= 50; }
   function refreshOrGoTop() {
     if (HOME_DEAD) { stats.homeTapsIgnored = (stats.homeTapsIgnored || 0) + 1; return; }
-    if (!isAtNewest()) { window.scrollTo(0, 0); return; }
+    // TimelineRenderer.scrollToTop: applyNewTweetsBarInstructions, then
+    // scrollToNewest.
+    if (!isAtNewest()) { applyBar('home'); window.scrollTo(0, 0); return; }
     stats.refreshes++;
     loadTop('refresh');
   }
@@ -193,6 +257,7 @@
     tabSel = name;
     document.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t.textContent.trim() === name)));
     cells = []; byId.clear(); topCursor = bottomCursor = null; topSort = maxEntrySort = null;
+    bar = []; if (barEl) barEl.remove(); if (pillEl) pillEl.remove();
     for (const el of mounted.values()) el.remove();
     mounted.clear();
     relayout();
@@ -227,7 +292,7 @@
     document.body.appendChild(nav);
     nav.querySelector('a').addEventListener('click', (e) => { e.preventDefault(); stats.homeTaps++; refreshOrGoTop(); });
     setTimeout(loadHead, SIM.headDelayMs || 400);
-    window.__simApp = { ids: () => cells.map((c) => c.id), topCursor: () => topCursor, stats, lastTopAt: () => lastTopAt };
+    window.__simApp = { ids: () => cells.map((c) => c.id), barIds: () => bar.map((c) => c.id), applyBar, topCursor: () => topCursor, stats, lastTopAt: () => lastTopAt };
   }
   if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', boot); else boot();
 })();

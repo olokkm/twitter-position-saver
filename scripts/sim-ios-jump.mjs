@@ -33,7 +33,13 @@ const STALE_MS = Number(opt('stale', 60000)), POLL_MS = Number(opt('poll', 0));
 const FAULT = opt('fault', '');
 const XRULE = opt('xrule', 'on') !== 'off';
 const SCROLL_BUDGET_MS = Number(opt('budget', 200000));
-const AGO = { '4d': 4 * 864e5, '3d': 3 * 864e5, '1d': 864e5, '6h': 6 * 36e5, '1h': 36e5 };
+// --bar off: X merges Top responses in place (no new-posts bar). Default on:
+// pinned list tabs park Top responses in the bar (see sim-fake-x-app.js).
+const BAR = opt('bar', 'on') !== 'off';
+// --tap-pill off: the reader never taps X's "N new posts" pill.
+const TAP_PILL = opt('tap-pill', 'on') !== 'off';
+const SKIP_POSTS = 40; // one swipe moves ~8-10 posts; more = the view skipped
+const AGO = { '4d': 4 * 864e5, '3d': 3 * 864e5, '2d': 2 * 864e5, '1d': 864e5, '6h': 6 * 36e5, '1h': 36e5 };
 
 const hookSrc = readFileSync(join(root, 'gear-extension/page-hook.js'), 'utf8');
 const contentSrc = readFileSync(join(root, 'gear-extension/content.js'), 'utf8');
@@ -88,7 +94,7 @@ async function runTarget(browser, label) {
   }
   await page.setRequestInterception(true);
   const appHtml = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home / X (sim)</title></head><body>' +
-    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS, fault: FAULT, xrule: XRULE }) + ';</script><script>' + appSrc + '</script></body></html>';
+    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS, fault: FAULT, xrule: XRULE, bar: BAR }) + ';</script><script>' + appSrc + '</script></body></html>';
   page.on('request', async (req) => {
     const u = req.url();
     try {
@@ -196,11 +202,37 @@ async function runTarget(browser, label) {
   const landed = land.found && land.top >= 0 && land.top <= land.vh * 0.6;
   const fetchesToLand = fake.log.length;
 
+  const ds_index = new Map(ds.map((p, i) => [p.id, i]));
+  // Top visible post (first article below the sticky tab bar), as an index
+  // into the dataset (0 = newest).
+  const topVisible = async () => {
+    const id = await page.evaluate(() => {
+      let best = null, bestTop = Infinity;
+      for (const a of document.querySelectorAll('article[data-testid="tweet"]')) {
+        const r = a.getBoundingClientRect();
+        if (r.bottom > 60 && r.top < innerHeight && r.top < bestTop) {
+          const l = a.querySelector('a[href*="/status/"]');
+          const m = l && l.getAttribute('href').match(/status\/(\d+)/);
+          if (m) { best = m[1]; bestTop = r.top; }
+        }
+      }
+      return best;
+    });
+    return id == null ? null : ds_index.get(id);
+  };
+  const landTopIdx = await topVisible();
   // Idle away from the top: background polls must be held (no backend Top).
   const logBeforeIdle = fake.log.length;
   await sleep(Math.max(POLL_MS * 2, 3000) + 500);
   const idleTop = fake.log.slice(logBeforeIdle).filter((e) => e.kind === 'top' || e.kind === 'head').length;
   const idleFill = await page.evaluate(() => document.documentElement.getAttribute('data-tps-fill'));
+  // Still at the saved post after idling (nothing moved the view).
+  const idleTopIdx = await topVisible();
+  const savedInView = await page.evaluate((id) => {
+    const a = [...document.querySelectorAll('article[data-testid="tweet"]')].find((x) => x.querySelector('a[href*="/status/' + id + '"]'));
+    const r = a && a.getBoundingClientRect();
+    return !!r && r.bottom > 60 && r.top < innerHeight;
+  }, target.id);
 
   // User scrolls up until the newest post is loaded and visible.
   const contiguity = [];
@@ -211,7 +243,29 @@ async function runTarget(browser, label) {
     for (let i = 1; i < idx.length; i++) if (idx[i] !== idx[i - 1] + 1) gaps++;
     return { gaps, n: ids.length, newest: idx[0], oldest: idx[idx.length - 1] };
   };
-  const ds_index = new Map(ds.map((p, i) => [p.id, i]));
+  // A skip = the top visible post became more than SKIP_POSTS newer in one
+  // step and stayed there (re-checked after 3 s, so a re-anchor that jumps
+  // back counts as fine).
+  const skips = [];
+  let lastTopIdx = await topVisible();
+  const checkSkip = async (why) => {
+    let t = await topVisible();
+    if (t != null && lastTopIdx != null && lastTopIdx - t > SKIP_POSTS) {
+      await sleep(3000);
+      t = await topVisible();
+      if (t != null && lastTopIdx - t > SKIP_POSTS) {
+        const loaded = await page.evaluate(() => window.__simApp.ids());
+        const idx = loaded.map((id) => ds_index.get(id));
+        const between = idx.filter((i) => i > t && i < lastTopIdx).length;
+        skips.push({ why, from: lastTopIdx, to: t, skipped: lastTopIdx - t - 1,
+          // 'position lost' = the skipped posts are in X's list (scroll up
+          // reaches them); 'never present' = they are not loaded at all.
+          kind: between >= lastTopIdx - t - 1 ? 'loaded-but-position-lost' : 'gap-posts-never-present' });
+      }
+    }
+    if (t != null) lastTopIdx = t;
+  };
+  let pillTaps = 0;
   let reachedNow = false, gestures = 0, gapEver = 0;
   const tScroll = Date.now();
   let atTopWaits = 0;
@@ -223,11 +277,20 @@ async function runTarget(browser, label) {
     // A reader at the very top of the list stops swiping and waits for
     // newer posts (as on the phone) instead of swiping forever.
     const yNow = await page.evaluate(() => scrollY);
-    if (gestures > 0 && yNow < 5) { atTopWaits++; await sleep(1000); }
-    else {
+    if (gestures > 0 && yNow < 5) {
+      atTopWaits++; await sleep(1000);
+      // A reader waiting at the top taps X's "N new posts" pill after a while.
+      if (TAP_PILL && atTopWaits % 4 === 0 && await page.evaluate(() => !!document.getElementById('sim-new-pill') && document.getElementById('sim-new-pill').isConnected)) {
+        pillTaps++;
+        await page.evaluate(() => document.getElementById('sim-new-pill').click());
+        await sleep(400);
+      }
+      await checkSkip('wait');
+    } else {
       await cdp.send('Input.synthesizeScrollGesture', { x: 195, y: 400, yDistance: 1600, speed: 3000, gestureSourceType: 'mouse' });
       gestures++;
       await sleep(250);
+      await checkSkip('swipe');
     }
     const g = await checkGaps();
     contiguity.push(g);
@@ -238,6 +301,7 @@ async function runTarget(browser, label) {
   const tReached = Date.now();
   await sleep(1500);
   const end = await checkGaps();
+  const barLeft = await page.evaluate(() => window.__simApp.barIds().length);
   const endState = await page.evaluate(() => ({
     fill: document.documentElement.getAttribute('data-tps-fill'),
     maxMounted: window.__simMon.maxMounted, appMax: window.__simApp.stats.maxMounted, stats: window.__simApp.stats,
@@ -266,11 +330,13 @@ async function runTarget(browser, label) {
     fillEnd: endState.fill, maxMounted: Math.max(endState.maxMounted, endState.appMax), reloads,
     backend: { total: fake.log.length, top: fake.log.filter((e) => e.kind === 'top').length,
       bottom: fake.log.filter((e) => e.kind === 'bottom').length, head: fake.log.filter((e) => e.kind === 'head').length },
+    landTopIdx, idleTopIdx, stayedAtSaved: idleTopIdx === landTopIdx && savedInView, skips, pillTaps, barLeft,
     lastTopB: lastTop ? lastTop.B : null, app: endState.stats, atTopWaitSec: atTopWaits, scrollSec: Math.round((tReached - tScroll) / 1000),
     fault: FAULT || undefined, pill: endState.pill, panel: endState.panel, debugLog: debugLog || undefined,
     pageErrors: consoleErrors.slice(0, 5)
   };
   res.pass = res.landed && res.reachedNow && !res.gapEver && !res.endGaps && res.maxMounted <= 100 &&
+    res.stayedAtSaved && !res.skips.length && !res.barLeft &&
     res.reloads === 0 && (res.mode !== 'window' || res.idleBackendTop === 0) && !res.pageErrors.length;
   return res;
 }
