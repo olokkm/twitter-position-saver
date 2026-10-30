@@ -77,10 +77,17 @@ export function makeDataset({ nowMs = Date.now(), days = 4, posts = 1500, seed =
   return list.map((id, idx) => ({ id: id.toString(), ms: msFromSnowflake(id), idx }));
 }
 
-function tweetEntry(p) {
+// Real X list sortIndexes are not post ids: they are anchored near "now"
+// (the cursor's A), far above the ids, but ordered like the posts within one
+// cursor chain. SORT_MODE 'id' restores the old (unrealistic) sortIndex = id.
+const SORT_MODE = process.env.SIM_SORT || 'anchored';
+function sortFor(a, id) {
+  return SORT_MODE === 'id' ? BigInt(id) : BigInt(a) + (BigInt(id) >> 12n);
+}
+function tweetEntry(p, a) {
   return {
     entryId: 'tweet-' + p.id,
-    sortIndex: p.id,
+    sortIndex: String(sortFor(a, p.id)),
     content: {
       entryType: 'TimelineTimelineItem',
       __typename: 'TimelineTimelineItem',
@@ -134,15 +141,16 @@ export function createFakeList(dataset, { A = null } = {}) {
     const vars = JSON.parse(u.searchParams.get('variables') || '{}');
     const { sel, cur, count, kind } = select(vars);
     const a = cur ? cur.A : (A != null ? BigInt(A) : snowflakeFromMs(Date.now()));
-    const entries = sel.map(tweetEntry);
+    const entries = sel.map((p) => tweetEntry(p, a));
     if (sel.length) {
       const newest = BigInt(sel[0].id);
       const oldest = BigInt(sel[sel.length - 1].id);
-      entries.push(cursorEntry('top', a, newest, 1, newest + 1n));
-      entries.push(cursorEntry('bottom', a, oldest, 2, oldest - 1n));
+      entries.push(cursorEntry('top', a, newest, 1, sortFor(a, newest) + 1n));
+      entries.push(cursorEntry('bottom', a, oldest, 2, sortFor(a, oldest) - 1n));
     } else if (cur) {
       // nothing in that direction: echo the cursor (X keeps it)
-      entries.push(cursorEntry(cur.type === 1 ? 'top' : 'bottom', a, cur.B, cur.type, cur.B));
+      entries.push(cursorEntry(cur.type === 1 ? 'top' : 'bottom', a, cur.B, cur.type,
+        sortFor(a, cur.B) + (cur.type === 1 ? 1n : -1n)));
     }
     log.push({ kind, count, B: cur ? cur.B.toString() : null, n: sel.length, at: Date.now() });
     return {

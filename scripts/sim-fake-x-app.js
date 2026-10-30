@@ -17,6 +17,9 @@
 // near-top edge never fires on scroll movement (only on list updates), so
 // scroll nudges cannot make X ask; 'home-dead' = the Home link does nothing;
 // 'both-dead' = both. Used to check that the fill never hangs silently.
+// X's fetchTop rule (v3.45, main.js eT / IN): the Top cursor is used only
+// while it is entries[0] after sorting by sortIndex descending; otherwise X
+// silently sends nothing (stats.topNoop). SIM.xrule === false disables it.
 (function () {
   'use strict';
   const SIM = window.__SIM || {};
@@ -30,6 +33,10 @@
   let cells = []; // newest first: {id, iso, text, h}
   const byId = new Map();
   let topCursor = null, bottomCursor = null;
+  const XRULE = SIM.xrule !== false;
+  let topSort = null, maxEntrySort = null;
+  const big = (v) => { try { return v == null ? null : BigInt(String(v)); } catch (_) { return null; } };
+  const bmax = (a, b) => (a == null ? b : b == null ? a : (a > b ? a : b));
   let lastTopAt = 0, busyTop = false, busyBottom = false;
   let offsets = [];
   let tabSel = 'Olo';
@@ -46,16 +53,17 @@
   function parse(json) {
     const ents = json.data.list.tweets_timeline.timeline.instructions[0].entries;
     const tweets = [];
-    let top = null, bottom = null;
+    let top = null, bottom = null, tSort = null, eMax = null;
     for (const e of ents) {
-      if (e.entryId.startsWith('cursor-top-') || (e.content && e.content.cursorType === 'Top')) top = e.content.value;
-      else if (e.entryId.startsWith('cursor-bottom-') || (e.content && e.content.cursorType === 'Bottom')) bottom = e.content.value;
+      if (e.entryId.startsWith('cursor-top-') || (e.content && e.content.cursorType === 'Top')) { top = e.content.value; tSort = big(e.sortIndex); }
+      else if (e.entryId.startsWith('cursor-bottom-') || (e.content && e.content.cursorType === 'Bottom')) { bottom = e.content.value; eMax = bmax(eMax, big(e.sortIndex)); }
       else if (e.entryId.startsWith('tweet-')) {
+        eMax = bmax(eMax, big(e.sortIndex));
         const r = e.content.itemContent.tweet_results.result;
         tweets.push({ id: r.rest_id, iso: new Date(r.legacy.created_at).toISOString(), text: r.legacy.full_text, h: hashH(r.rest_id) });
       }
     }
-    return { tweets, top, bottom };
+    return { tweets, top, bottom, tSort, eMax };
   }
   async function get(u, extra) {
     const headers = Object.assign({ authorization: 'Bearer sim', 'x-csrf-token': 'sim', 'x-client-transaction-id': 'sim' }, extra || {});
@@ -128,16 +136,21 @@
     mounted.clear();
     add(r.tweets, 'bottom');
     topCursor = r.top; bottomCursor = r.bottom; lastTopAt = Date.now();
+    topSort = r.tSort; maxEntrySort = r.eMax;
+    stats.topFirst = topSort != null && (maxEntrySort == null || topSort > maxEntrySort);
   }
   async function loadTop(reason) {
     if (busyTop || !topCursor || tabSel !== 'Olo') return;
     // near_top is onlyIfStale; polls and refresh are not.
     if (reason === 'near-top' && Date.now() - lastTopAt < STALE_MS) { stats.staleSkips++; return; }
+    if (XRULE && (topSort == null || (maxEntrySort != null && topSort <= maxEntrySort))) { stats.topNoop = (stats.topNoop || 0) + 1; return; }
     busyTop = true; stats.topReq++;
     try {
       const r = await get(url(topCursor, 40), reason === 'poll' ? { 'x-twitter-polling': 'true' } : null);
       add(r.tweets, 'top');
-      if (r.top) topCursor = r.top;
+      maxEntrySort = bmax(maxEntrySort, r.eMax);
+      // X keeps both Top cursors; entries[0] (highest sortIndex) wins.
+      if (r.top && (r.tSort == null || topSort == null || r.tSort > topSort)) { topCursor = r.top; topSort = r.tSort; }
       lastTopAt = Date.now();
     } finally { busyTop = false; }
   }
@@ -147,6 +160,7 @@
     try {
       const r = await get(url(bottomCursor, 20));
       add(r.tweets, 'bottom');
+      maxEntrySort = bmax(maxEntrySort, r.eMax);
       if (r.bottom) bottomCursor = r.bottom;
     } finally { busyBottom = false; }
   }
@@ -178,7 +192,7 @@
   function selectTab(name) {
     tabSel = name;
     document.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t.textContent.trim() === name)));
-    cells = []; byId.clear(); topCursor = bottomCursor = null;
+    cells = []; byId.clear(); topCursor = bottomCursor = null; topSort = maxEntrySort = null;
     for (const el of mounted.values()) el.remove();
     mounted.clear();
     relayout();

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.44
+// @version      3.45
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.44';
+const TPS_VERSION = '3.45';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -1055,8 +1055,24 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         };
     }
 
-    function makeTopCursorEntry(template, value, newestPos) {
-        const sortIndex = String(BigInt(newestPos) + 1n);
+    // v3.45: X uses a Top cursor only while it is the FIRST entry of the
+    // timeline (entries sorted by sortIndex, descending; X's fetchTop reads
+    // entries[0] and silently does nothing otherwise). List sortIndexes are
+    // anchored near "now" (cursor A), far above the post ids, so the cursor
+    // sortIndex must be above every entry's sortIndex, not newest id + 1.
+    function maxEntrySortIndex(entries) {
+        let m = null;
+        for (let i = 0; i < (entries ? entries.length : 0); i++) {
+            const si = entries[i] && entries[i].sortIndex;
+            if (si == null || !/^\d+$/.test(String(si))) continue;
+            const v = BigInt(String(si));
+            if (m == null || v > m) m = v;
+        }
+        return m;
+    }
+
+    function makeTopCursorEntry(template, value, sortIndexBig) {
+        const sortIndex = String(sortIndexBig);
         let ent = null;
         try {
             if (template) ent = JSON.parse(JSON.stringify(template));
@@ -1087,7 +1103,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     // Build a response: tweets newer than minExclusive from pages (newest
     // first), plus a synthetic Top cursor at newest. No Bottom cursor unless
     // keepBottom is given (the window keeps P0's real bottom cursor).
-    function buildTimelineResponse(skeleton, pages, minExclusive, A, topTemplate, keepBottom) {
+    function buildTimelineResponse(skeleton, pages, minExclusive, A, topTemplate, keepBottom, floorSort, renumberAbove) {
         const base = JSON.parse(JSON.stringify(skeleton || defaultSkeleton()));
         const tl = timelineOf(base);
         const seen = new Set();
@@ -1107,14 +1123,46 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 if (newest == null || pos > newest) newest = pos;
             }
         }
+        // Posts newer than everything X has must also sort above it: if
+        // the server sortIndexes would not (different anchor), renumber.
+        let renumbered = false;
+        if (renumberAbove != null && tweets.length) {
+            const minSi = tweets.reduce((m, e) => {
+                const v = /^\d+$/.test(String(e.sortIndex)) ? BigInt(String(e.sortIndex)) : -1n;
+                return m == null || v < m ? v : m;
+            }, null);
+            if (minSi == null || minSi <= renumberAbove) {
+                const byPos = tweets.map((e) => {
+                    const x = extractSortMapFromListJson({ data: { list: { tweets_timeline: { timeline: {
+                        instructions: [{ type: 'TimelineAddEntries', entries: [e] }] } } } } });
+                    return { e, pos: x.positionIds.length ? BigInt(x.positionIds[0]) : 0n };
+                });
+                byPos.sort((a, b) => (a.pos < b.pos ? 1 : a.pos > b.pos ? -1 : 0));
+                const n = BigInt(byPos.length);
+                for (let i = 0; i < byPos.length; i++) {
+                    const c = JSON.parse(JSON.stringify(byPos[i].e));
+                    c.sortIndex = String(renumberAbove + n - BigInt(i));
+                    tweets[tweets.indexOf(byPos[i].e)] = c;
+                }
+                renumbered = true;
+            }
+        }
+        const maxTweetSort = maxEntrySortIndex(tweets);
+        let topSort = null;
+        if (newest != null) {
+            topSort = newest + 1n;
+            if (maxTweetSort != null && maxTweetSort >= topSort) topSort = maxTweetSort + 1n;
+            if (floorSort != null && floorSort >= topSort) topSort = floorSort + 1n;
+        }
         const top = newest != null
-            ? makeTopCursorEntry(topTemplate, encodeListCursor(A, newest, 1), newest)
+            ? makeTopCursorEntry(topTemplate, encodeListCursor(A, newest, 1), topSort)
             : null;
         const entries = tweets.slice();
         if (top) entries.push(top);
         if (keepBottom) entries.push(keepBottom);
         tl.instructions = [{ type: 'TimelineAddEntries', entries }];
-        return { json: base, order, tweetCount: tweets.length, newest, topEntry: top };
+        return { json: base, order, tweetCount: tweets.length, newest, topEntry: top,
+            topSort, maxTweetSort, renumbered };
     }
 
     function inspectResponseText(text) {
@@ -1171,6 +1219,54 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         } catch (_) { /* ignore */ }
     }
 
+    function noteTopCursorOrder(where, built, prevMax) {
+        try {
+            if (!built || built.topSort == null) return;
+            const first = built.maxTweetSort == null || built.topSort > built.maxTweetSort;
+            const tail = (s) => (s == null ? '-' : String(s).slice(-7));
+            fillEvent(where + ': Top cursor ' + (first ? 'is first' : 'NOT first') + ' (cursor …' + tail(built.topSort) +
+                ', max post …' + tail(built.maxTweetSort) + (prevMax != null ? ', prev …' + tail(prevMax) : '') +
+                (built.renumbered ? ', renumbered' : '') + ', ' + built.tweetCount + ' posts)');
+        } catch (_) { /* ignore */ }
+    }
+
+    // v3.45: count every GraphQL request the hook sees (by operation) and
+    // ListLatestTweetsTimeline by kind/transport, so the debug panel can tell
+    // "X did not ask" from "we did not see it".
+    const reqStats = { ops: {}, list: { fetch: { initial: 0, top: 0, bottom: 0, other: 0 },
+        xhr: { initial: 0, top: 0, bottom: 0, other: 0 } }, last: '', lastAt: 0 };
+    function noteRequest(url, transport) {
+        try {
+            if (!url || typeof url !== 'string') return;
+            const m = /\/graphql\/[^/]+\/([A-Za-z0-9_]+)/.exec(url);
+            if (!m) return;
+            const op = m[1];
+            reqStats.ops[op] = (reqStats.ops[op] || 0) + 1;
+            // v3.45: re-announce the hook if it was installed before
+            // <html> existed (the content script then thought it missing).
+            try {
+                const de = g.document && g.document.documentElement;
+                if (de && !de.getAttribute('data-tps-hook')) de.setAttribute('data-tps-hook', String(ver) + '|' + realm);
+            } catch (_) { /* ignore */ }
+            if (op === 'ListLatestTweetsTimeline') {
+                let kind = 'other';
+                const vars = parseListVariables(url);
+                if (!vars || vars.cursor == null || vars.cursor === '') kind = 'initial';
+                else {
+                    try {
+                        const d = decodeListCursor(String(vars.cursor));
+                        kind = d.type === 1 ? 'top' : d.type === 2 ? 'bottom' : 'other';
+                    } catch (_) { kind = 'other'; }
+                }
+                reqStats.list[transport][kind]++;
+                reqStats.last = kind + '/' + transport;
+                reqStats.lastAt = Date.now();
+                if (kind !== 'bottom') fillEvent('X sent list request: ' + kind + ' (' + transport + ')');
+            }
+            g.document.documentElement.setAttribute('data-tps-req-stats', JSON.stringify(reqStats));
+        } catch (_) { /* ignore */ }
+    }
+
     function setFillState(state) {
         const prev = jumpSession ? jumpSession.fillState : null;
         if (jumpSession) jumpSession.fillState = state;
@@ -1193,6 +1289,10 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             sf: opts.sf || null,
             floor: opts.floor || null,  // { K, B }: no posts in (K, B) (carry to next step)
             lastTopEntry: opts.lastTopEntry || null,
+            // v3.45: highest sortIndex we handed X (our Top cursor) and the
+            // highest post sortIndex, so later Top cursors stay entries[0].
+            maxSort: opts.maxSort != null ? opts.maxSort : null,
+            maxTweetSort: opts.maxTweetSort != null ? opts.maxTweetSort : null,
             skeleton: opts.skeleton || null,
             // v3.43 prefetch buffer: contiguous chunks of posts newer than
             // `base` (X's current Top cursor), oldest chunk first.
@@ -1665,8 +1765,14 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             const pages = [];
             for (let i = drained.length - 1; i >= 0; i--) pages.push.apply(pages, drained[i].pages);
             const atNow = buf.atNow && !buf.chunks.length;
-            const built = buildTimelineResponse(s.skeleton, pages, K0, decoded.A, s.lastTopEntry, null);
-            if (built.topEntry) s.lastTopEntry = built.topEntry;
+            const built = buildTimelineResponse(s.skeleton, pages, K0, decoded.A, s.lastTopEntry, null,
+                s.maxSort, s.maxSort != null ? s.maxSort : s.maxTweetSort);
+            if (built.topEntry) {
+                noteTopCursorOrder('fill', built, s.maxSort);
+                s.lastTopEntry = built.topEntry;
+                s.maxSort = built.topSort;
+                if (built.maxTweetSort != null) s.maxTweetSort = built.maxTweetSort;
+            }
             if (drained.length) buf.base = drained[drained.length - 1].K;
             if (built.newest != null && built.newest > buf.base) buf.base = built.newest;
             if (atNow) {
@@ -1869,11 +1975,13 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                         const topTpl = win.p0.extracted.topCursor;
                         const skeleton = skeletonFrom(win.p0.json);
                         const built = buildTimelineResponse(skeleton, win.pages, null, jump.A, topTpl, bottom);
+                        noteTopCursorOrder('window', built, null);
                         startJumpSession({
                             mode: 'window', fillUp: jump.fillUp, A: jump.A, sf: win.sf,
                             atNow: win.atNow, lastTopEntry: built.topEntry, skeleton,
                             floor: win.floorB != null ? { K: win.K, B: win.floorB } : null,
                             topK: built.newest != null ? built.newest : win.K,
+                            maxSort: built.topSort, maxTweetSort: built.maxTweetSort,
                             fetcher: { fetchAtB: makeFetchAtB(headUrl, headerObj, jump.A), pageSize }
                         });
                         // v3.43: start loading the posts above in the
@@ -1938,7 +2046,9 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
             try {
                 if (typeof input === 'string') url = input;
                 else if (input && typeof input.url === 'string') url = input.url;
+                else if (input && typeof input.href === 'string') url = input.href;
             } catch (_) { /* ignore */ }
+            noteRequest(url, 'fetch');
 
             // Merged / fallback jump for cursorless list timeline.
             try {
@@ -2029,7 +2139,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
 
         XHR.prototype.open = function (method, url) {
             try {
-                this.__tpsListUrl = typeof url === 'string' ? url : null;
+                this.__tpsListUrl = typeof url === 'string' ? url : (url && typeof url.href === 'string' ? url.href : null);
                 this.__tpsMethod = method;
                 this.__tpsHeaders = [];
                 this.__tpsJumpHandled = false;
@@ -2048,6 +2158,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         XHR.prototype.send = function () {
             const xhr = this;
             const args = arguments;
+            noteRequest(xhr.__tpsListUrl, 'xhr');
             try {
                 if (isListTimelineUrl(xhr.__tpsListUrl) && isCursorlessListUrl(xhr.__tpsListUrl)) {
                     const jump = readPendingJump();
@@ -3504,6 +3615,7 @@ function tpsInjectPageRealmScripts() {
         method: 'home',     // next method to try
         misses: 0, homeMisses: 0, count: 0,
         homeOff: '',        // reason Home taps are disabled
+        reloadDone: false,  // v3.45 X-independent reload used on this page
         topSince: 0, lastAt: 0, stuckLogged: false, slowLogged: false,
         log: []
     };
@@ -3534,6 +3646,32 @@ function tpsInjectPageRealmScripts() {
         if (!b) return '';
         const parts = b.split('|');
         return parts[0] + ' ready' + (parts[1] === 'now' ? ', up to now' : '');
+    }
+
+    // v3.45: what the page hook saw (data-tps-req-stats).
+    function readReqStats() {
+        try { return JSON.parse(document.documentElement.getAttribute('data-tps-req-stats') || 'null'); } catch (_) { return null; }
+    }
+    function reqCounts(st) {
+        const out = { list: 0, top: 0, ops: 0 };
+        if (!st) return out;
+        for (const t of ['fetch', 'xhr']) {
+            const k = (st.list && st.list[t]) || {};
+            for (const n of Object.keys(k)) { out.list += k[n] || 0; if (n === 'top') out.top += k[n] || 0; }
+        }
+        for (const n of Object.keys(st.ops || {})) out.ops += st.ops[n] || 0;
+        return out;
+    }
+    function reqDelta(c0) {
+        const c = reqCounts(readReqStats());
+        return 'X requests seen since: list +' + (c.list - c0.list) + ' (Top +' + (c.top - c0.top) +
+            '), any GraphQL +' + (c.ops - c0.ops);
+    }
+    function selectedTabLabel() {
+        try {
+            const t = getNavigationTabs().find((x) => x.getAttribute('aria-selected') === 'true');
+            return t ? getTabLabel(t) : '-';
+        } catch (_) { return '?'; }
     }
 
     function homeLink() {
@@ -3600,6 +3738,19 @@ function tpsInjectPageRealmScripts() {
         lines.push('last X request ' + (topAt ? Math.round((now - topAt) / 1000) + ' s ago' : 'never') +
             (busyAt ? ' · answering for ' + Math.round((now - busyAt) / 1000) + ' s' : '') +
             ' · y=' + Math.round(scrollTop()));
+        const st = readReqStats();
+        const L = (t) => { const k = (st && st.list && st.list[t]) || {}; return (k.initial || 0) + '/' + (k.top || 0) + '/' + (k.bottom || 0) + '/' + (k.other || 0); };
+        lines.push('route ' + location.pathname + ' · tab ' + selectedTabLabel() +
+            ' · hook ' + (readHookInfo() ? 'ok' : 'MISSING'));
+        lines.push('list requests seen (initial/top/bottom/other): fetch ' + L('fetch') + ' · xhr ' + L('xhr') +
+            (st && st.last ? ' · last ' + st.last + ' ' + Math.round((now - st.lastAt) / 1000) + ' s ago' : ''));
+        if (st && st.ops) {
+            const ops = Object.keys(st.ops).sort((a, b) => st.ops[b] - st.ops[a]);
+            lines.push('GraphQL seen: ' + ops.slice(0, 5).map((o) => o + '×' + st.ops[o]).join(', ') +
+                (ops.length > 5 ? ' +' + (ops.length - 5) + ' more' : ''));
+        } else {
+            lines.push('GraphQL seen: none');
+        }
         lines.push('nudges=' + fillNudge.count + ' · misses in a row=' + fillNudge.misses +
             ' · next=' + (fillNudge.homeOff ? 'scroll (Home off: ' + fillNudge.homeOff + ')' : fillNudge.method) +
             (fillNudge.pending ? ' · waiting on ' + fillNudge.pending.method + ' #' + fillNudge.pending.n : ''));
@@ -3638,6 +3789,7 @@ function tpsInjectPageRealmScripts() {
             return b;
         };
         mk('Retry now', () => { resetFillNudge('retry button'); renderFillLog(); });
+        mk('Reload here', () => { toggleFillLog(); reloadListHere('button'); });
         const copyBtn = mk('Copy', () => {
             const t = fillLogLines().join('\n');
             try {
@@ -3682,21 +3834,28 @@ function tpsInjectPageRealmScripts() {
         fillNudge.method = next;
         fillUiLog(p.method + ' #' + p.n + ': X did not ask within ' + (FILL_NUDGE_TIMEOUT_MS / 1000) +
             ' s (miss ' + fillNudge.misses + '/' + FILL_NUDGE_MAX_MISSES + '), next: ' +
-            (fillNudge.homeOff ? 'scroll' : next));
+            (fillNudge.homeOff ? 'scroll' : next) + ' · ' + (p.req0 ? reqDelta(p.req0) : ''));
     }
 
     function sendFillNudge(method, now) {
         fillNudge.count++;
         fillNudge.lastAt = now;
-        const p = { method, n: fillNudge.count, at: now };
+        const p = { method, n: fillNudge.count, at: now, req0: reqCounts(readReqStats()) };
         fillNudge.pending = p;
         updateNearTopFlag();
         if (method === 'home') {
             const a = homeLink();
             fillUiLog('home #' + p.n + ': tap Home (X refresh, no 60 s wait) y=' + Math.round(scrollTop()));
             const tab0 = isOnTargetTab();
+            const path0 = currentPath();
+            const label0 = selectedTabLabel();
+            const y0 = Math.round(scrollTop());
+            const first0 = (getTopTweet() || {}).id || '-';
             try { a.click(); } catch (e) { fillUiLog('home tap error ' + (e && e.message)); }
             setTimeout(() => {
+                fillUiLog('home #' + p.n + ' after 0.8 s: path ' + path0 + '→' + currentPath() + ', tab ' + label0 + '→' +
+                    selectedTabLabel() + ', y ' + y0 + '→' + Math.round(scrollTop()) + ', top post ' +
+                    (((getTopTweet() || {}).id || '-') === first0 ? 'same' : 'changed') + ' · ' + reqDelta(p.req0));
                 // The tap must keep us on /home and the same tab.
                 if (currentPath() !== '/home' || (tab0 && !isOnTargetTab())) {
                     fillNudge.homeOff = 'tap left the tab';
@@ -3763,6 +3922,13 @@ function tpsInjectPageRealmScripts() {
                 fillNudge.stuckLogged = true;
                 fillUiLog('stuck: ' + fillNudge.misses + ' nudges in a row got no request from X; retry every ' +
                     (FILL_STUCK_RETRY_MS / 1000) + ' s');
+                if (!fillNudge.reloadDone && CONFIG.fillReloadWhenStuck !== false) {
+                    // v3.45: do not depend on X's Top request any more:
+                    // reload the list at the post on screen (tab away and
+                    // back, X's own first request gets our window).
+                    reloadListHere('stuck');
+                    return;
+                }
             }
             const left = Math.ceil((fillNudge.lastAt + FILL_STUCK_RETRY_MS - now) / 1000);
             showFillWait('X is not loading newer posts (retry in ' + Math.max(0, left) + ' s). Tap for details / retry');
@@ -3790,6 +3956,31 @@ function tpsInjectPageRealmScripts() {
             }
         }
         sendFillNudge(method, now);
+    }
+
+    async function reloadListHere(why) {
+        if (restoring) { fillUiLog('reload skipped: restore running'); return; }
+        const top = getTopTweet();
+        if (!top || !isOnTargetTab() || !isHomeTimelinePath(currentPath())) {
+            fillUiLog('reload skipped: no post / not on the ' + CONFIG.targetTab + ' tab');
+            return;
+        }
+        fillNudge.reloadDone = true;
+        const saved = {
+            tweetId: top.id, tweetTime: top.time,
+            sortId: resolveSortIdForArticle(top.article, top.id),
+            timestamp: Date.now(), path: currentPath()
+        };
+        fillUiLog('reload (' + why + '): reopening the list at post ' + saved.tweetId + ' (X-independent)');
+        showFillWait('');
+        try {
+            await restore(saved, { refetch: true });
+        } catch (e) {
+            fillUiLog('reload error ' + (e && (e.message || e)));
+        }
+        const keep = fillNudge.reloadDone;
+        resetFillNudge('after reload: ' + (readJumpResultCode() || '-'));
+        fillNudge.reloadDone = keep;
     }
 
     function nextFrames(n) {
@@ -4182,7 +4373,7 @@ function tpsInjectPageRealmScripts() {
         return finishPanel('Jumped near the post, but it was not on the page');
     }
 
-    async function restore(saved) {
+    async function restore(saved, ropts) {
         if (!saved) return;
 
         const interrupted = restoreWasInterrupted();
@@ -4262,12 +4453,14 @@ function tpsInjectPageRealmScripts() {
 
                 updatePanel('Jumping near tweet from ' + timeStr + '…');
                 const jumpWaitMs = CONFIG.jumpMerge === false ? 2500 : 15000;
-                let used = jumpWasUsed() || await waitForJumpUsed(ctrl, jumpWaitMs);
+                // v3.45 reload: the list is already loaded; go straight to
+                // the tab-switch refetch.
+                let used = (ropts && ropts.refetch) ? false : (jumpWasUsed() || await waitForJumpUsed(ctrl, jumpWaitMs));
                 if (ctrl.aborted) return finishPanel('Stopped');
 
                 // Timeline may have loaded before the hook was armed — try one
                 // tab switch away and back to force a fresh ListLatestTweetsTimeline.
-                if (!used && hookInfo) {
+                if (!used && (hookInfo || (ropts && ropts.refetch))) {
                     jumpLate = true;
                     jumpLog('Jump not consumed; trying tab-switch refetch');
                     updatePanel('Refreshing for jump… [jump:late]');

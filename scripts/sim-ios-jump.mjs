@@ -31,6 +31,7 @@ const SEED = Number(opt('seed', 7));
 // X's real staleIntervalMs is 60 s; polls default off (list timelines).
 const STALE_MS = Number(opt('stale', 60000)), POLL_MS = Number(opt('poll', 0));
 const FAULT = opt('fault', '');
+const XRULE = opt('xrule', 'on') !== 'off';
 const SCROLL_BUDGET_MS = Number(opt('budget', 200000));
 const AGO = { '4d': 4 * 864e5, '3d': 3 * 864e5, '1d': 864e5, '6h': 6 * 36e5, '1h': 36e5 };
 
@@ -87,7 +88,7 @@ async function runTarget(browser, label) {
   }
   await page.setRequestInterception(true);
   const appHtml = '<!doctype html><html><head><meta name="viewport" content="width=device-width,initial-scale=1"><title>Home / X (sim)</title></head><body>' +
-    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS, fault: FAULT }) + ';</script><script>' + appSrc + '</script></body></html>';
+    '<script>window.__SIM=' + JSON.stringify({ staleMs: STALE_MS, pollMs: POLL_MS, fault: FAULT, xrule: XRULE }) + ';</script><script>' + appSrc + '</script></body></html>';
   page.on('request', async (req) => {
     const u = req.url();
     try {
@@ -121,7 +122,7 @@ async function runTarget(browser, label) {
   page.on('framenavigated', (f) => { if (f === page.mainFrame()) navs++; });
   const consoleErrors = [];
   page.on('pageerror', (e) => consoleErrors.push(String(e.message || e)));
-  if (process.env.SIM_LOG) page.on('console', (m) => { const t = m.text(); if (/TPS jump|fill|kick/.test(t)) console.error(((Date.now() - t0) / 1000).toFixed(1) + 's', t.slice(0, 200)); });
+  if (process.env.SIM_LOG) page.on('console', (m) => { const t = m.text(); if (/TPS|fill|kick|reload|Timeline/i.test(t)) console.error(((Date.now() - t0) / 1000).toFixed(1) + 's', t.slice(0, 200)); });
 
   if (VIDEO) await cdp.send('Page.startScreencast', { format: 'jpeg', quality: 55, maxWidth: 390, maxHeight: 844, everyNthFrame: 1 });
   const t0 = Date.now();
@@ -266,7 +267,7 @@ async function runTarget(browser, label) {
     backend: { total: fake.log.length, top: fake.log.filter((e) => e.kind === 'top').length,
       bottom: fake.log.filter((e) => e.kind === 'bottom').length, head: fake.log.filter((e) => e.kind === 'head').length },
     lastTopB: lastTop ? lastTop.B : null, app: endState.stats, atTopWaitSec: atTopWaits, scrollSec: Math.round((tReached - tScroll) / 1000),
-    fault: FAULT || undefined, pill: endState.pill, debugLog: debugLog || undefined,
+    fault: FAULT || undefined, pill: endState.pill, panel: endState.panel, debugLog: debugLog || undefined,
     pageErrors: consoleErrors.slice(0, 5)
   };
   res.pass = res.landed && res.reachedNow && !res.gapEver && !res.endGaps && res.maxMounted <= 100 &&
