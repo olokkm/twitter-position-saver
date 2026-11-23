@@ -1409,6 +1409,103 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
   assert(!labelsMatchTab('Following', 'Olo'), 'v3.48: Following is not Olo');
 }
 
+// v3.49: Stefan's 3.48 iPhone dump — button role=tab, no data-pinned-timeline,
+// textContent "OloOlo", innerText "Olo". 3.48 already matched this in Chrome;
+// keep it as a unit test of the real userscript helpers, and require an exact
+// innerText match to win over a looser textContent source.
+{
+  const userscriptPath = path.join(path.dirname(fileURLToPath(import.meta.url)), '..', 'twitter-position-saver.user.js');
+  const src = fs.readFileSync(userscriptPath, 'utf8');
+  const start = src.indexOf('    function stripTabMarks(s)');
+  const end = src.indexOf('    // x-web posts are <article>');
+  if (start < 0 || end < 0 || end <= start) throw new Error('v3.49: could not extract tab helpers');
+  const helpers = new Function(src.slice(start, end) +
+    '; return { stripTabMarks, undoubleTabText, foldTabLabel, visibleTabText, normalizeTabLabel, tabInnerText, exactFoldedTabMatch, tabLabelSources, getTabLabel, labelsMatchTab, tabSourcesMatch };')();
+
+  function textNode(s) {
+    return { nodeType: 3, textContent: String(s) };
+  }
+  function el(tag, attrs, children) {
+    attrs = attrs || {};
+    const node = {
+      nodeType: 1,
+      tagName: String(tag).toUpperCase(),
+      childNodes: children || [],
+      getAttribute(name) {
+        return Object.prototype.hasOwnProperty.call(attrs, name) ? attrs[name] : null;
+      },
+      hasAttribute(name) {
+        const v = this.getAttribute(name);
+        return v != null && v !== '';
+      },
+      querySelector() { return null; }
+    };
+    const walk = (n) => {
+      if (!n) return '';
+      if (n.nodeType === 3) return n.textContent || '';
+      return (n.childNodes || []).map(walk).join('');
+    };
+    const visible = (n) => {
+      if (!n) return '';
+      if (n.nodeType === 3) return n.textContent || '';
+      if (n.getAttribute && n.getAttribute('aria-hidden') === 'true') return '';
+      return (n.childNodes || []).map(visible).join('');
+    };
+    node.textContent = walk(node);
+    node.innerText = visible(node);
+    return node;
+  }
+
+  // Exact markup from the 3.48 log / live x-web: measuring span + visible span.
+  const olo = el('button', { role: 'tab', 'aria-selected': 'false' }, [
+    el('span', { class: 'relative inline-flex h-5 items-center justify-center' }, [
+      el('span', { 'aria-hidden': 'true', class: 'invisible flex items-center gap-2 font-medium' }, [textNode('Olo')]),
+      el('span', { class: 'absolute inset-0 flex items-center justify-center' }, [
+        el('span', { class: 'transition-[padding] duration-200' }, [textNode('Olo')])
+      ])
+    ])
+  ]);
+  assert(olo.getAttribute('data-pinned-timeline') == null, 'v3.49: log markup has no data-pinned-timeline');
+  assert(olo.getAttribute('role') === 'tab', 'v3.49: log markup is role=tab');
+  assert(olo.textContent === 'OloOlo', 'v3.49: log markup textContent is OloOlo');
+  assert(olo.innerText === 'Olo', 'v3.49: log markup innerText is Olo');
+  assert(helpers.tabInnerText(olo) === 'Olo', 'v3.49: tabInnerText reads Olo');
+  assert(helpers.tabLabelSources(olo)[0] === 'Olo', 'v3.49: innerText is the first label source');
+  assert(helpers.exactFoldedTabMatch(olo.innerText, 'Olo'), 'v3.49: exact innerText match');
+  assert(helpers.tabSourcesMatch(olo, 'Olo'), 'v3.49: no-pin OloOlo/Olo tab matches target Olo');
+  assert(!helpers.tabSourcesMatch(olo, 'Following'), 'v3.49: Olo tab does not match Following');
+
+  const forYou = el('button', { role: 'tab', 'data-pinned-timeline': 'for-you', 'aria-selected': 'true' }, [
+    el('span', {}, [
+      el('span', { 'aria-hidden': 'true' }, [textNode('For you')]),
+      el('span', {}, [el('span', {}, [textNode('For you')])])
+    ])
+  ]);
+  assert(forYou.textContent === 'For youFor you' && forYou.innerText === 'For you', 'v3.49: For you duplicate label');
+  assert(!helpers.tabSourcesMatch(forYou, 'Olo'), 'v3.49: For you does not match Olo');
+
+  // Exact innerText wins: pick the tab whose innerText is Olo even if an earlier
+  // candidate's textContent loosely contains the letters.
+  const cands = [
+    forYou,
+    el('button', { role: 'tab', 'data-pinned-timeline': 'following', 'aria-selected': 'false' }, [
+      el('span', {}, [
+        el('span', { 'aria-hidden': 'true' }, [textNode('Following')]),
+        el('span', {}, [el('span', {}, [textNode('Following')])])
+      ])
+    ]),
+    olo
+  ];
+  let found = null;
+  for (const c of cands) {
+    if (helpers.exactFoldedTabMatch(helpers.tabInnerText(c), 'Olo')) { found = c; break; }
+  }
+  if (!found) {
+    for (const c of cands) { if (helpers.tabSourcesMatch(c, 'Olo')) { found = c; break; } }
+  }
+  assert(found === olo, 'v3.49: getTargetTabEl-style scan selects the no-pin Olo tab');
+}
+
 if (failed) {
   console.error(`\n${failed} failure(s)`);
   process.exit(1);

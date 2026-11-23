@@ -269,12 +269,13 @@
       // Mobile layout (AGENTS.md): the tab bar sits outside primaryColumn.
       '<div id="react-root"><main role="main"><div class="tabs" role="tablist">' +
       ['For you', 'Following', 'Olo'].map((n) => {
-        const pin = n === 'For you' ? 'for-you' : n === 'Following' ? 'following' : 'list:1234567890';
-        // Visible measuring text + label, as on x-web when aria-hidden is missing
-        // or innerText joins both with a space: "Olo Olo".
-        return '<button type="button" role="tab" data-tab-name="' + n + '" data-pinned-timeline="' + pin +
-          '" aria-selected="' + (n === 'Olo') + '">' +
-          '<span class="tab-wrap"><span>' + n + ' </span><span class="tab-vis"><span>' + n + '</span></span></span></button>';
+        const pin = n === 'For you' ? 'for-you' : n === 'Following' ? 'following' : '';
+        const pinAttr = pin ? ' data-pinned-timeline="' + pin + '"' : '';
+        // x-web list tabs have no data-pinned-timeline. A measuring span is
+        // aria-hidden, so textContent is "OloOlo" and innerText is "Olo".
+        return '<button type="button" role="tab" data-tab-name="' + n + '"' + pinAttr +
+          ' aria-selected="' + (n === 'Olo') + '">' +
+          '<span class="tab-wrap"><span aria-hidden="true">' + n + '</span><span class="tab-vis"><span>' + n + '</span></span></span></button>';
       }).join('') +
       '</div><div data-testid="primaryColumn">' +
       '<div role="tablist" id="sim-decoy-tabs">' +

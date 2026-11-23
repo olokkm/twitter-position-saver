@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.48
+// @version      3.49
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.48';
+const TPS_VERSION = '3.49';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -3206,17 +3206,20 @@ function tpsInjectPageRealmScripts() {
     // ============ NAVIGATION TABS (For you / Following / Olo ...) ============
 
     // x-web (2026) tabs wrap the name in a measuring span (aria-hidden) plus
-    // a visible span, so textContent is often "OloOlo" or "Olo Olo". Match
+    // a visible span, so textContent is often "OloOlo" or "Olo Olo" while
+    // innerText is the real name ("Olo"). Prefer a non-empty innerText, match
     // names loosely, search more than the winning tablist, and wait for the
-    // bar to mount (it can appear after hydration).
+    // bar to mount (it can appear after hydration). List tabs usually have no
+    // data-pinned-timeline — finding the tab is not the same as selecting it.
     function stripTabMarks(s) {
-        return String(s || '')
+        let t = String(s || '')
             .replace(/[\u00A0\u202F\u2007\u2060]/g, ' ')
             .replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
-            .replace(/[\uFE00-\uFE0F\u20E3]/g, '')
-            .replace(/\p{Extended_Pictographic}/gu, '')
-            .replace(/\s+/g, ' ')
-            .trim();
+            .replace(/[\uFE00-\uFE0F\u20E3]/g, '');
+        // Build the emoji class at runtime so an older engine that cannot
+        // parse \p{Extended_Pictographic} still loads the rest of the script.
+        try { t = t.replace(new RegExp('\\p{Extended_Pictographic}', 'gu'), ''); } catch (_) { /* ignore */ }
+        return t.replace(/\s+/g, ' ').trim();
     }
 
     function undoubleTabText(text) {
@@ -3261,6 +3264,17 @@ function tpsInjectPageRealmScripts() {
         return t || null;
     }
 
+    function tabInnerText(tab) {
+        if (!tab) return '';
+        try { return String(tab.innerText || '').trim(); } catch (_) { return ''; }
+    }
+
+    function exactFoldedTabMatch(got, want) {
+        const a = foldTabLabel(got);
+        const b = foldTabLabel(want);
+        return !!(a && b && a === b);
+    }
+
     function tabLabelSources(tab) {
         if (!tab) return [];
         const out = [];
@@ -3268,8 +3282,10 @@ function tpsInjectPageRealmScripts() {
             const t = String(s || '').trim();
             if (t && out.indexOf(t) < 0) out.push(t);
         };
+        // Non-empty innerText is the primary label: it skips the aria-hidden
+        // measuring span, so a tab whose textContent is "OloOlo" still reads "Olo".
+        push(tabInnerText(tab));
         push(visibleTabText(tab));
-        try { push(tab.innerText); } catch (_) { /* ignore */ }
         try { push(tab.textContent); } catch (_) { /* ignore */ }
         push(tab.getAttribute && tab.getAttribute('aria-label'));
         push(tab.getAttribute && tab.getAttribute('title'));
@@ -3296,6 +3312,8 @@ function tpsInjectPageRealmScripts() {
     }
 
     function tabSourcesMatch(tab, want) {
+        const it = tabInnerText(tab);
+        if (it && exactFoldedTabMatch(it, want)) return true;
         const src = tabLabelSources(tab);
         for (let i = 0; i < src.length; i++) {
             if (labelsMatchTab(src[i], want)) return true;
@@ -3381,10 +3399,31 @@ function tpsInjectPageRealmScripts() {
         return false;
     }
 
+    function reactPropsOf(el) {
+        if (!el) return null;
+        try {
+            const keys = Object.keys(el);
+            for (let i = 0; i < keys.length; i++) {
+                const k = keys[i];
+                if (k.indexOf('__reactProps$') === 0 || k.indexOf('__reactEventHandlers$') === 0) {
+                    return el[k];
+                }
+            }
+        } catch (_) { /* ignore */ }
+        return null;
+    }
+
     function rememberListIdFromTab(el) {
         if (!el) return;
         const pin = (el.getAttribute && el.getAttribute('data-pinned-timeline')) || '';
-        const m = /^list:(\d+)$/.exec(pin) || /\/i\/lists\/(\d+)/.exec(elementHref(el));
+        let m = /^list:(\d+)$/.exec(pin) || /\/i\/lists\/(\d+)/.exec(elementHref(el));
+        if (!m) {
+            try {
+                const props = reactPropsOf(el);
+                const v = props && props.value;
+                if (typeof v === 'string') m = /^list:(\d+)$/.exec(v);
+            } catch (_) { /* ignore */ }
+        }
         if (m) lastTargetListId = m[1];
     }
 
@@ -3461,6 +3500,11 @@ function tpsInjectPageRealmScripts() {
         const want = CONFIG.targetTab;
         const ids = knownListIds();
         const cands = collectTabCandidates();
+        // Exact innerText match first (Stefan's x-web Olo tab: it="Olo", tc="OloOlo").
+        for (let i = 0; i < cands.length; i++) {
+            const it = tabInnerText(cands[i]);
+            if (it && exactFoldedTabMatch(it, want)) return cands[i];
+        }
         for (let i = 0; i < cands.length; i++) {
             if (tabMatchesTarget(cands[i], want, ids)) return cands[i];
         }
@@ -3575,14 +3619,89 @@ function tpsInjectPageRealmScripts() {
     }
 
     function tabNotFoundMessage() {
-        logTabSearchMiss();
+        const found = !!getTargetTabEl();
+        const on = isOnTargetTab();
+        if (found && !on) {
+            logTabSearchMiss('found-but-not-selected');
+            return 'Tab "' + CONFIG.targetTab + '" was found but did not stay selected — log is open; tap Copy and send the "tab search" lines';
+        }
+        logTabSearchMiss(found ? '' : 'missing');
         return 'Tab "' + CONFIG.targetTab + '" not found — log is open; tap Copy and send the "tab search" lines';
+    }
+
+    // Programmatic .click() is enough on desktop Chrome, but x-web list tabs
+    // often have no data-pinned-timeline (the list-level handler ignores them)
+    // and iOS WebKit / untrusted events can drop a bare click. Fire a pointer
+    // sequence, then fall back to the React onClick / parent onValueChange.
+    function clickTabEl(tab) {
+        if (!tab) return;
+        try { tab.scrollIntoView({ block: 'nearest', inline: 'center', behavior: 'instant' }); } catch (_) {
+            try { tab.scrollIntoView(true); } catch (__) { /* ignore */ }
+        }
+        try { if (tab.focus) tab.focus(); } catch (_) { /* ignore */ }
+
+        const fire = (type, Ctor, extra) => {
+            if (!Ctor) return;
+            try {
+                const ev = new Ctor(type, Object.assign({
+                    bubbles: true,
+                    cancelable: true,
+                    composed: true,
+                    view: window,
+                    button: 0,
+                    buttons: type === 'mousedown' || type === 'pointerdown' ? 1 : 0,
+                    pointerId: 1,
+                    pointerType: 'mouse',
+                    isPrimary: true
+                }, extra || {}));
+                tab.dispatchEvent(ev);
+            } catch (_) { /* ignore */ }
+        };
+        const PE = window.PointerEvent || window.MouseEvent;
+        fire('pointerdown', PE);
+        fire('mousedown', window.MouseEvent);
+        fire('pointerup', PE);
+        fire('mouseup', window.MouseEvent);
+        fire('click', window.MouseEvent);
+        try { tab.click(); } catch (_) { /* ignore */ }
+
+        try {
+            const props = reactPropsOf(tab);
+            const fakeEv = {
+                type: 'click',
+                target: tab,
+                currentTarget: tab,
+                bubbles: true,
+                cancelable: true,
+                defaultPrevented: false,
+                isTrusted: true,
+                button: 0,
+                preventDefault: function () { this.defaultPrevented = true; },
+                stopPropagation: function () {},
+                stopImmediatePropagation: function () {},
+                nativeEvent: { isTrusted: true, target: tab }
+            };
+            if (props && typeof props.onClick === 'function') props.onClick(fakeEv);
+            if (props && typeof props.onPress === 'function') props.onPress(fakeEv);
+            let value = props && props.value;
+            let node = tab;
+            for (let hop = 0; hop < 8 && node; hop++) {
+                const p = reactPropsOf(node);
+                if (p && value == null && p.value != null) value = p.value;
+                if (p && typeof p.onValueChange === 'function' && value != null) {
+                    p.onValueChange(value);
+                    break;
+                }
+                node = node.parentElement;
+            }
+        } catch (_) { /* ignore */ }
     }
 
     // Switch to the "Olo" tab and confirm it is actually selected before returning.
     async function ensureTargetTab(ctrl, maxWaitMs) {
         const start = Date.now();
-        const deadline = start + getTargetWaitMs(maxWaitMs);
+        const waitMs = getTargetWaitMs(maxWaitMs);
+        const deadline = start + waitMs;
 
         await waitForTabPred(() => !!getTargetTabEl() || isOnTargetTab(), ctrl, deadline);
         if (ctrl && ctrl.aborted) return false;
@@ -3594,12 +3713,22 @@ function tpsInjectPageRealmScripts() {
         if (!tab) return false;
 
         rememberListIdFromTab(tab);
-        try { tab.click(); } catch (_) { /* ignore */ }
-        await waitForTabPred(() => isOnTargetTab(), ctrl, deadline);
+        clickTabEl(tab);
+        // Always give the click its own window — the search wait may have
+        // used up the original deadline while the bar was mounting.
+        const afterClick = Date.now() + Math.max(3000, Math.min(waitMs, 8000));
+        await waitForTabPred(() => isOnTargetTab(), ctrl, afterClick);
         if (ctrl && ctrl.aborted) return false;
         if (isOnTargetTab()) return true;
-        // Click may have switched the view without aria-selected; accept a matching tab.
-        return !!getTargetTabEl() && isOnTargetTab();
+
+        const tab2 = getTargetTabEl();
+        if (tab2) {
+            rememberListIdFromTab(tab2);
+            clickTabEl(tab2);
+            await waitForTabPred(() => isOnTargetTab(), ctrl, Date.now() + 3000);
+        }
+        if (ctrl && ctrl.aborted) return false;
+        return isOnTargetTab();
     }
 
     // ============ SAVE / RESTORE ============
