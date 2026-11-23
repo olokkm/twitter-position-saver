@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.47
+// @version      3.48
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.47';
+const TPS_VERSION = '3.48';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -3012,7 +3012,7 @@ function tpsInjectPageRealmScripts() {
         await sleep(350);
         if (ctrl.aborted) return false;
         armCursorJump(saved, 15000);
-        return ensureTargetTab(ctrl, 6000);
+        return ensureTargetTab(ctrl, 10000);
     }
 
     let gentleRestore = false;
@@ -3206,8 +3206,40 @@ function tpsInjectPageRealmScripts() {
     // ============ NAVIGATION TABS (For you / Following / Olo ...) ============
 
     // x-web (2026) tabs wrap the name in a measuring span (aria-hidden) plus
-    // a visible span, so the first span's textContent is "OloOlo". Do not
-    // use querySelector('span') — that was the rweb structure.
+    // a visible span, so textContent is often "OloOlo" or "Olo Olo". Match
+    // names loosely, search more than the winning tablist, and wait for the
+    // bar to mount (it can appear after hydration).
+    function stripTabMarks(s) {
+        return String(s || '')
+            .replace(/[\u00A0\u202F\u2007\u2060]/g, ' ')
+            .replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+            .replace(/[\uFE00-\uFE0F\u20E3]/g, '')
+            .replace(/\p{Extended_Pictographic}/gu, '')
+            .replace(/\s+/g, ' ')
+            .trim();
+    }
+
+    function undoubleTabText(text) {
+        if (!text) return text;
+        if (text.length % 2 === 0) {
+            const half = text.length / 2;
+            if (text.slice(0, half) === text.slice(half)) return text.slice(0, half).trim();
+        }
+        const parts = text.split(' ');
+        if (parts.length >= 2 && parts.length % 2 === 0) {
+            const mid = parts.length / 2;
+            const a = parts.slice(0, mid).join(' ');
+            const b = parts.slice(mid).join(' ');
+            if (a && a === b) return a;
+        }
+        return text;
+    }
+
+    function foldTabLabel(s) {
+        const t = undoubleTabText(stripTabMarks(s));
+        return t ? t.toLowerCase() : '';
+    }
+
     function visibleTabText(el) {
         if (!el) return '';
         let out = '';
@@ -3225,27 +3257,50 @@ function tpsInjectPageRealmScripts() {
     }
 
     function normalizeTabLabel(raw) {
-        let text = String(raw || '').replace(/\s+/g, ' ').trim();
-        if (text && text.length % 2 === 0) {
-            const half = text.length / 2;
-            if (text.slice(0, half) === text.slice(half)) text = text.slice(0, half);
-        }
-        return text || null;
+        const t = undoubleTabText(stripTabMarks(raw));
+        return t || null;
+    }
+
+    function tabLabelSources(tab) {
+        if (!tab) return [];
+        const out = [];
+        const push = (s) => {
+            const t = String(s || '').trim();
+            if (t && out.indexOf(t) < 0) out.push(t);
+        };
+        push(visibleTabText(tab));
+        try { push(tab.innerText); } catch (_) { /* ignore */ }
+        try { push(tab.textContent); } catch (_) { /* ignore */ }
+        push(tab.getAttribute && tab.getAttribute('aria-label'));
+        push(tab.getAttribute && tab.getAttribute('title'));
+        return out;
     }
 
     function getTabLabel(tab) {
         if (!tab) return null;
-        let text = normalizeTabLabel(visibleTabText(tab));
-        if (!text) text = normalizeTabLabel(tab.innerText || tab.textContent || '');
-        return text || tab.getAttribute('aria-label') || null;
+        const src = tabLabelSources(tab);
+        for (let i = 0; i < src.length; i++) {
+            const n = normalizeTabLabel(src[i]);
+            if (n) return n;
+        }
+        return null;
     }
 
     function labelsMatchTab(got, want) {
-        if (!got || !want) return false;
-        if (got === want) return true;
-        const a = normalizeTabLabel(got);
-        const b = normalizeTabLabel(want);
-        return !!(a && b && a.toLowerCase() === b.toLowerCase());
+        const a = foldTabLabel(got);
+        const b = foldTabLabel(want);
+        if (!a || !b) return false;
+        if (a === b) return true;
+        if (a.startsWith(b) || b.startsWith(a)) return true;
+        return a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+    }
+
+    function tabSourcesMatch(tab, want) {
+        const src = tabLabelSources(tab);
+        for (let i = 0; i < src.length; i++) {
+            if (labelsMatchTab(src[i], want)) return true;
+        }
+        return false;
     }
 
     // x-web posts are <article> with a /status/ link and no data-testid="tweet".
@@ -3285,76 +3340,266 @@ function tpsInjectPageRealmScripts() {
         return null;
     }
 
-    // Several tablists exist on the page; pick the one that looks like the timeline tab bar.
-    function scoreTablist(tablist) {
-        const tabs = Array.from(tablist.querySelectorAll('[role="tab"]'));
-        const labels = tabs.map(getTabLabel).filter(Boolean);
-        if (labels.length < 2) return -1;
+    function knownListIds() {
+        const ids = [];
+        const add = (v) => {
+            const s = String(v || '');
+            if (/^\d+$/.test(s) && ids.indexOf(s) < 0) ids.push(s);
+        };
+        try { if (CONFIG.targetListId) add(CONFIG.targetListId); } catch (_) { /* ignore */ }
+        if (lastTargetListId) add(lastTargetListId);
+        try {
+            const saved = readSavedPosition && readSavedPosition();
+            const path = (saved && saved.path) || currentPath();
+            const m = /\/i\/lists\/(\d+)/.exec(path || '');
+            if (m) add(m[1]);
+        } catch (_) { /* ignore */ }
+        return ids;
+    }
 
-        let score = labels.length;
-        if (tabs.some(t => t.getAttribute('aria-selected') === 'true')) score += 5;
+    function elementHref(el) {
+        if (!el) return '';
+        const own = el.getAttribute && (el.getAttribute('href') || '');
+        if (own) return own;
+        try {
+            const a = el.querySelector && el.querySelector('a[href]');
+            return (a && a.getAttribute('href')) || '';
+        } catch (_) { return ''; }
+    }
 
-        const column = document.querySelector('[data-testid="primaryColumn"]');
-        if (column) {
-            if (column.contains(tablist)) {
-                score += 10;
-            } else {
-                // On mobile the tab bar sits just above the timeline column.
-                const t = tablist.getBoundingClientRect();
-                const c = column.getBoundingClientRect();
-                if (t.bottom <= c.top + 120 && t.top >= c.top - 160) score += 12;
-            }
+    function tabMatchesListId(el, ids) {
+        if (!el || !ids || !ids.length) return false;
+        const pin = (el.getAttribute && el.getAttribute('data-pinned-timeline')) || '';
+        const href = elementHref(el);
+        const attr = pin + ' ' + href + ' ' + (el.id || '');
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            if (pin === 'list:' + id) return true;
+            if (href.indexOf('/i/lists/' + id) !== -1) return true;
+            if (attr.indexOf('list:' + id) !== -1) return true;
         }
-        return score;
+        return false;
     }
 
-    function getNavigationTabs() {
-        let best = [];
-        let bestScore = -1;
-        document.querySelectorAll('[role="tablist"], [data-testid="ScrollSnap-List"]').forEach(list => {
-            const score = scoreTablist(list);
-            if (score > bestScore) {
-                bestScore = score;
-                best = Array.from(list.querySelectorAll('[role="tab"]'));
+    function rememberListIdFromTab(el) {
+        if (!el) return;
+        const pin = (el.getAttribute && el.getAttribute('data-pinned-timeline')) || '';
+        const m = /^list:(\d+)$/.exec(pin) || /\/i\/lists\/(\d+)/.exec(elementHref(el));
+        if (m) lastTargetListId = m[1];
+    }
+
+    let lastTargetListId = '';
+
+    function isOurUi(el) {
+        try {
+            return !!(el.closest && (el.closest('#' + PANEL_ID) || el.closest('#' + FILL_LOG_ID) ||
+                el.closest('#' + BUTTON_ID) || el.closest('#' + FILL_WAIT_ID)));
+        } catch (_) { return false; }
+    }
+
+    function tabSearchRoots() {
+        const roots = [];
+        const seen = new Set();
+        const add = (el) => {
+            if (!el || seen.has(el) || isOurUi(el)) return;
+            seen.add(el);
+            roots.push(el);
+        };
+        try {
+            document.querySelectorAll('[role="tablist"], [data-testid="ScrollSnap-List"]').forEach(add);
+            const maybe = document.querySelectorAll(
+                'header, header[role="banner"], nav, [data-testid="primaryColumn"] header, [data-testid="primaryColumn"] > div, [class*="sticky"]'
+            );
+            const vh = window.innerHeight || 800;
+            for (let i = 0; i < maybe.length; i++) {
+                const el = maybe[i];
+                let r;
+                try { r = el.getBoundingClientRect(); } catch (_) { continue; }
+                if (r.width < 80 || r.height < 24 || r.height > Math.min(220, vh * 0.4)) continue;
+                if (r.top > 180 || r.bottom < 0) continue;
+                add(el);
             }
-        });
-        return best;
+        } catch (_) { /* ignore */ }
+        return roots;
     }
 
-    function getCurrentTabLabel() {
-        const tab = getNavigationTabs().find(t => t.getAttribute('aria-selected') === 'true');
-        return tab ? getTabLabel(tab) : null;
+    function collectTabCandidates() {
+        const seen = new Set();
+        const out = [];
+        const add = (el) => {
+            if (!el || seen.has(el) || isOurUi(el)) return;
+            const tag = (el.tagName || '').toLowerCase();
+            if (tag === 'svg' || tag === 'path' || tag === 'img' || tag === 'script' || tag === 'style') return;
+            seen.add(el);
+            out.push(el);
+        };
+        try {
+            document.querySelectorAll('[role="tab"], [data-pinned-timeline]').forEach(add);
+            const roots = tabSearchRoots();
+            for (let i = 0; i < roots.length; i++) {
+                roots[i].querySelectorAll('a, button, [role="tab"], [role="button"], [role="link"]').forEach(add);
+            }
+        } catch (_) { /* ignore */ }
+        return out;
+    }
+
+    function tabIsSelected(el) {
+        if (!el || !el.getAttribute) return false;
+        if (el.getAttribute('aria-selected') === 'true') return true;
+        if (el.hasAttribute('data-active')) return true;
+        if (el.hasAttribute('data-composite-item-active')) return true;
+        return false;
+    }
+
+    function tabMatchesTarget(el, want, ids) {
+        if (!el) return false;
+        if (ids && ids.length && tabMatchesListId(el, ids)) return true;
+        return tabSourcesMatch(el, want);
     }
 
     function getTargetTabEl() {
-        return getNavigationTabs().find(t => labelsMatchTab(getTabLabel(t), CONFIG.targetTab)) || null;
+        const want = CONFIG.targetTab;
+        const ids = knownListIds();
+        const cands = collectTabCandidates();
+        for (let i = 0; i < cands.length; i++) {
+            if (tabMatchesTarget(cands[i], want, ids)) return cands[i];
+        }
+        return null;
     }
 
     function isOnTargetTab() {
-        return labelsMatchTab(getCurrentTabLabel(), CONFIG.targetTab);
+        const want = CONFIG.targetTab;
+        const ids = knownListIds();
+        const cands = collectTabCandidates();
+        for (let i = 0; i < cands.length; i++) {
+            if (tabIsSelected(cands[i]) && tabMatchesTarget(cands[i], want, ids)) return true;
+        }
+        return false;
+    }
+
+    // Kept for the fill-log "current tab" line and for leaving the tab.
+    function getNavigationTabs() {
+        const cands = collectTabCandidates().filter((el) => (el.getAttribute && el.getAttribute('role') === 'tab') ||
+            (el.hasAttribute && el.hasAttribute('data-pinned-timeline')));
+        return cands.length ? cands : collectTabCandidates();
+    }
+
+    function getCurrentTabLabel() {
+        const cands = collectTabCandidates();
+        const sel = cands.find(tabIsSelected);
+        return sel ? getTabLabel(sel) : null;
+    }
+
+    function getTargetWaitMs(explicit) {
+        if (explicit != null) return explicit;
+        return 10000;
+    }
+
+    function waitForTabPred(pred, ctrl, deadline) {
+        if (pred()) return Promise.resolve(true);
+        return new Promise((resolve) => {
+            let done = false;
+            const finish = (v) => {
+                if (done) return;
+                done = true;
+                try { obs.disconnect(); } catch (_) { /* ignore */ }
+                clearInterval(iv);
+                resolve(v);
+            };
+            let obs = { disconnect: function () {} };
+            try {
+                obs = new MutationObserver(() => {
+                    if (ctrl && ctrl.aborted) return finish(false);
+                    if (pred()) finish(true);
+                });
+                obs.observe(document.documentElement, {
+                    subtree: true, childList: true, attributes: true, characterData: true
+                });
+            } catch (_) { /* ignore */ }
+            const iv = setInterval(() => {
+                if (ctrl && ctrl.aborted) return finish(false);
+                if (pred()) return finish(true);
+                if (Date.now() >= deadline) finish(!!pred());
+            }, 200);
+            const left = Math.max(0, deadline - Date.now());
+            setTimeout(() => finish(!!pred()), left);
+        });
+    }
+
+    function clipJson60(s) {
+        let t = String(s == null ? '' : s);
+        if (t.length > 60) t = t.slice(0, 60);
+        try { return JSON.stringify(t); } catch (_) { return '"' + t.replace(/"/g, '') + '"'; }
+    }
+
+    function tabSearchDiagLines() {
+        const want = CONFIG.targetTab;
+        const cands = collectTabCandidates();
+        const lines = [];
+        let url = '';
+        try { url = String(location.href || ''); } catch (_) { url = ''; }
+        lines.push('tab search v=' + TPS_VERSION + ' url=' + url + ' n=' + cands.length +
+            ' want=' + clipJson60(want) + (lastTargetListId ? ' list=' + lastTargetListId : ''));
+        const limit = Math.min(15, cands.length);
+        for (let i = 0; i < limit; i++) {
+            const el = cands[i];
+            const tag = (el.tagName || '?').toLowerCase();
+            const role = (el.getAttribute && el.getAttribute('role')) || '';
+            const aria = (el.getAttribute && el.getAttribute('aria-label')) || '';
+            const href = elementHref(el) || '';
+            const pin = (el.getAttribute && el.getAttribute('data-pinned-timeline')) || '';
+            let tc = '', it = '';
+            try { tc = el.textContent || ''; } catch (_) { /* ignore */ }
+            try { it = el.innerText || ''; } catch (_) { /* ignore */ }
+            lines.push('#' + (i + 1) + ' ' + tag +
+                ' role=' + (role || '-') +
+                ' aria=' + clipJson60(aria) +
+                ' href=' + clipJson60(href) +
+                (pin ? ' pin=' + clipJson60(pin) : '') +
+                ' tc=' + clipJson60(tc) +
+                ' it=' + clipJson60(it));
+        }
+        if (cands.length > 15) lines.push('… +' + (cands.length - 15) + ' more');
+        return lines;
+    }
+
+    function logTabSearchMiss(why) {
+        const lines = tabSearchDiagLines();
+        if (why) lines[0] = lines[0] + ' ' + why;
+        try {
+            for (let i = 0; i < lines.length; i++) fillUiLog(lines[i]);
+        } catch (_) { /* ignore */ }
+        try { jumpLog.apply(null, lines); } catch (_) { /* ignore */ }
+        try { toggleFillLog(true); } catch (_) { /* ignore */ }
+        return lines;
+    }
+
+    function tabNotFoundMessage() {
+        logTabSearchMiss();
+        return 'Tab "' + CONFIG.targetTab + '" not found — log is open; tap Copy and send the "tab search" lines';
     }
 
     // Switch to the "Olo" tab and confirm it is actually selected before returning.
-    async function ensureTargetTab(ctrl, maxWaitMs = 8000) {
+    async function ensureTargetTab(ctrl, maxWaitMs) {
         const start = Date.now();
+        const deadline = start + getTargetWaitMs(maxWaitMs);
 
-        let tab = getTargetTabEl();
-        while (!tab && Date.now() - start < maxWaitMs) {
-            if (ctrl.aborted) return false;
-            await sleep(300);
-            tab = getTargetTabEl();
+        await waitForTabPred(() => !!getTargetTabEl() || isOnTargetTab(), ctrl, deadline);
+        if (ctrl && ctrl.aborted) return false;
+        if (isOnTargetTab()) {
+            rememberListIdFromTab(getTargetTabEl());
+            return true;
         }
+        const tab = getTargetTabEl();
         if (!tab) return false;
 
+        rememberListIdFromTab(tab);
+        try { tab.click(); } catch (_) { /* ignore */ }
+        await waitForTabPred(() => isOnTargetTab(), ctrl, deadline);
+        if (ctrl && ctrl.aborted) return false;
         if (isOnTargetTab()) return true;
-
-        tab.click();
-        while (Date.now() - start < maxWaitMs) {
-            if (ctrl.aborted) return false;
-            if (isOnTargetTab()) return true;
-            await sleep(200);
-        }
-        return isOnTargetTab();
+        // Click may have switched the view without aria-selected; accept a matching tab.
+        return !!getTargetTabEl() && isOnTargetTab();
     }
 
     // ============ SAVE / RESTORE ============
@@ -3790,10 +4035,7 @@ function tpsInjectPageRealmScripts() {
             '), any GraphQL +' + (c.ops - c0.ops);
     }
     function selectedTabLabel() {
-        try {
-            const t = getNavigationTabs().find((x) => x.getAttribute('aria-selected') === 'true');
-            return t ? getTabLabel(t) : '-';
-        } catch (_) { return '?'; }
+        try { return getCurrentTabLabel() || '-'; } catch (_) { return '?'; }
     }
 
     function homeLink() {
@@ -4853,7 +5095,7 @@ function tpsInjectPageRealmScripts() {
         try {
             const switched = await ensureTargetTab(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
-            if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
+            if (!switched) return finishPanel(tabNotFoundMessage());
 
             if (saved.path && saved.path !== currentPath()) {
                 log('Saved position is on a different page, skipping scroll');
@@ -5376,7 +5618,7 @@ function tpsInjectPageRealmScripts() {
         try {
             const switched = await ensureTargetTab(ctrl);
             if (ctrl.aborted) return finishPanel('Stopped');
-            if (!switched) return finishPanel(`Tab "${CONFIG.targetTab}" not found`);
+            if (!switched) return finishPanel(tabNotFoundMessage());
 
             // Start from the currently visible tweet — don't jump back to the top.
             await waitForContentToSettle(ctrl);
@@ -5703,7 +5945,7 @@ function tpsInjectPageRealmScripts() {
             if (ctrl.aborted) return finishPanel('Stopped');
             finishPanel(switched
                 ? `On "${CONFIG.targetTab}"`
-                : `Tab "${CONFIG.targetTab}" not found`);
+                : tabNotFoundMessage());
         } finally {
             restoring = false;
             if (currentAbort === ctrl) currentAbort = null;

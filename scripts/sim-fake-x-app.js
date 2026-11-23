@@ -269,12 +269,19 @@
       // Mobile layout (AGENTS.md): the tab bar sits outside primaryColumn.
       '<div id="react-root"><main role="main"><div class="tabs" role="tablist">' +
       ['For you', 'Following', 'Olo'].map((n) => {
-        const pin = n === 'For you' ? 'for-you' : n === 'Following' ? 'following' : 'list:olo';
+        const pin = n === 'For you' ? 'for-you' : n === 'Following' ? 'following' : 'list:1234567890';
+        // Visible measuring text + label, as on x-web when aria-hidden is missing
+        // or innerText joins both with a space: "Olo Olo".
         return '<button type="button" role="tab" data-tab-name="' + n + '" data-pinned-timeline="' + pin +
           '" aria-selected="' + (n === 'Olo') + '">' +
-          '<span class="tab-wrap"><span aria-hidden="true">' + n + '</span><span class="tab-vis"><span>' + n + '</span></span></span></button>';
+          '<span class="tab-wrap"><span>' + n + ' </span><span class="tab-vis"><span>' + n + '</span></span></span></button>';
       }).join('') +
-      '</div><div data-testid="primaryColumn"><section aria-label="Timeline"><div id="tl"></div></section></div></main></div>';
+      '</div><div data-testid="primaryColumn">' +
+      '<div role="tablist" id="sim-decoy-tabs">' +
+      ['1D','1W','1M','1Y','ALL'].map((n,i) =>
+        '<button type="button" role="tab" aria-selected="' + (n === 'ALL') + '"><span>' + n + '</span></button>'
+      ).join('') + '</div>' +
+      '<section aria-label="Timeline"><div id="tl"></div></section></div></main></div>';
     const st = document.createElement('style');
     st.textContent = 'body{margin:0;font:15px -apple-system,Helvetica,sans-serif;background:#000;color:#e7e9ea}' +
       '.tabs{position:sticky;top:0;z-index:5;display:flex;background:rgba(0,0,0,.85);border-bottom:1px solid #2f3336}' +

@@ -1357,17 +1357,56 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
   assert(exNew.tweets.length === exOld.tweets.length && exNew.tweets.length > 0,
     'v3.47: extractSortMap reads list_by_rest_id_v2 the same as data.list');
 
-  function normalizeTabLabel(raw) {
-    let text = String(raw || '').replace(/\s+/g, ' ').trim();
-    if (text && text.length % 2 === 0) {
-      const half = text.length / 2;
-      if (text.slice(0, half) === text.slice(half)) text = text.slice(0, half);
-    }
-    return text || null;
+  function stripTabMarks(s) {
+    return String(s || '')
+      .replace(/[\u00A0\u202F\u2007\u2060]/g, ' ')
+      .replace(/[\u200B-\u200F\u202A-\u202E\u2066-\u2069\uFEFF]/g, '')
+      .replace(/[\uFE00-\uFE0F\u20E3]/g, '')
+      .replace(/\p{Extended_Pictographic}/gu, '')
+      .replace(/\s+/g, ' ')
+      .trim();
   }
-  assert(normalizeTabLabel('OloOlo') === 'Olo', 'v3.47: undoubles OloOlo');
-  assert(normalizeTabLabel('For youFor you') === 'For you', 'v3.47: undoubles For youFor you');
-  assert(normalizeTabLabel('Olo') === 'Olo', 'v3.47: leaves a single Olo alone');
+  function undoubleTabText(text) {
+    if (!text) return text;
+    if (text.length % 2 === 0) {
+      const half = text.length / 2;
+      if (text.slice(0, half) === text.slice(half)) return text.slice(0, half).trim();
+    }
+    const parts = text.split(' ');
+    if (parts.length >= 2 && parts.length % 2 === 0) {
+      const mid = parts.length / 2;
+      const a = parts.slice(0, mid).join(' ');
+      const b = parts.slice(mid).join(' ');
+      if (a && a === b) return a;
+    }
+    return text;
+  }
+  function normalizeTabLabel(raw) {
+    return undoubleTabText(stripTabMarks(raw)) || null;
+  }
+  function foldTabLabel(s) {
+    const t = undoubleTabText(stripTabMarks(s));
+    return t ? t.toLowerCase() : '';
+  }
+  function labelsMatchTab(got, want) {
+    const a = foldTabLabel(got);
+    const b = foldTabLabel(want);
+    if (!a || !b) return false;
+    if (a === b) return true;
+    if (a.startsWith(b) || b.startsWith(a)) return true;
+    return a.indexOf(b) !== -1 || b.indexOf(a) !== -1;
+  }
+  assert(normalizeTabLabel('OloOlo') === 'Olo', 'v3.48: undoubles OloOlo');
+  assert(normalizeTabLabel('For youFor you') === 'For you', 'v3.48: undoubles For youFor you');
+  assert(normalizeTabLabel('Olo Olo') === 'Olo', 'v3.48: undoubles Olo Olo');
+  assert(normalizeTabLabel('For you For you') === 'For you', 'v3.48: undoubles For you For you');
+  assert(normalizeTabLabel('Olo') === 'Olo', 'v3.48: leaves a single Olo alone');
+  assert(normalizeTabLabel('Olo\u00a0Olo') === 'Olo', 'v3.48: NBSP-separated duplicate');
+  assert(normalizeTabLabel('Ol\u200boOlo') === 'Olo', 'v3.48: strips zero-width in OloOlo');
+  assert(labelsMatchTab('📌 Olo Olo', 'Olo'), 'v3.48: emoji + spaced duplicate matches Olo');
+  assert(labelsMatchTab('Olo list', 'Olo'), 'v3.48: contains/starts-with fallback');
+  assert(labelsMatchTab('olo', 'Olo'), 'v3.48: case-insensitive');
+  assert(!labelsMatchTab('Following', 'Olo'), 'v3.48: Following is not Olo');
 }
 
 if (failed) {
