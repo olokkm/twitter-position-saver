@@ -255,7 +255,7 @@
   }
   function selectTab(name) {
     tabSel = name;
-    document.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String(t.textContent.trim() === name)));
+    document.querySelectorAll('[role="tab"]').forEach((t) => t.setAttribute('aria-selected', String((t.getAttribute('data-tab-name') || t.textContent.trim()) === name)));
     cells = []; byId.clear(); topCursor = bottomCursor = null; topSort = maxEntrySort = null;
     bar = []; if (barEl) barEl.remove(); if (pillEl) pillEl.remove();
     for (const el of mounted.values()) el.remove();
@@ -268,7 +268,12 @@
     document.body.innerHTML =
       // Mobile layout (AGENTS.md): the tab bar sits outside primaryColumn.
       '<div id="react-root"><main role="main"><div class="tabs" role="tablist">' +
-      ['For you', 'Following', 'Olo'].map((n) => '<div role="tab" aria-selected="' + (n === 'Olo') + '"><span>' + n + '</span></div>').join('') +
+      ['For you', 'Following', 'Olo'].map((n) => {
+        const pin = n === 'For you' ? 'for-you' : n === 'Following' ? 'following' : 'list:olo';
+        return '<button type="button" role="tab" data-tab-name="' + n + '" data-pinned-timeline="' + pin +
+          '" aria-selected="' + (n === 'Olo') + '">' +
+          '<span class="tab-wrap"><span aria-hidden="true">' + n + '</span><span class="tab-vis"><span>' + n + '</span></span></span></button>';
+      }).join('') +
       '</div><div data-testid="primaryColumn"><section aria-label="Timeline"><div id="tl"></div></section></div></main></div>';
     const st = document.createElement('style');
     st.textContent = 'body{margin:0;font:15px -apple-system,Helvetica,sans-serif;background:#000;color:#e7e9ea}' +
@@ -278,7 +283,7 @@
       '.hd{color:#71767b;margin-bottom:6px}.hd b{color:#e7e9ea}a{color:#71767b;text-decoration:none}.tx{line-height:1.35}';
     document.head.appendChild(st);
     tl = document.getElementById('tl');
-    document.querySelectorAll('[role="tab"]').forEach((t) => t.addEventListener('click', () => selectTab(t.textContent.trim())));
+    document.querySelectorAll('[role="tab"]').forEach((t) => t.addEventListener('click', () => selectTab(t.getAttribute('data-tab-name') || t.textContent.trim())));
     // SPA: link taps never navigate the document (the sim's touch tap can
     // land on a status link).
     document.addEventListener('click', (e) => { if (e.target.closest && e.target.closest('a')) e.preventDefault(); }, true);

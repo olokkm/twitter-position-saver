@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Twitter/X Timeline Position Saver
 // @namespace    http://tampermonkey.net/
-// @version      3.46
+// @version      3.47
 // @description  Remembers where you stopped scrolling on the X "Olo" timeline and jumps back there on your next visit.
 // @author       zaengerlein
 // @license      MIT
@@ -16,7 +16,7 @@
 // @noframes
 // ==/UserScript==
 
-const TPS_VERSION = '3.46';
+const TPS_VERSION = '3.47';
 
 /* TPS_SCROLL_GUARD_BEGIN */
 // Page-realm scroll block. Runs via unsafeWindow (Tampermonkey) or MAIN-world
@@ -716,6 +716,24 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     }
 
     // Pure: walk TimelineAddEntries → { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds }
+    // rweb: data.list.tweets_timeline; x-web (2026): data.list_by_rest_id_v2.tweets_timeline
+    // (ListTimeline). Keep whichever shape the request used so X still renders our answer.
+    let lastListDataKey = 'list';
+    function listTimelineRoot(json) {
+        const d = json && json.data;
+        if (!d) return null;
+        if (d.list && d.list.tweets_timeline && d.list.tweets_timeline.timeline) {
+            lastListDataKey = 'list';
+            return d.list.tweets_timeline.timeline;
+        }
+        if (d.list_by_rest_id_v2 && d.list_by_rest_id_v2.tweets_timeline &&
+            d.list_by_rest_id_v2.tweets_timeline.timeline) {
+            lastListDataKey = 'list_by_rest_id_v2';
+            return d.list_by_rest_id_v2.tweets_timeline.timeline;
+        }
+        return null;
+    }
+
     function extractSortMapFromListJson(json) {
         const sortIndexes = [];
         const pairs = [];
@@ -723,8 +741,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         let topCursor = null;
         let bottomCursor = null;
         try {
-            const tl = json && json.data && json.data.list &&
-                json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+            const tl = listTimelineRoot(json);
             const instructions = tl && tl.instructions;
             if (!Array.isArray(instructions)) {
                 return { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds: [] };
@@ -806,8 +823,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
         if (!pageJsons || !pageJsons.length) return null;
         try {
             const base = JSON.parse(JSON.stringify(pageJsons[0]));
-            const tl = base && base.data && base.data.list &&
-                base.data.list.tweets_timeline && base.data.list.tweets_timeline.timeline;
+            const tl = listTimelineRoot(base);
             if (!tl || !Array.isArray(tl.instructions)) return null;
 
             let addInst = null;
@@ -1029,8 +1045,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     }
 
     function timelineOf(json) {
-        return json && json.data && json.data.list &&
-            json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+        return listTimelineRoot(json);
     }
 
     // Empty response shaped like a real one (keeps metadata etc.).
@@ -1047,12 +1062,16 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     }
 
     function defaultSkeleton() {
-        return {
-            data: { list: { tweets_timeline: { timeline: {
+        const inner = {
+            tweets_timeline: { timeline: {
                 instructions: [{ type: 'TimelineAddEntries', entries: [] }],
                 metadata: {}
-            } } } }
+            } }
         };
+        if (lastListDataKey === 'list_by_rest_id_v2') {
+            return { data: { list_by_rest_id_v2: inner } };
+        }
+        return { data: { list: inner } };
     }
 
     // v3.45: X uses a Top cursor only while it is the FIRST entry of the
@@ -1248,7 +1267,7 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
                 const de = g.document && g.document.documentElement;
                 if (de && !de.getAttribute('data-tps-hook')) de.setAttribute('data-tps-hook', String(ver) + '|' + realm);
             } catch (_) { /* ignore */ }
-            if (op === 'ListLatestTweetsTimeline') {
+            if (op === 'ListLatestTweetsTimeline' || op === 'ListTimeline') {
                 let kind = 'other';
                 const vars = parseListVariables(url);
                 if (!vars || vars.cursor == null || vars.cursor === '') kind = 'initial';
@@ -1356,7 +1375,11 @@ function tpsInstallPageJumpHook(globalObj, realmHint, versionHint) {
     }
 
     function isListTimelineUrl(url) {
-        return typeof url === 'string' && url.indexOf('/ListLatestTweetsTimeline') !== -1;
+        if (typeof url !== 'string') return false;
+        // rweb kept the old name; x-web (2026 rewrite) uses ListTimeline
+        // at /i/api/graphql/{id}/ListTimeline.
+        if (url.indexOf('/ListLatestTweetsTimeline') !== -1) return true;
+        return /\/graphql\/[^/]+\/ListTimeline(?:\?|$)/.test(url);
     }
 
     function headersToObject(headerPairs) {
@@ -2978,7 +3001,7 @@ function tpsInjectPageRealmScripts() {
         const tabs = getNavigationTabs();
         const other = tabs.find(t => {
             const label = getTabLabel(t);
-            return label && label !== CONFIG.targetTab;
+            return label && !labelsMatchTab(label, CONFIG.targetTab);
         });
         if (!other) return false;
         try {
@@ -3097,7 +3120,7 @@ function tpsInjectPageRealmScripts() {
         const mapped = lookupSortId(tweetId);
         if (mapped) return mapped;
         if (article && isRepostArticle(article)) {
-            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const articles = tweetArticles();
             const idx = articles.indexOf(article);
             for (let i = idx - 1; i >= 0; i--) {
                 if (isRepostArticle(articles[i])) continue;
@@ -3137,7 +3160,7 @@ function tpsInjectPageRealmScripts() {
     // Topmost tweet occupying the upper half of the viewport (including ones
     // partially tucked under the sticky mobile header where rect.top < 0).
     function getTopTweet() {
-        const articles = document.querySelectorAll('article[data-testid="tweet"]');
+        const articles = tweetArticles();
         let best = null;
         let bestTop = Infinity;
         const headerSlack = 80;
@@ -3158,7 +3181,7 @@ function tpsInjectPageRealmScripts() {
     function findTweetById(id) {
         const links = document.querySelectorAll(`a[href*="/status/${id}"]`);
         for (const link of links) {
-            const article = link.closest('article[data-testid="tweet"]');
+            const article = closestTweet(link);
             if (article) return article;
         }
         return null;
@@ -3166,7 +3189,7 @@ function tpsInjectPageRealmScripts() {
 
     function newestMountedSortPosition() {
         let newest = null;
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const pos = articleSortPosition(article);
             if (pos == null) continue;
             if (newest == null || pos > newest) newest = pos;
@@ -3182,11 +3205,84 @@ function tpsInjectPageRealmScripts() {
 
     // ============ NAVIGATION TABS (For you / Following / Olo ...) ============
 
+    // x-web (2026) tabs wrap the name in a measuring span (aria-hidden) plus
+    // a visible span, so the first span's textContent is "OloOlo". Do not
+    // use querySelector('span') — that was the rweb structure.
+    function visibleTabText(el) {
+        if (!el) return '';
+        let out = '';
+        const nodes = el.childNodes;
+        for (let i = 0; i < nodes.length; i++) {
+            const n = nodes[i];
+            if (n.nodeType === 3) out += n.textContent || '';
+            else if (n.nodeType === 1) {
+                if (n.getAttribute('aria-hidden') === 'true') continue;
+                if (n.hasAttribute('data-tab-underline')) continue;
+                out += visibleTabText(n);
+            }
+        }
+        return out;
+    }
+
+    function normalizeTabLabel(raw) {
+        let text = String(raw || '').replace(/\s+/g, ' ').trim();
+        if (text && text.length % 2 === 0) {
+            const half = text.length / 2;
+            if (text.slice(0, half) === text.slice(half)) text = text.slice(0, half);
+        }
+        return text || null;
+    }
+
     function getTabLabel(tab) {
-        const span = tab.querySelector('span');
-        if (span && span.textContent.trim()) return span.textContent.trim();
-        const text = (tab.innerText || tab.textContent || '').trim();
+        if (!tab) return null;
+        let text = normalizeTabLabel(visibleTabText(tab));
+        if (!text) text = normalizeTabLabel(tab.innerText || tab.textContent || '');
         return text || tab.getAttribute('aria-label') || null;
+    }
+
+    function labelsMatchTab(got, want) {
+        if (!got || !want) return false;
+        if (got === want) return true;
+        const a = normalizeTabLabel(got);
+        const b = normalizeTabLabel(want);
+        return !!(a && b && a.toLowerCase() === b.toLowerCase());
+    }
+
+    // x-web posts are <article> with a /status/ link and no data-testid="tweet".
+    function isTweetArticle(el) {
+        if (!el || !el.tagName || el.tagName.toLowerCase() !== 'article') return false;
+        if (el.getAttribute('data-testid') === 'tweet') return true;
+        if (!el.querySelector('a[href*="/status/"]')) return false;
+        const parent = el.parentElement && el.parentElement.closest('article');
+        return !parent;
+    }
+
+    function tweetArticles(root) {
+        const scope = root || document;
+        const all = scope.querySelectorAll('article');
+        const out = [];
+        for (let i = 0; i < all.length; i++) if (isTweetArticle(all[i])) out.push(all[i]);
+        return out;
+    }
+
+    function firstTweetArticle(root) {
+        const scope = root || document;
+        const tes = scope.querySelector('article[data-testid="tweet"]');
+        if (tes && isTweetArticle(tes)) return tes;
+        const all = scope.querySelectorAll('article');
+        for (let i = 0; i < all.length; i++) if (isTweetArticle(all[i])) return all[i];
+        return null;
+    }
+
+    function closestTweet(el) {
+        const tes = el && el.closest && el.closest('article[data-testid="tweet"]');
+        if (tes) return tes;
+        let art = el && el.closest && el.closest('article');
+        while (art) {
+            if (isTweetArticle(art)) return art;
+            art = art.parentElement && art.parentElement.closest('article');
+        }
+        return null;
     }
 
     // Several tablists exist on the page; pick the one that looks like the timeline tab bar.
@@ -3231,11 +3327,11 @@ function tpsInjectPageRealmScripts() {
     }
 
     function getTargetTabEl() {
-        return getNavigationTabs().find(t => getTabLabel(t) === CONFIG.targetTab) || null;
+        return getNavigationTabs().find(t => labelsMatchTab(getTabLabel(t), CONFIG.targetTab)) || null;
     }
 
     function isOnTargetTab() {
-        return getCurrentTabLabel() === CONFIG.targetTab;
+        return labelsMatchTab(getCurrentTabLabel(), CONFIG.targetTab);
     }
 
     // Switch to the "Olo" tab and confirm it is actually selected before returning.
@@ -4266,7 +4362,7 @@ function tpsInjectPageRealmScripts() {
                 const order = (readJumpSortMeta().order) || [];
                 let idx = order.indexOf(a.sortId);
                 if (idx < 0) idx = order.indexOf(a.id);
-                const arts = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+                const arts = tweetArticles();
                 const mounted = [];
                 for (const art of arts) {
                     const id = extractTweetId(art);
@@ -4472,7 +4568,7 @@ function tpsInjectPageRealmScripts() {
             const tweet = findTweetById(saved.tweetId);
             if (tweet) return landTweet(tweet, timeStr, 'pos:near');
 
-            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const articles = tweetArticles();
             let minI = Infinity;
             let maxI = -Infinity;
             for (let a = 0; a < articles.length; a++) {
@@ -4577,7 +4673,7 @@ function tpsInjectPageRealmScripts() {
             }
 
             const root = scrollRoot();
-            const articles = Array.from(document.querySelectorAll('article[data-testid="tweet"]'));
+            const articles = tweetArticles();
             const mounted = [];
             for (let a = 0; a < articles.length; a++) {
                 const id = extractTweetId(articles[a]);
@@ -5014,7 +5110,7 @@ function tpsInjectPageRealmScripts() {
 
     function currentTweetIds() {
         const ids = new Set();
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const id = extractTweetId(article);
             if (id) ids.add(id);
         }
@@ -5022,7 +5118,7 @@ function tpsInjectPageRealmScripts() {
     }
 
     function hasNewTweet(knownIds) {
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const id = extractTweetId(article);
             if (id && !knownIds.has(id)) return true;
         }
@@ -5033,7 +5129,7 @@ function tpsInjectPageRealmScripts() {
     function getBottomVisibleTweet() {
         let bottomTweet = null;
         let maxBottom = -1;
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const rect = article.getBoundingClientRect();
             if (rect.bottom <= 0 || rect.top >= window.innerHeight) continue;
             if (rect.bottom > maxBottom) {
@@ -5080,7 +5176,7 @@ function tpsInjectPageRealmScripts() {
     }
 
     function mountedTweetCount() {
-        return document.querySelectorAll('article[data-testid="tweet"]').length;
+        return tweetArticles().length;
     }
 
     async function waitForVirtualizer(ctrl) {
@@ -5122,7 +5218,7 @@ function tpsInjectPageRealmScripts() {
         if (target == null) return false;
         let newest = null;
         let count = 0;
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const pos = articleSortPosition(article);
             if (pos == null) continue;
             count++;
@@ -5203,7 +5299,7 @@ function tpsInjectPageRealmScripts() {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
             if (ctrl.aborted) return;
-            if (document.querySelector('article[data-testid="tweet"]')) return;
+            if (firstTweetArticle()) return;
             await sleep(80);
         }
     }
@@ -5255,7 +5351,7 @@ function tpsInjectPageRealmScripts() {
 
         const topDay = startOfDay(new Date(top.time));
         let beforeCount = 0;
-        for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+        for (const article of tweetArticles()) {
             const date = tweetDate(article);
             if (date && isBeforeDay(date, topDay)) beforeCount++;
         }
@@ -5296,7 +5392,7 @@ function tpsInjectPageRealmScripts() {
                 let oldestTargetTime = null;
                 const visible = [];
 
-                for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+                for (const article of tweetArticles()) {
                     const date = tweetDate(article);
                     if (!date) continue;
                     const rect = article.getBoundingClientRect();
@@ -5335,7 +5431,7 @@ function tpsInjectPageRealmScripts() {
                         landEl = findTweetById(deepestTargetId);
                         if (!landEl) {
                             let best = null, bestTime = null;
-                            for (const article of document.querySelectorAll('article[data-testid="tweet"]')) {
+                            for (const article of tweetArticles()) {
                                 const date = tweetDate(article);
                                 if (!date || !isSameDay(date, targetDay)) continue;
                                 if (!bestTime || date < bestTime) {
@@ -5397,7 +5493,8 @@ function tpsInjectPageRealmScripts() {
         const start = Date.now();
         while (Date.now() - start < maxWaitMs) {
             if (!isTimelinePage()) return false;
-            if (document.querySelector('article[data-testid="tweet"]') || getNavigationTabs().length) {
+            if (firstTweetArticle() || getNavigationTabs().length ||
+                document.querySelector('[data-pinned-timeline], [role="tab"]')) {
                 return true;
             }
             await sleep(400);

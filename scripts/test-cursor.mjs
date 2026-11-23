@@ -215,8 +215,9 @@ function unwrapTweetResult(result) {
 function extractSortMapFromListJson(json) {
   const sortIndexes = [];
   const pairs = [];
-  const tl = json && json.data && json.data.list &&
-    json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+  const d = json && json.data;
+  const tl = (d && d.list && d.list.tweets_timeline && d.list.tweets_timeline.timeline) ||
+    (d && d.list_by_rest_id_v2 && d.list_by_rest_id_v2.tweets_timeline && d.list_by_rest_id_v2.tweets_timeline.timeline);
   const instructions = tl && tl.instructions;
   if (!Array.isArray(instructions)) return { sortIndexes, pairs };
 
@@ -364,8 +365,9 @@ function extractSortMapFromListJsonExtended(json) {
   const tweets = [];
   let topCursor = null;
   let bottomCursor = null;
-  const tl = json && json.data && json.data.list &&
-    json.data.list.tweets_timeline && json.data.list.tweets_timeline.timeline;
+  const d = json && json.data;
+  const tl = (d && d.list && d.list.tweets_timeline && d.list.tweets_timeline.timeline) ||
+    (d && d.list_by_rest_id_v2 && d.list_by_rest_id_v2.tweets_timeline && d.list_by_rest_id_v2.tweets_timeline.timeline);
   const instructions = tl && tl.instructions;
   if (!Array.isArray(instructions)) {
     return { sortIndexes, pairs, tweets, topCursor, bottomCursor, positionIds: [] };
@@ -1328,6 +1330,45 @@ console.log('info: v3.40 noanchor/debug-gate tests done');
   for (const s of summary) console.log('info: v3.42 ' + s);
 }
 
+
+
+// v3.47: x-web ListTimeline uses data.list_by_rest_id_v2 and /ListTimeline URLs;
+// tab labels are duplicated in an aria-hidden measuring span.
+{
+  function isListTimelineUrl(url) {
+    if (typeof url !== 'string') return false;
+    if (url.indexOf('/ListLatestTweetsTimeline') !== -1) return true;
+    return /\/graphql\/[^/]+\/ListTimeline(?:\?|$)/.test(url);
+  }
+  assert(isListTimelineUrl('https://x.com/i/api/graphql/abc/ListLatestTweetsTimeline?variables={}'),
+    'v3.47: still matches rweb ListLatestTweetsTimeline');
+  assert(isListTimelineUrl('https://x.com/i/api/graphql/QIvZ3PivV3i1DEci_GqCbQ/ListTimeline?variables={}'),
+    'v3.47: matches x-web ListTimeline');
+  assert(!isListTimelineUrl('https://x.com/i/api/graphql/abc/ListsTimelineQuery?variables={}'),
+    'v3.47: does not match ListsTimelineQuery');
+
+  const xweb = {
+    data: {
+      list_by_rest_id_v2: sampleResponse.data.list
+    }
+  };
+  const exNew = extractSortMapFromListJsonExtended(xweb);
+  const exOld = extractSortMapFromListJsonExtended(sampleResponse);
+  assert(exNew.tweets.length === exOld.tweets.length && exNew.tweets.length > 0,
+    'v3.47: extractSortMap reads list_by_rest_id_v2 the same as data.list');
+
+  function normalizeTabLabel(raw) {
+    let text = String(raw || '').replace(/\s+/g, ' ').trim();
+    if (text && text.length % 2 === 0) {
+      const half = text.length / 2;
+      if (text.slice(0, half) === text.slice(half)) text = text.slice(0, half);
+    }
+    return text || null;
+  }
+  assert(normalizeTabLabel('OloOlo') === 'Olo', 'v3.47: undoubles OloOlo');
+  assert(normalizeTabLabel('For youFor you') === 'For you', 'v3.47: undoubles For youFor you');
+  assert(normalizeTabLabel('Olo') === 'Olo', 'v3.47: leaves a single Olo alone');
+}
 
 if (failed) {
   console.error(`\n${failed} failure(s)`);
